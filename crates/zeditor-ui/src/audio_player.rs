@@ -29,6 +29,12 @@ impl AudioPlayer {
         self.sink.stop();
     }
 
+    /// Clear all queued audio from the sink without destroying it.
+    /// Unlike `stop()`, the sink remains usable after clearing.
+    pub fn clear(&self) {
+        self.sink.clear();
+    }
+
     pub fn pause(&self) {
         self.sink.pause();
     }

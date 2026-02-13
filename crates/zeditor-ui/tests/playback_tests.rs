@@ -778,3 +778,64 @@ fn test_pause_clears_audio_state() {
     app.update(Message::Pause);
     assert!(!app.is_playing);
 }
+
+#[test]
+fn test_audio_adjacent_clip_transition_switches_decode() {
+    // Reproduces: two adjacent audio clips [0,5) and [5,10).
+    // When playhead crosses 5s boundary, audio_decode_clip_id should switch
+    // to clip2 and new audio frames should be consumable (not blocked by old audio).
+    let (mut app, _video_sender, audio_sender) = App::new_with_test_channels();
+
+    // Add two audio-bearing assets as adjacent clips
+    let asset1 = make_test_asset_with_audio("clip_a", 5.0);
+    let asset1_id = asset1.id;
+    app.update(Message::MediaImported(Ok(asset1)));
+    app.update(Message::AddClipToTimeline {
+        asset_id: asset1_id,
+        track_index: 0,
+        position: TimelinePosition::from_secs_f64(0.0),
+    });
+
+    let asset2 = make_test_asset_with_audio("clip_b", 5.0);
+    let asset2_id = asset2.id;
+    app.update(Message::MediaImported(Ok(asset2)));
+    app.update(Message::AddClipToTimeline {
+        asset_id: asset2_id,
+        track_index: 0,
+        position: TimelinePosition::from_secs_f64(5.0),
+    });
+
+    let audio_clip1_id = app.project.timeline.tracks[1].clips[0].id;
+    let audio_clip2_id = app.project.timeline.tracks[1].clips[1].id;
+
+    // Start playing inside clip1
+    app.set_audio_decode_clip_id(Some(audio_clip1_id));
+    app.set_audio_decode_time_offset(0.0);
+    app.set_decode_clip_id(Some(app.project.timeline.tracks[0].clips[0].id));
+    app.set_decode_time_offset(0.0);
+
+    app.update(Message::Play);
+    let start = app.playback_start_wall.unwrap();
+
+    // Advance to 5.5s — should transition to clip2
+    app.playback_start_wall = Some(start - Duration::from_millis(5500));
+    app.update(Message::PlaybackTick);
+
+    assert_eq!(
+        app.audio_decode_clip_id(),
+        Some(audio_clip2_id),
+        "audio decode should switch to clip2 after crossing 5s boundary"
+    );
+
+    // Inject a clip2 audio frame — it should be consumable (not blocked by old buffered audio)
+    audio_sender.send_audio(TestAudio {
+        samples: vec![0.0; 1024],
+        sample_rate: 44100,
+        channels: 2,
+        pts_secs: 0.5,
+    });
+
+    // Tick again — should drain the audio frame without issues
+    app.update(Message::PlaybackTick);
+    assert!(app.is_playing, "playback should continue into clip2");
+}

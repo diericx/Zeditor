@@ -1,9 +1,11 @@
+use std::collections::HashMap;
+
 use iced::mouse;
 use iced::widget::canvas;
 use iced::{border, Color, Point, Rectangle, Renderer, Size, Theme};
 use uuid::Uuid;
 
-use zeditor_core::timeline::{Timeline, TimelinePosition, TrackType};
+use zeditor_core::timeline::{Timeline, TimelinePosition, TrimPreview, TrackType};
 
 use crate::message::{Message, ToolMode};
 
@@ -403,20 +405,29 @@ impl<'a> canvas::Program<Message> for TimelineCanvas<'a> {
         self.draw_ruler(&mut frame, bounds.width);
 
         // Pre-compute drag info: effective (snapped) position + trim preview
+        struct LinkedDragPreview {
+            track_index: usize,
+            clip_id: Uuid,
+            effective_start_px: f32,
+            effective_width_px: f32,
+            effective_duration: f64,
+            preview_map: HashMap<Uuid, Vec<TrimPreview>>,
+        }
+
         struct DragPreview {
             dest_track: usize,
             effective_start_px: f32,
             effective_width_px: f32,
             effective_duration: f64,
-            preview_map:
-                std::collections::HashMap<Uuid, Vec<zeditor_core::timeline::TrimPreview>>,
+            preview_map: HashMap<Uuid, Vec<TrimPreview>>,
+            linked: Vec<LinkedDragPreview>,
         }
 
         let drag_preview: Option<DragPreview> = if let TimelineInteraction::Dragging {
             clip_id: drag_clip_id,
+            track_index: drag_track,
             offset_px,
             current_x,
-            ..
         } = &state.interaction
         {
             let drag_left_px = current_x - offset_px;
@@ -443,25 +454,107 @@ impl<'a> canvas::Program<Message> for TimelineCanvas<'a> {
                     effective_end,
                     Some(*drag_clip_id),
                 );
-                let mut map: std::collections::HashMap<Uuid, Vec<_>> =
-                    std::collections::HashMap::new();
+                let mut map: HashMap<Uuid, Vec<_>> = HashMap::new();
                 for p in previews {
                     map.entry(p.clip_id).or_default().push(p);
                 }
                 let effective_start_px = self.secs_to_px(effective_start);
                 let effective_end_px = self.secs_to_px(effective_end);
+
+                // Compute linked clip drag positions
+                let mut linked = Vec::new();
+                let link_id = self.timeline.track(*drag_track)
+                    .ok()
+                    .and_then(|t| t.get_clip(*drag_clip_id))
+                    .and_then(|c| c.link_id);
+
+                if let Some(link_id) = link_id {
+                    // Get original position of dragged clip to compute delta
+                    let orig_start = self.timeline.track(*drag_track)
+                        .ok()
+                        .and_then(|t| t.get_clip(*drag_clip_id))
+                        .map(|c| c.timeline_range.start.as_secs_f64())
+                        .unwrap_or(0.0);
+                    let delta = effective_start - orig_start;
+
+                    for (linked_track_idx, linked_clip_id) in self.timeline.find_linked_clips(link_id) {
+                        if linked_clip_id == *drag_clip_id {
+                            continue;
+                        }
+                        if let Ok(linked_track) = self.timeline.track(linked_track_idx) {
+                            if let Some(linked_clip) = linked_track.get_clip(linked_clip_id) {
+                                let linked_start = linked_clip.timeline_range.start.as_secs_f64() + delta;
+                                let linked_dur = linked_clip.duration().as_secs_f64();
+                                let linked_end = linked_start + linked_dur;
+                                let linked_previews = linked_track.preview_trim_overlaps(
+                                    linked_start,
+                                    linked_end,
+                                    Some(linked_clip_id),
+                                );
+                                let mut linked_map: HashMap<Uuid, Vec<_>> = HashMap::new();
+                                for p in linked_previews {
+                                    linked_map.entry(p.clip_id).or_default().push(p);
+                                }
+                                let linked_start_px = self.secs_to_px(linked_start);
+                                let linked_end_px = self.secs_to_px(linked_end);
+                                linked.push(LinkedDragPreview {
+                                    track_index: linked_track_idx,
+                                    clip_id: linked_clip_id,
+                                    effective_start_px: linked_start_px,
+                                    effective_width_px: linked_end_px - linked_start_px,
+                                    effective_duration: linked_dur,
+                                    preview_map: linked_map,
+                                });
+                            }
+                        }
+                    }
+                }
+
                 Some(DragPreview {
                     dest_track,
                     effective_start_px,
                     effective_width_px: effective_end_px - effective_start_px,
                     effective_duration: drag_duration,
                     preview_map: map,
+                    linked,
                 })
             } else {
                 None
             }
         } else {
             None
+        };
+
+        // Pre-compute resize info for linked clips
+        let linked_resize: HashMap<Uuid, f32> = if let TimelineInteraction::Resizing {
+            track_index,
+            clip_id: resize_id,
+            current_x,
+        } = &state.interaction
+        {
+            let mut map = HashMap::new();
+            if let Ok(track) = self.timeline.track(*track_index) {
+                if let Some(clip) = track.get_clip(*resize_id) {
+                    if let Some(link_id) = clip.link_id {
+                        let old_end_px = self.secs_to_px(clip.timeline_range.end.as_secs_f64());
+                        let delta_px = current_x - old_end_px;
+                        for (linked_track_idx, linked_clip_id) in self.timeline.find_linked_clips(link_id) {
+                            if linked_clip_id == *resize_id {
+                                continue;
+                            }
+                            if let Ok(linked_track) = self.timeline.track(linked_track_idx) {
+                                if let Some(linked_clip) = linked_track.get_clip(linked_clip_id) {
+                                    let linked_end_px = self.secs_to_px(linked_clip.timeline_range.end.as_secs_f64());
+                                    map.insert(linked_clip_id, linked_end_px + delta_px);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            map
+        } else {
+            HashMap::new()
         };
 
         // Track lanes
@@ -523,10 +616,22 @@ impl<'a> canvas::Program<Message> for TimelineCanvas<'a> {
                     TimelineInteraction::Dragging { clip_id: drag_id, .. } if *drag_id == clip.id
                 );
 
-                // If this clip is on the dest track and has preview data, draw the
-                // preview pieces (trimmed/split) instead of the original clip shape.
-                if !is_dragged_clip {
+                // Check if this clip is a linked-dragged clip
+                let linked_drag_info = if !is_dragged_clip {
+                    drag_preview.as_ref().and_then(|info| {
+                        info.linked.iter().find(|l| l.clip_id == clip.id)
+                    })
+                } else {
+                    None
+                };
+                let is_linked_dragged = linked_drag_info.is_some();
+
+                // If this clip is on the dest track (or linked track) and has preview
+                // data, draw the preview pieces (trimmed/split) instead of the
+                // original clip shape.
+                if !is_dragged_clip && !is_linked_dragged {
                     if let Some(ref info) = drag_preview {
+                        // Check primary drag preview map
                         if i == info.dest_track {
                             if let Some(previews) = info.preview_map.get(&clip.id) {
                                 let color = color_from_uuid(clip.asset_id);
@@ -540,47 +645,67 @@ impl<'a> canvas::Program<Message> for TimelineCanvas<'a> {
                                             &mut frame, px, pw, track_top, color, te - ts,
                                         );
                                     }
-                                    // trimmed_start == None means fully removed → skip
                                 }
-                                continue; // skip normal drawing for this clip
+                                continue;
                             }
+                        }
+                        // Check linked drag preview maps
+                        let mut handled_by_linked_preview = false;
+                        for linked in &info.linked {
+                            if i == linked.track_index {
+                                if let Some(previews) = linked.preview_map.get(&clip.id) {
+                                    let color = color_from_uuid(clip.asset_id);
+                                    for preview in previews {
+                                        if let (Some(ts), Some(te)) =
+                                            (preview.trimmed_start, preview.trimmed_end)
+                                        {
+                                            let px = self.secs_to_px(ts);
+                                            let pw = (self.secs_to_px(te) - px).max(4.0);
+                                            draw_clip_shape(
+                                                &mut frame, px, pw, track_top, color, te - ts,
+                                            );
+                                        }
+                                    }
+                                    handled_by_linked_preview = true;
+                                    break;
+                                }
+                            }
+                        }
+                        if handled_by_linked_preview {
+                            continue;
                         }
                     }
                 }
 
                 // Dragged clip: draw at effective (snapped) position
+                // Linked-dragged clip: draw at linked effective position
                 // Resized clip: draw at current cursor position
+                // Linked-resized clip: draw with adjusted width
                 // Normal clip: draw at original position
-                let (draw_x, draw_width, dur) =
+                let (draw_x, draw_width, dur) = if is_dragged_clip {
                     if let Some(ref info) = drag_preview {
-                        if is_dragged_clip {
-                            (info.effective_start_px, info.effective_width_px, info.effective_duration)
-                        } else {
-                            match &state.interaction {
-                                TimelineInteraction::Resizing {
-                                    clip_id: resize_id,
-                                    current_x,
-                                    ..
-                                } if *resize_id == clip.id => {
-                                    let w = current_x - clip_start_px;
-                                    (clip_start_px, w, self.px_to_secs(w.max(4.0)))
-                                }
-                                _ => (clip_start_px, clip_width, clip.duration().as_secs_f64()),
-                            }
-                        }
+                        (info.effective_start_px, info.effective_width_px, info.effective_duration)
                     } else {
-                        match &state.interaction {
-                            TimelineInteraction::Resizing {
-                                clip_id: resize_id,
-                                current_x,
-                                ..
-                            } if *resize_id == clip.id => {
-                                let w = current_x - clip_start_px;
-                                (clip_start_px, w, self.px_to_secs(w.max(4.0)))
-                            }
-                            _ => (clip_start_px, clip_width, clip.duration().as_secs_f64()),
+                        (clip_start_px, clip_width, clip.duration().as_secs_f64())
+                    }
+                } else if let Some(linked_info) = linked_drag_info {
+                    (linked_info.effective_start_px, linked_info.effective_width_px, linked_info.effective_duration)
+                } else if let Some(&new_end_px) = linked_resize.get(&clip.id) {
+                    let w = new_end_px - clip_start_px;
+                    (clip_start_px, w, self.px_to_secs(w.max(4.0)))
+                } else {
+                    match &state.interaction {
+                        TimelineInteraction::Resizing {
+                            clip_id: resize_id,
+                            current_x,
+                            ..
+                        } if *resize_id == clip.id => {
+                            let w = current_x - clip_start_px;
+                            (clip_start_px, w, self.px_to_secs(w.max(4.0)))
                         }
-                    };
+                        _ => (clip_start_px, clip_width, clip.duration().as_secs_f64()),
+                    }
+                };
 
                 let color = color_from_uuid(clip.asset_id);
                 draw_clip_shape(&mut frame, draw_x, draw_width.max(4.0), track_top, color, dur);
@@ -928,6 +1053,157 @@ mod tests {
             assert!(secs >= 0.0, "clip position should be >= 0, got {secs}");
         } else {
             panic!("expected Dragging interaction");
+        }
+    }
+
+    /// Helper: create a timeline with grouped video+audio tracks and linked clips.
+    fn make_grouped_timeline() -> Timeline {
+        let mut tl = Timeline::new();
+        let group_id = Uuid::new_v4();
+        tl.add_track_with_group("Video 1", TrackType::Video, Some(group_id));
+        tl.add_track_with_group("Audio 1", TrackType::Audio, Some(group_id));
+
+        let asset_id = Uuid::new_v4();
+        let source_range = TimeRange {
+            start: TimelinePosition::zero(),
+            end: TimelinePosition::from_secs_f64(5.0),
+        };
+
+        // Add linked video+audio clips at 1.0s
+        tl.add_clip_with_audio(0, 1, asset_id, TimelinePosition::from_secs_f64(1.0), source_range)
+            .unwrap();
+
+        tl
+    }
+
+    #[test]
+    fn test_grouped_drag_computes_linked_position() {
+        // Verify that when dragging a linked video clip, the linked audio clip
+        // would be computed to move by the same delta.
+        let tl = make_grouped_timeline();
+        let video_clip_id = tl.tracks[0].clips[0].id;
+        let audio_clip_id = tl.tracks[1].clips[0].id;
+
+        let canvas = TimelineCanvas {
+            timeline: &tl,
+            playback_position: TimelinePosition::zero(),
+            selected_asset_id: None,
+            zoom: 100.0,
+            scroll_offset: 0.0,
+            tool_mode: ToolMode::Arrow,
+        };
+
+        // Video clip starts at 1.0s. Drag to 3.0s → delta = 2.0s.
+        // Audio clip also starts at 1.0s → should move to 3.0s.
+        let drag_left_px = 300.0; // offset_px=50, current_x=350 → 350-50 = 300px
+        let raw_start = canvas.px_to_secs(drag_left_px).max(0.0); // 3.0s
+        let drag_duration = canvas.clip_duration_secs(video_clip_id); // 5.0s
+
+        assert!((raw_start - 3.0).abs() < 0.01, "raw drag start should be 3.0s");
+        assert!((drag_duration - 5.0).abs() < 0.01, "clip duration should be 5.0s");
+
+        // Verify linked clip delta computation matches draw() logic
+        let video_clip = tl.tracks[0].get_clip(video_clip_id).unwrap();
+        let link_id = video_clip.link_id.unwrap();
+        let delta = raw_start - video_clip.timeline_range.start.as_secs_f64();
+
+        let linked_clips = tl.find_linked_clips(link_id);
+        assert_eq!(linked_clips.len(), 2, "should find 2 linked clips (video + audio)");
+
+        let audio_clip = tl.tracks[1].get_clip(audio_clip_id).unwrap();
+        let expected_audio_start = audio_clip.timeline_range.start.as_secs_f64() + delta;
+        assert!(
+            (expected_audio_start - 3.0).abs() < 0.01,
+            "linked audio clip should move by same delta to 3.0s, got {expected_audio_start}"
+        );
+
+        // Verify linked audio clip px position
+        let expected_audio_start_px = canvas.secs_to_px(expected_audio_start);
+        let expected_audio_end_px = canvas.secs_to_px(expected_audio_start + audio_clip.duration().as_secs_f64());
+        assert!(
+            (expected_audio_start_px - 300.0).abs() < 0.01,
+            "audio start should be at 300px, got {expected_audio_start_px}"
+        );
+        assert!(
+            (expected_audio_end_px - 800.0).abs() < 0.01,
+            "audio end should be at 800px, got {expected_audio_end_px}"
+        );
+    }
+
+    #[test]
+    fn test_grouped_resize_computes_linked_position() {
+        // Verify that when resizing a linked video clip, the linked audio clip
+        // end position is adjusted by the same pixel delta.
+        let tl = make_grouped_timeline();
+        let video_clip_id = tl.tracks[0].clips[0].id;
+        let audio_clip_id = tl.tracks[1].clips[0].id;
+
+        let canvas = TimelineCanvas {
+            timeline: &tl,
+            playback_position: TimelinePosition::zero(),
+            selected_asset_id: None,
+            zoom: 100.0,
+            scroll_offset: 0.0,
+            tool_mode: ToolMode::Arrow,
+        };
+
+        // Video clip is [1.0, 6.0) → end_px = 600
+        // Resize to current_x = 800 → delta_px = 200
+        let video_clip = tl.tracks[0].get_clip(video_clip_id).unwrap();
+        let video_end_px = canvas.secs_to_px(video_clip.timeline_range.end.as_secs_f64());
+        let current_x = 800.0;
+        let delta_px = current_x - video_end_px;
+
+        assert!((video_end_px - 600.0).abs() < 0.01, "video end should be at 600px");
+        assert!((delta_px - 200.0).abs() < 0.01, "delta should be 200px");
+
+        // Audio clip is also [1.0, 6.0) → end_px = 600
+        // New audio end_px = 600 + 200 = 800px → 8.0s
+        let audio_clip = tl.tracks[1].get_clip(audio_clip_id).unwrap();
+        let audio_end_px = canvas.secs_to_px(audio_clip.timeline_range.end.as_secs_f64());
+        let new_audio_end_px = audio_end_px + delta_px;
+        let new_audio_end_secs = canvas.px_to_secs(new_audio_end_px);
+
+        assert!(
+            (new_audio_end_px - 800.0).abs() < 0.01,
+            "linked audio clip end should be at 800px, got {new_audio_end_px}"
+        );
+        assert!(
+            (new_audio_end_secs - 8.0).abs() < 0.01,
+            "linked audio clip end should be at 8.0s, got {new_audio_end_secs}"
+        );
+    }
+
+    #[test]
+    fn test_grouped_drag_interaction_starts_correctly() {
+        // Verify that clicking a linked clip body starts dragging with correct state
+        let tl = make_grouped_timeline();
+        let video_clip_id = tl.tracks[0].clips[0].id;
+
+        let canvas = TimelineCanvas {
+            timeline: &tl,
+            playback_position: TimelinePosition::zero(),
+            selected_asset_id: None,
+            zoom: 100.0,
+            scroll_offset: 0.0,
+            tool_mode: ToolMode::Arrow,
+        };
+
+        let mut state = TimelineCanvasState::default();
+        let bounds = Rectangle::new(Point::ORIGIN, Size::new(1200.0, 200.0));
+        // Click at x=300 (3.0s) in track 0, inside clip [1.0, 6.0)
+        let cursor = mouse::Cursor::Available(Point::new(300.0, RULER_HEIGHT + 25.0));
+        let event = canvas::Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left));
+
+        let result = canvas.update(&mut state, &event, bounds, cursor);
+        assert!(result.is_some(), "clicking linked clip should return action");
+
+        match &state.interaction {
+            TimelineInteraction::Dragging { track_index, clip_id, .. } => {
+                assert_eq!(*track_index, 0);
+                assert_eq!(*clip_id, video_clip_id);
+            }
+            other => panic!("expected Dragging, got {other:?}"),
         }
     }
 }

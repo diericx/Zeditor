@@ -880,6 +880,13 @@ impl App {
                 .map(|a| a.path.clone());
 
             if let Some(path) = path {
+                // Clear buffered audio from previous clip before starting new one.
+                // Without this, adjacent clips (no gap) would keep playing clip1's
+                // buffered audio instead of transitioning to clip2.
+                if let Some(player) = &self.audio_player {
+                    player.clear();
+                    player.play();
+                }
                 self.audio_decode_clip_id = Some(clip_id);
                 self.audio_decode_time_offset = clip_tl_start - clip_src_start;
                 if let Some(tx) = &self.audio_decode_tx {
