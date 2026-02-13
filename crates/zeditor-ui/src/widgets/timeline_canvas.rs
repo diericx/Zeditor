@@ -12,6 +12,7 @@ const TRACK_HEIGHT: f32 = 50.0;
 const CLIP_RESIZE_EDGE_WIDTH: f32 = 8.0;
 const ZOOM_MIN: f32 = 0.1;
 const ZOOM_MAX: f32 = 1000.0;
+const SNAP_THRESHOLD_SECS: f64 = 0.2;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum HitZone {
@@ -98,6 +99,43 @@ impl<'a> TimelineCanvas<'a> {
         let track_y = (y - RULER_HEIGHT).max(0.0);
         let idx = (track_y / TRACK_HEIGHT) as usize;
         idx.min(self.timeline.tracks.len().saturating_sub(1))
+    }
+
+    fn clip_duration_secs(&self, clip_id: Uuid) -> f64 {
+        self.timeline
+            .tracks
+            .iter()
+            .flat_map(|t| &t.clips)
+            .find(|c| c.id == clip_id)
+            .map(|c| c.duration().as_secs_f64())
+            .unwrap_or(0.0)
+    }
+
+    /// Compute the effective drop position for a drag, accounting for snap.
+    /// First computes trim preview at the raw position, then checks for snap
+    /// against the resulting (trimmed) edges. Returns the snapped start in secs.
+    fn compute_snapped_start(
+        &self,
+        raw_start: f64,
+        clip_duration: f64,
+        dest_track: usize,
+        exclude_id: Uuid,
+    ) -> f64 {
+        let raw_end = raw_start + clip_duration;
+        if let Ok(track) = self.timeline.track(dest_track) {
+            let previews =
+                track.preview_trim_overlaps(raw_start, raw_end, Some(exclude_id));
+            if let Some(snapped) = track.preview_snap_position(
+                raw_start,
+                raw_end,
+                Some(exclude_id),
+                &previews,
+                SNAP_THRESHOLD_SECS,
+            ) {
+                return snapped.max(0.0);
+            }
+        }
+        raw_start
     }
 }
 
@@ -302,14 +340,18 @@ impl<'a> canvas::Program<Message> for TimelineCanvas<'a> {
                         offset_px,
                         current_x,
                     } => {
-                        let new_secs = self.px_to_secs(current_x - offset_px).max(0.0);
+                        let raw_secs = self.px_to_secs(current_x - offset_px).max(0.0);
                         let dest_track = self.track_at_y(cursor_pos.y);
+                        let duration = self.clip_duration_secs(clip_id);
+                        let effective_secs = self.compute_snapped_start(
+                            raw_secs, duration, dest_track, clip_id,
+                        );
                         Some(
                             canvas::Action::publish(Message::MoveClip {
                                 source_track: track_index,
                                 clip_id,
                                 dest_track,
-                                position: TimelinePosition::from_secs_f64(new_secs),
+                                position: TimelinePosition::from_secs_f64(effective_secs),
                             })
                             .and_capture(),
                         )
@@ -360,11 +402,17 @@ impl<'a> canvas::Program<Message> for TimelineCanvas<'a> {
         // Time ruler
         self.draw_ruler(&mut frame, bounds.width);
 
-        // Pre-compute drag preview: which clips on the dest track get trimmed/split/removed
-        let drag_preview: Option<(
-            usize,
-            std::collections::HashMap<Uuid, Vec<zeditor_core::timeline::TrimPreview>>,
-        )> = if let TimelineInteraction::Dragging {
+        // Pre-compute drag info: effective (snapped) position + trim preview
+        struct DragPreview {
+            dest_track: usize,
+            effective_start_px: f32,
+            effective_width_px: f32,
+            effective_duration: f64,
+            preview_map:
+                std::collections::HashMap<Uuid, Vec<zeditor_core::timeline::TrimPreview>>,
+        }
+
+        let drag_preview: Option<DragPreview> = if let TimelineInteraction::Dragging {
             clip_id: drag_clip_id,
             offset_px,
             current_x,
@@ -372,25 +420,27 @@ impl<'a> canvas::Program<Message> for TimelineCanvas<'a> {
         } = &state.interaction
         {
             let drag_left_px = current_x - offset_px;
-            let drag_start_secs = self.px_to_secs(drag_left_px).max(0.0);
-            let drag_duration = self
-                .timeline
-                .tracks
-                .iter()
-                .flat_map(|t| &t.clips)
-                .find(|c| c.id == *drag_clip_id)
-                .map(|c| c.duration().as_secs_f64())
-                .unwrap_or(0.0);
-            let drag_end_secs = drag_start_secs + drag_duration;
+            let raw_start = self.px_to_secs(drag_left_px).max(0.0);
+            let drag_duration = self.clip_duration_secs(*drag_clip_id);
             let dest_track = cursor
                 .position_in(bounds)
                 .map(|p| self.track_at_y(p.y))
                 .unwrap_or(0);
 
+            // Compute effective position with snap
+            let effective_start = self.compute_snapped_start(
+                raw_start,
+                drag_duration,
+                dest_track,
+                *drag_clip_id,
+            );
+            let effective_end = effective_start + drag_duration;
+
+            // Compute trim preview at the effective (snapped) position
             if let Ok(track) = self.timeline.track(dest_track) {
                 let previews = track.preview_trim_overlaps(
-                    drag_start_secs,
-                    drag_end_secs,
+                    effective_start,
+                    effective_end,
                     Some(*drag_clip_id),
                 );
                 let mut map: std::collections::HashMap<Uuid, Vec<_>> =
@@ -398,7 +448,15 @@ impl<'a> canvas::Program<Message> for TimelineCanvas<'a> {
                 for p in previews {
                     map.entry(p.clip_id).or_default().push(p);
                 }
-                Some((dest_track, map))
+                let effective_start_px = self.secs_to_px(effective_start);
+                let effective_end_px = self.secs_to_px(effective_end);
+                Some(DragPreview {
+                    dest_track,
+                    effective_start_px,
+                    effective_width_px: effective_end_px - effective_start_px,
+                    effective_duration: drag_duration,
+                    preview_map: map,
+                })
             } else {
                 None
             }
@@ -457,9 +515,9 @@ impl<'a> canvas::Program<Message> for TimelineCanvas<'a> {
                 // If this clip is on the dest track and has preview data, draw the
                 // preview pieces (trimmed/split) instead of the original clip shape.
                 if !is_dragged_clip {
-                    if let Some((dest_track_idx, ref preview_map)) = drag_preview {
-                        if i == dest_track_idx {
-                            if let Some(previews) = preview_map.get(&clip.id) {
+                    if let Some(ref info) = drag_preview {
+                        if i == info.dest_track {
+                            if let Some(previews) = info.preview_map.get(&clip.id) {
                                 let color = color_from_uuid(clip.asset_id);
                                 for preview in previews {
                                     if let (Some(ts), Some(te)) =
@@ -479,23 +537,41 @@ impl<'a> canvas::Program<Message> for TimelineCanvas<'a> {
                     }
                 }
 
-                let (draw_x, draw_width) = match &state.interaction {
-                    TimelineInteraction::Dragging {
-                        clip_id: drag_id,
-                        offset_px,
-                        current_x,
-                        ..
-                    } if *drag_id == clip.id => (current_x - offset_px, clip_width),
-                    TimelineInteraction::Resizing {
-                        clip_id: resize_id,
-                        current_x,
-                        ..
-                    } if *resize_id == clip.id => (clip_start_px, current_x - clip_start_px),
-                    _ => (clip_start_px, clip_width),
-                };
+                // Dragged clip: draw at effective (snapped) position
+                // Resized clip: draw at current cursor position
+                // Normal clip: draw at original position
+                let (draw_x, draw_width, dur) =
+                    if let Some(ref info) = drag_preview {
+                        if is_dragged_clip {
+                            (info.effective_start_px, info.effective_width_px, info.effective_duration)
+                        } else {
+                            match &state.interaction {
+                                TimelineInteraction::Resizing {
+                                    clip_id: resize_id,
+                                    current_x,
+                                    ..
+                                } if *resize_id == clip.id => {
+                                    let w = current_x - clip_start_px;
+                                    (clip_start_px, w, self.px_to_secs(w.max(4.0)))
+                                }
+                                _ => (clip_start_px, clip_width, clip.duration().as_secs_f64()),
+                            }
+                        }
+                    } else {
+                        match &state.interaction {
+                            TimelineInteraction::Resizing {
+                                clip_id: resize_id,
+                                current_x,
+                                ..
+                            } if *resize_id == clip.id => {
+                                let w = current_x - clip_start_px;
+                                (clip_start_px, w, self.px_to_secs(w.max(4.0)))
+                            }
+                            _ => (clip_start_px, clip_width, clip.duration().as_secs_f64()),
+                        }
+                    };
 
                 let color = color_from_uuid(clip.asset_id);
-                let dur = clip.duration().as_secs_f64();
                 draw_clip_shape(&mut frame, draw_x, draw_width.max(4.0), track_top, color, dur);
             }
         }

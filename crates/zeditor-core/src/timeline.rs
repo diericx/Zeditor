@@ -332,6 +332,72 @@ impl Track {
         previews
     }
 
+    /// Preview what snap position a clip would get if placed at [clip_start, clip_end).
+    /// Uses the trim previews for affected clips and original positions for unaffected ones.
+    /// Returns the snapped start position if within threshold, else None.
+    pub fn preview_snap_position(
+        &self,
+        clip_start: f64,
+        clip_end: f64,
+        exclude_id: Option<Uuid>,
+        trim_previews: &[TrimPreview],
+        snap_threshold_secs: f64,
+    ) -> Option<f64> {
+        let clip_duration = clip_end - clip_start;
+        let mut best_gap = f64::MAX;
+        let mut best_start = clip_start;
+        let mut found = false;
+
+        let affected: std::collections::HashSet<Uuid> =
+            trim_previews.iter().map(|p| p.clip_id).collect();
+
+        // Collect all neighbor edges to check against
+        let mut edges: Vec<(f64, f64)> = Vec::new();
+
+        for clip in &self.clips {
+            if Some(clip.id) == exclude_id {
+                continue;
+            }
+            if affected.contains(&clip.id) {
+                continue; // use trimmed edges instead
+            }
+            edges.push((
+                clip.timeline_range.start.as_secs_f64(),
+                clip.timeline_range.end.as_secs_f64(),
+            ));
+        }
+
+        for preview in trim_previews {
+            if let (Some(ts), Some(te)) = (preview.trimmed_start, preview.trimmed_end) {
+                edges.push((ts, te));
+            }
+        }
+
+        for (other_start, other_end) in edges {
+            // Snap our start to other's end
+            let gap = (clip_start - other_end).abs();
+            if gap <= snap_threshold_secs && gap < best_gap {
+                best_gap = gap;
+                best_start = other_end;
+                found = true;
+            }
+
+            // Snap our end to other's start
+            let gap = (clip_end - other_start).abs();
+            if gap <= snap_threshold_secs && gap < best_gap {
+                best_gap = gap;
+                best_start = other_start - clip_duration;
+                found = true;
+            }
+        }
+
+        if found {
+            Some(best_start)
+        } else {
+            None
+        }
+    }
+
     /// Get the end position of the last clip on this track.
     pub fn end_position(&self) -> TimelinePosition {
         self.clips

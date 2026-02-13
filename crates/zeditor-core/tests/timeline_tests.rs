@@ -583,3 +583,106 @@ fn test_preview_no_overlap() {
     let previews = timeline.tracks[0].preview_trim_overlaps(10.0, 15.0, None);
     assert!(previews.is_empty());
 }
+
+#[test]
+fn test_preview_snap_to_adjacent_end() {
+    let mut timeline = Timeline::new();
+    timeline.add_track("Video 1");
+
+    let asset_id = Uuid::new_v4();
+    // Clip A at [0, 5)
+    timeline
+        .add_clip(0, make_clip(asset_id, 0.0, 5.0))
+        .unwrap();
+
+    // Dragging a 3s clip to position 5.1 (end at 8.1) — close to A's end at 5.0
+    let previews = timeline.tracks[0].preview_trim_overlaps(5.1, 8.1, None);
+    let snap = timeline.tracks[0].preview_snap_position(5.1, 8.1, None, &previews, 0.2);
+    assert!(snap.is_some());
+    assert!((snap.unwrap() - 5.0).abs() < 0.001, "should snap start to A's end");
+}
+
+#[test]
+fn test_preview_snap_to_adjacent_start() {
+    let mut timeline = Timeline::new();
+    timeline.add_track("Video 1");
+
+    let asset_id = Uuid::new_v4();
+    // Clip A at [5, 10)
+    timeline
+        .add_clip(0, make_clip(asset_id, 5.0, 5.0))
+        .unwrap();
+
+    // Dragging a 3s clip to position 1.85 (end at 4.85) — close to A's start at 5.0
+    let previews = timeline.tracks[0].preview_trim_overlaps(1.85, 4.85, None);
+    let snap = timeline.tracks[0].preview_snap_position(1.85, 4.85, None, &previews, 0.2);
+    assert!(snap.is_some());
+    assert!((snap.unwrap() - 2.0).abs() < 0.001, "should snap end to A's start (start=5.0-3.0=2.0)");
+}
+
+#[test]
+fn test_preview_snap_no_match() {
+    let mut timeline = Timeline::new();
+    timeline.add_track("Video 1");
+
+    let asset_id = Uuid::new_v4();
+    // Clip A at [0, 5)
+    timeline
+        .add_clip(0, make_clip(asset_id, 0.0, 5.0))
+        .unwrap();
+
+    // Dragging a 3s clip to position 10.0 (end at 13.0) — far from A
+    let previews = timeline.tracks[0].preview_trim_overlaps(10.0, 13.0, None);
+    let snap = timeline.tracks[0].preview_snap_position(10.0, 13.0, None, &previews, 0.2);
+    assert!(snap.is_none());
+}
+
+#[test]
+fn test_preview_snap_uses_trimmed_edges() {
+    let mut timeline = Timeline::new();
+    timeline.add_track("Video 1");
+
+    let asset_id = Uuid::new_v4();
+    // Clip A at [0, 10)
+    timeline
+        .add_clip(0, make_clip(asset_id, 0.0, 10.0))
+        .unwrap();
+
+    // Dragging a 3s clip to position 4.0 (end at 7.0) — overlaps A
+    // A gets trimmed to [0, 4) and [7, 10)
+    let previews = timeline.tracks[0].preview_trim_overlaps(4.0, 7.0, None);
+    assert_eq!(previews.len(), 2); // split
+
+    // Now drag to 3.85 (end at 6.85) — trimmed left piece would be [0, 3.85)
+    // Snap should find trimmed left piece's end at 3.85 is close to... wait,
+    // the snap checks the TRIMMED edges, so left piece end = 3.85, right piece start = 6.85
+    // Our clip start 3.85 vs left piece end 3.85 = gap 0 → already snapped
+    // Let's try a position that would result in a near-snap
+    let _previews2 = timeline.tracks[0].preview_trim_overlaps(3.9, 6.9, None);
+    // Left piece: [0, 3.9), right piece: [6.9, 10)
+    // Now try snapping a clip at [4.05, 7.05) → trimmed edges [0, 4.05) and [7.05, 10)
+    // Our start 4.05 vs trimmed left end 4.05 = gap 0, no snap needed
+    // Actually let's test that snap works against trimmed edge of a different scenario:
+
+    // Clip B at [15, 20) also on track
+    timeline
+        .add_clip(0, make_clip(asset_id, 15.0, 5.0))
+        .unwrap();
+
+    // Drag a 3s clip to [6.85, 9.85) — overlaps A, trims A to [0, 6.85)
+    // Right piece of A: [9.85, 10) — and clip B at [15, 20)
+    // Check snap: our end 9.85 vs trimmed right piece start 9.85 = gap 0
+    // Our end 9.85 vs B's start 15 = gap 5.15 > threshold
+    // So no snap (already aligned). Good.
+    // Let's test: clip at [6.9, 9.9) → A trimmed to [0, 6.9) and [9.9, 10)
+    // Our start 6.9 near A-left-end 6.9? gap 0 → already aligned
+    // Let's just verify no snap at a position far from edges
+    let previews3 = timeline.tracks[0].preview_trim_overlaps(3.0, 6.0, None);
+    // A trimmed to [0, 3) and [6, 10)
+    let snap = timeline.tracks[0].preview_snap_position(3.0, 6.0, None, &previews3, 0.2);
+    // start 3.0 vs trimmed-left end 3.0 → gap 0, so it finds a snap with gap 0
+    // end 6.0 vs trimmed-right start 6.0 → gap 0
+    // Both are gap 0, so effectively already snapped. Should return Some(3.0).
+    assert!(snap.is_some());
+    assert!((snap.unwrap() - 3.0).abs() < 0.001);
+}
