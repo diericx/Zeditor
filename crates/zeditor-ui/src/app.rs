@@ -1,5 +1,5 @@
 use std::path::PathBuf;
-use std::sync::Mutex;
+use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use iced::widget::{button, center, column, container, row, scrollable, text};
@@ -12,6 +12,31 @@ use zeditor_core::timeline::{Clip, TimeRange, TimelinePosition};
 use crate::message::Message;
 use crate::widgets::timeline_canvas::TimelineCanvas;
 
+/// Preview resolution cap. 4K frames are scaled down to this for display.
+const PREVIEW_MAX_WIDTH: u32 = 960;
+const PREVIEW_MAX_HEIGHT: u32 = 540;
+
+/// Request sent from UI to the decode thread.
+enum DecodeRequest {
+    /// Seek to time. If `continuous` is true, keep decoding (playback).
+    /// If false, decode one target frame and stop (scrub).
+    Seek {
+        path: PathBuf,
+        time: f64,
+        continuous: bool,
+    },
+    Stop,
+}
+
+/// Decoded frame sent from the decode thread to the UI.
+struct DecodedFrame {
+    rgba: Vec<u8>,
+    width: u32,
+    height: u32,
+    /// Source-file PTS in seconds.
+    pts_secs: f64,
+}
+
 pub struct App {
     pub project: Project,
     pub playback_position: TimelinePosition,
@@ -19,11 +44,17 @@ pub struct App {
     pub status_message: String,
     pub selected_asset_id: Option<Uuid>,
     pub current_frame: Option<iced::widget::image::Handle>,
-    pub decode_in_flight: bool,
     pub playback_start_wall: Option<Instant>,
     pub playback_start_pos: TimelinePosition,
     pub timeline_zoom: f32,
     pub timeline_scroll: f32,
+    decode_tx: Option<mpsc::Sender<DecodeRequest>>,
+    decode_rx: Option<mpsc::Receiver<DecodedFrame>>,
+    decode_clip_id: Option<Uuid>,
+    /// Offset to convert source PTS → timeline time: timeline_time = pts + offset.
+    decode_time_offset: f64,
+    /// Frame received from decode thread but not yet displayed (PTS ahead of playback).
+    pending_frame: Option<DecodedFrame>,
 }
 
 impl Default for App {
@@ -35,11 +66,15 @@ impl Default for App {
             status_message: String::new(),
             selected_asset_id: None,
             current_frame: None,
-            decode_in_flight: false,
             playback_start_wall: None,
             playback_start_pos: TimelinePosition::zero(),
             timeline_zoom: 100.0,
             timeline_scroll: 0.0,
+            decode_tx: None,
+            decode_rx: None,
+            decode_clip_id: None,
+            decode_time_offset: 0.0,
+            pending_frame: None,
         }
     }
 }
@@ -50,16 +85,26 @@ impl App {
     }
 
     pub fn boot() -> (Self, Task<Message>) {
-        (Self::default(), Task::none())
+        let (req_tx, req_rx) = mpsc::channel::<DecodeRequest>();
+        let (frame_tx, frame_rx) = mpsc::sync_channel::<DecodedFrame>(1);
+
+        std::thread::spawn(move || {
+            decode_worker(req_rx, frame_tx);
+        });
+
+        let mut app = Self::default();
+        app.decode_tx = Some(req_tx);
+        app.decode_rx = Some(frame_rx);
+        (app, Task::none())
     }
 
     pub fn subscription(&self) -> Subscription<Message> {
         let mut subs: Vec<Subscription<Message>> =
             vec![keyboard::listen().map(Message::KeyboardEvent)];
 
-        if self.is_playing {
-            subs.push(time::every(Duration::from_millis(33)).map(|_| Message::PlaybackTick));
-        }
+        // Always tick: 16ms when playing (60fps), 100ms when paused (for scrub frames)
+        let tick_ms = if self.is_playing { 16 } else { 100 };
+        subs.push(time::every(Duration::from_millis(tick_ms)).map(|_| Message::PlaybackTick));
 
         Subscription::batch(subs)
     }
@@ -244,7 +289,8 @@ impl App {
             }
             Message::TimelineClickEmpty(pos) => {
                 self.playback_position = pos;
-                self.spawn_frame_decode()
+                self.send_decode_seek(self.is_playing);
+                Task::none()
             }
             Message::PlaceSelectedClip {
                 asset_id,
@@ -274,17 +320,20 @@ impl App {
                 } else {
                     self.status_message = "Asset not found".into();
                 }
-                self.spawn_frame_decode()
+                self.send_decode_seek(self.is_playing);
+                Task::none()
             }
             Message::Play => {
                 self.is_playing = true;
                 self.playback_start_wall = Some(Instant::now());
                 self.playback_start_pos = self.playback_position;
+                self.send_decode_seek(true);
                 Task::none()
             }
             Message::Pause => {
                 self.is_playing = false;
                 self.playback_start_wall = None;
+                self.send_decode_stop();
                 Task::none()
             }
             Message::TogglePlayback => {
@@ -304,6 +353,8 @@ impl App {
                             TimelinePosition::from_secs_f64(timeline_dur);
                         self.is_playing = false;
                         self.playback_start_wall = None;
+                        self.send_decode_stop();
+                        self.poll_decoded_frame();
                         return Task::none();
                     }
                     self.playback_position = TimelinePosition::from_secs_f64(new_pos);
@@ -317,8 +368,16 @@ impl App {
                             new_pos as f32 * self.timeline_zoom - visible_width * 0.5;
                     }
 
-                    return self.spawn_frame_decode();
+                    // Check if we've crossed into a different clip
+                    let current_clip_id =
+                        self.clip_at_position(self.playback_position).map(|(_, c)| c.id);
+                    if current_clip_id != self.decode_clip_id {
+                        self.send_decode_seek(true);
+                    }
                 }
+
+                // Drain decoded frames from the channel
+                self.poll_decoded_frame();
                 Task::none()
             }
             Message::SeekTo(pos) => {
@@ -327,20 +386,7 @@ impl App {
                     self.playback_start_wall = Some(Instant::now());
                     self.playback_start_pos = pos;
                 }
-                self.spawn_frame_decode()
-            }
-            Message::FrameDecoded(result) => {
-                self.decode_in_flight = false;
-                match result {
-                    Ok((rgba_data, width, height)) => {
-                        self.current_frame = Some(iced::widget::image::Handle::from_rgba(
-                            width, height, rgba_data,
-                        ));
-                    }
-                    Err(_e) => {
-                        // Keep showing previous frame on decode error
-                    }
-                }
+                self.send_decode_seek(self.is_playing);
                 Task::none()
             }
             Message::KeyboardEvent(event) => {
@@ -534,30 +580,95 @@ impl App {
         None
     }
 
-    /// Spawn a background task to decode the frame at the current playback position.
-    fn spawn_frame_decode(&mut self) -> Task<Message> {
-        if self.decode_in_flight {
-            return Task::none();
+    /// Send a seek request to the decode thread for the current playback position.
+    /// If `continuous` is true, the thread decodes ahead (playback mode).
+    /// If false, it decodes one target frame and stops (scrub mode).
+    fn send_decode_seek(&mut self, continuous: bool) {
+        // Drain stale frames from the channel and discard pending
+        self.pending_frame = None;
+        if let Some(rx) = &self.decode_rx {
+            while rx.try_recv().is_ok() {}
         }
 
-        let clip_info = self.clip_at_position(self.playback_position);
-        if let Some((_track_idx, clip)) = clip_info {
-            let asset_id = clip.asset_id;
-            let clip_tl_start = clip.timeline_range.start.as_secs_f64();
-            let clip_src_start = clip.source_range.start.as_secs_f64();
+        let clip_info =
+            self.clip_at_position(self.playback_position)
+                .map(|(_, clip)| {
+                    (
+                        clip.id,
+                        clip.asset_id,
+                        clip.timeline_range.start.as_secs_f64(),
+                        clip.source_range.start.as_secs_f64(),
+                    )
+                });
+
+        if let Some((clip_id, asset_id, clip_tl_start, clip_src_start)) = clip_info {
             let playback_pos = self.playback_position.as_secs_f64();
             let source_time = clip_src_start + (playback_pos - clip_tl_start);
+            let path = self
+                .project
+                .source_library
+                .get(asset_id)
+                .map(|a| a.path.clone());
 
-            if let Some(asset) = self.project.source_library.get(asset_id) {
-                let path = asset.path.clone();
-                self.decode_in_flight = true;
-                return Task::perform(
-                    async move { decode_frame_at(path, source_time) },
-                    Message::FrameDecoded,
-                );
+            if let Some(path) = path {
+                self.decode_clip_id = Some(clip_id);
+                // Store offset so we can convert source PTS → timeline time:
+                // timeline_time = pts_secs + (clip_tl_start - clip_src_start)
+                self.decode_time_offset = clip_tl_start - clip_src_start;
+                if let Some(tx) = &self.decode_tx {
+                    let _ = tx.send(DecodeRequest::Seek {
+                        path,
+                        time: source_time,
+                        continuous,
+                    });
+                }
+                return;
             }
         }
-        Task::none()
+        self.decode_clip_id = None;
+    }
+
+    /// Tell the decode thread to stop decoding.
+    fn send_decode_stop(&self) {
+        if let Some(tx) = &self.decode_tx {
+            let _ = tx.send(DecodeRequest::Stop);
+        }
+    }
+
+    /// Display decoded frames that are due according to the playback clock.
+    /// Holds frames whose PTS is ahead of the current playback position.
+    fn poll_decoded_frame(&mut self) {
+        let playback_secs = self.playback_position.as_secs_f64();
+
+        loop {
+            // Get a frame: either from pending or from channel
+            let frame = if self.pending_frame.is_some() {
+                self.pending_frame.take().unwrap()
+            } else if let Some(rx) = &self.decode_rx {
+                match rx.try_recv() {
+                    Ok(f) => f,
+                    Err(_) => return,
+                }
+            } else {
+                return;
+            };
+
+            // Convert source PTS to timeline time
+            let frame_timeline_time = frame.pts_secs + self.decode_time_offset;
+
+            // When paused (scrubbing), always display immediately.
+            // When playing, only display if the frame's time has arrived.
+            if !self.is_playing || frame_timeline_time <= playback_secs + 0.02 {
+                self.current_frame = Some(iced::widget::image::Handle::from_rgba(
+                    frame.width, frame.height, frame.rgba,
+                ));
+                // Loop to check if there's an even more recent frame also due
+            } else {
+                // Frame is ahead of playback — hold it for a future tick
+                self.pending_frame = Some(frame);
+                return;
+            }
+        }
     }
 }
 
@@ -574,81 +685,134 @@ pub fn rgb24_to_rgba32(rgb: &[u8], width: u32, height: u32) -> Vec<u8> {
     rgba
 }
 
-/// Preview resolution cap. 4K frames are scaled down to this for display.
-const PREVIEW_MAX_WIDTH: u32 = 960;
-const PREVIEW_MAX_HEIGHT: u32 = 540;
-
-/// Cached decoder state. Keeps the decoder open between frames for the same file.
+/// Cached decoder state for the decode worker thread.
 struct CachedDecoder {
     path: PathBuf,
     decoder: zeditor_media::decoder::FfmpegDecoder,
     last_pts: f64,
 }
 
-static DECODER_CACHE: Mutex<Option<CachedDecoder>> = Mutex::new(None);
-
-/// Decode a single frame at the given source timestamp. Returns RGBA data + dimensions.
-/// Reuses the decoder if the path matches, only seeking when necessary.
-/// Scales down to preview resolution for performance.
-fn decode_frame_at(path: PathBuf, source_time: f64) -> Result<(Vec<u8>, u32, u32), String> {
+/// Background decode worker thread. Owns the FFmpeg decoder and runs ahead of playback.
+fn decode_worker(
+    request_rx: mpsc::Receiver<DecodeRequest>,
+    frame_tx: mpsc::SyncSender<DecodedFrame>,
+) {
     use zeditor_media::decoder::{FfmpegDecoder, VideoDecoder};
 
-    let mut cache = DECODER_CACHE.lock().map_err(|e| format!("lock: {e}"))?;
+    let mut decoder_state: Option<CachedDecoder> = None;
+    let mut running = false;
+    let mut is_continuous = false;
+    let mut target_time: f64 = 0.0;
+    let mut seeking_to_target = false;
 
-    // Reuse existing decoder if same path
-    let needs_open = match &*cache {
-        Some(cached) => cached.path != path,
-        None => true,
-    };
-
-    if needs_open {
-        let decoder = FfmpegDecoder::open(&path).map_err(|e| format!("{e}"))?;
-        *cache = Some(CachedDecoder {
-            path: path.clone(),
-            decoder,
-            last_pts: -1.0,
-        });
-    }
-
-    let cached = cache.as_mut().unwrap();
-
-    // Decide whether to seek:
-    // - If target is before current position, must seek backward
-    // - If target is far ahead (>2s), seek rather than decode through
-    // - If target is close ahead, just decode forward (much faster)
-    let needs_seek = source_time < cached.last_pts
-        || (source_time - cached.last_pts) > 2.0
-        || cached.last_pts < 0.0;
-
-    if needs_seek {
-        cached
-            .decoder
-            .seek_to(source_time)
-            .map_err(|e| format!("{e}"))?;
-        cached.last_pts = -1.0;
-    }
-
-    // Decode frames until we reach or pass the target timestamp.
-    // Use scaled decode to avoid processing full 4K pixels.
     loop {
-        match cached
-            .decoder
-            .decode_next_frame_scaled(PREVIEW_MAX_WIDTH, PREVIEW_MAX_HEIGHT)
-            .map_err(|e| format!("{e}"))?
-        {
-            Some(frame) => {
-                cached.last_pts = frame.pts_secs;
-                // Accept this frame if it's at or past the target
-                if frame.pts_secs >= source_time - 0.05 {
-                    let rgba = rgb24_to_rgba32(&frame.data, frame.width, frame.height);
-                    return Ok((rgba, frame.width, frame.height));
-                }
-                // Otherwise keep decoding forward (skipping pre-target frames)
+        // If not actively decoding, block until we get a request
+        // If actively decoding, check for new requests non-blocking
+        let request = if running {
+            match request_rx.try_recv() {
+                Ok(req) => Some(req),
+                Err(mpsc::TryRecvError::Empty) => None,
+                Err(mpsc::TryRecvError::Disconnected) => return,
             }
-            None => {
-                // Hit EOF - clear cache for next use
-                *cache = None;
-                return Err("No frame found".into());
+        } else {
+            match request_rx.recv() {
+                Ok(req) => Some(req),
+                Err(_) => return,
+            }
+        };
+
+        if let Some(request) = request {
+            match request {
+                DecodeRequest::Seek {
+                    path,
+                    time,
+                    continuous,
+                } => {
+                    let needs_open = match &decoder_state {
+                        Some(cached) => cached.path != path,
+                        None => true,
+                    };
+                    if needs_open {
+                        match FfmpegDecoder::open(&path) {
+                            Ok(decoder) => {
+                                decoder_state = Some(CachedDecoder {
+                                    path,
+                                    decoder,
+                                    last_pts: -1.0,
+                                });
+                            }
+                            Err(_) => {
+                                running = false;
+                                continue;
+                            }
+                        }
+                    }
+                    let cached = decoder_state.as_mut().unwrap();
+
+                    // Decide whether to seek or decode forward
+                    let needs_seek = time < cached.last_pts
+                        || (time - cached.last_pts) > 2.0
+                        || cached.last_pts < 0.0;
+
+                    if needs_seek {
+                        if cached.decoder.seek_to(time).is_err() {
+                            running = false;
+                            continue;
+                        }
+                        cached.last_pts = -1.0;
+                        seeking_to_target = true;
+                    } else {
+                        seeking_to_target = false;
+                    }
+                    target_time = time;
+                    is_continuous = continuous;
+                    running = true;
+                }
+                DecodeRequest::Stop => {
+                    running = false;
+                    continue;
+                }
+            }
+        }
+
+        if running {
+            let cached = decoder_state.as_mut().unwrap();
+            match cached
+                .decoder
+                .decode_next_frame_rgba_scaled(PREVIEW_MAX_WIDTH, PREVIEW_MAX_HEIGHT)
+            {
+                Ok(Some(frame)) => {
+                    cached.last_pts = frame.pts_secs;
+
+                    // After a seek, skip pre-target frames (between keyframe and target)
+                    if seeking_to_target && frame.pts_secs < target_time - 0.05 {
+                        continue;
+                    }
+                    seeking_to_target = false;
+
+                    let decoded = DecodedFrame {
+                        rgba: frame.data,
+                        width: frame.width,
+                        height: frame.height,
+                        pts_secs: frame.pts_secs,
+                    };
+                    // Send to UI; blocks if buffer is full (backpressure)
+                    if frame_tx.send(decoded).is_err() {
+                        return; // UI dropped the receiver
+                    }
+
+                    // In scrub mode, stop after sending one target frame
+                    if !is_continuous {
+                        running = false;
+                    }
+                }
+                Ok(None) => {
+                    // EOF
+                    running = false;
+                }
+                Err(_) => {
+                    running = false;
+                }
             }
         }
     }

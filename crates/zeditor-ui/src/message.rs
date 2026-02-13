@@ -51,7 +51,6 @@ pub enum Message {
     SeekTo(TimelinePosition),
     TogglePlayback,
     PlaybackTick,
-    FrameDecoded(Result<(Vec<u8>, u32, u32), String>),
 
     // Keyboard
     KeyboardEvent(iced::keyboard::Event),

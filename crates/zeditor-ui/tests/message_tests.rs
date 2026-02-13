@@ -360,31 +360,6 @@ fn test_click_without_selection_moves_cursor() {
 }
 
 #[test]
-fn test_frame_decoded_updates_display() {
-    let mut app = App::new();
-    app.decode_in_flight = true;
-    assert!(app.current_frame.is_none());
-
-    // 2x2 RGBA test data
-    let rgba = vec![255u8; 2 * 2 * 4];
-    app.update(Message::FrameDecoded(Ok((rgba, 2, 2))));
-
-    assert!(!app.decode_in_flight);
-    assert!(app.current_frame.is_some());
-}
-
-#[test]
-fn test_frame_decoded_error() {
-    let mut app = App::new();
-    app.decode_in_flight = true;
-
-    app.update(Message::FrameDecoded(Err("decode failed".into())));
-    assert!(!app.decode_in_flight);
-    // Should keep previous frame (None in this case)
-    assert!(app.current_frame.is_none());
-}
-
-#[test]
 fn test_rgb24_to_rgba32() {
     let rgb = vec![255, 0, 0, 0, 255, 0, 0, 0, 255, 128, 128, 128];
     let rgba = zeditor_ui::app::rgb24_to_rgba32(&rgb, 2, 2);
