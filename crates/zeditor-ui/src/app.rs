@@ -7,8 +7,9 @@ use iced::{keyboard, time, Element, Length, Subscription, Task};
 use uuid::Uuid;
 
 use zeditor_core::project::Project;
-use zeditor_core::timeline::{Clip, TimeRange, TimelinePosition};
+use zeditor_core::timeline::{Clip, TimeRange, TimelinePosition, TrackType};
 
+use crate::audio_player::AudioPlayer;
 use crate::message::{Message, ToolMode};
 use crate::widgets::timeline_canvas::TimelineCanvas;
 
@@ -26,6 +27,24 @@ enum DecodeRequest {
         continuous: bool,
     },
     Stop,
+}
+
+/// Request sent from UI to the audio decode thread.
+enum AudioDecodeRequest {
+    Seek {
+        path: PathBuf,
+        time: f64,
+        continuous: bool,
+    },
+    Stop,
+}
+
+/// Decoded audio sent from the audio decode thread to the UI.
+pub(crate) struct DecodedAudio {
+    pub(crate) samples: Vec<f32>,
+    pub(crate) sample_rate: u32,
+    pub(crate) channels: u16,
+    pub(crate) pts_secs: f64,
 }
 
 /// Decoded frame sent from the decode thread to the UI.
@@ -58,6 +77,12 @@ pub struct App {
     pending_frame: Option<DecodedFrame>,
     /// After a decode transition, discard frames that are too far ahead (stale from old context).
     drain_stale: bool,
+    // Audio playback
+    audio_player: Option<AudioPlayer>,
+    audio_decode_tx: Option<mpsc::Sender<AudioDecodeRequest>>,
+    pub(crate) audio_decode_rx: Option<mpsc::Receiver<DecodedAudio>>,
+    pub(crate) audio_decode_clip_id: Option<Uuid>,
+    pub(crate) audio_decode_time_offset: f64,
 }
 
 impl Default for App {
@@ -80,6 +105,11 @@ impl Default for App {
             decode_time_offset: 0.0,
             pending_frame: None,
             drain_stale: false,
+            audio_player: None,
+            audio_decode_tx: None,
+            audio_decode_rx: None,
+            audio_decode_clip_id: None,
+            audio_decode_time_offset: 0.0,
         }
     }
 }
@@ -97,9 +127,20 @@ impl App {
             decode_worker(req_rx, frame_tx);
         });
 
+        // Audio decode thread
+        let (audio_req_tx, audio_req_rx) = mpsc::channel::<AudioDecodeRequest>();
+        let (audio_frame_tx, audio_frame_rx) = mpsc::sync_channel::<DecodedAudio>(4);
+
+        std::thread::spawn(move || {
+            audio_decode_worker(audio_req_rx, audio_frame_tx);
+        });
+
         let mut app = Self::default();
         app.decode_tx = Some(req_tx);
         app.decode_rx = Some(frame_rx);
+        app.audio_decode_tx = Some(audio_req_tx);
+        app.audio_decode_rx = Some(audio_frame_rx);
+        app.audio_player = AudioPlayer::new();
         (app, Task::none())
     }
 
@@ -200,18 +241,40 @@ impl App {
                         start: TimelinePosition::zero(),
                         end: TimelinePosition::from_secs_f64(asset.duration.as_secs_f64()),
                     };
-                    let clip = Clip::new(asset_id, position, source_range);
-                    let result = self.project.command_history.execute(
-                        &mut self.project.timeline,
-                        "Add clip",
-                        |tl| tl.add_clip_trimming_overlaps(track_index, clip),
-                    );
-                    match result {
-                        Ok(()) => {
-                            self.status_message = "Clip added".into();
+                    let has_audio = asset.has_audio;
+                    let audio_track = self.project.timeline.find_paired_audio_track(track_index);
+
+                    if has_audio && audio_track.is_some() {
+                        let audio_track = audio_track.unwrap();
+                        let result = self.project.command_history.execute(
+                            &mut self.project.timeline,
+                            "Add clip",
+                            |tl| {
+                                tl.add_clip_with_audio(track_index, audio_track, asset_id, position, source_range)
+                            },
+                        );
+                        match result {
+                            Ok(_) => {
+                                self.status_message = "Clip added".into();
+                            }
+                            Err(e) => {
+                                self.status_message = format!("Add clip failed: {e}");
+                            }
                         }
-                        Err(e) => {
-                            self.status_message = format!("Add clip failed: {e}");
+                    } else {
+                        let clip = Clip::new(asset_id, position, source_range);
+                        let result = self.project.command_history.execute(
+                            &mut self.project.timeline,
+                            "Add clip",
+                            |tl| tl.add_clip_trimming_overlaps(track_index, clip),
+                        );
+                        match result {
+                            Ok(()) => {
+                                self.status_message = "Clip added".into();
+                            }
+                            Err(e) => {
+                                self.status_message = format!("Add clip failed: {e}");
+                            }
                         }
                     }
                 } else {
@@ -226,11 +289,21 @@ impl App {
                 position,
             } => {
                 let snap_threshold = Duration::from_millis(200);
+                let has_link = self.project.timeline.track(source_track)
+                    .ok()
+                    .and_then(|t| t.get_clip(clip_id))
+                    .and_then(|c| c.link_id)
+                    .is_some();
+
                 let result = self.project.command_history.execute(
                     &mut self.project.timeline,
                     "Move clip",
                     |tl| {
-                        tl.move_clip(source_track, clip_id, dest_track, position)?;
+                        if has_link {
+                            tl.move_clip_grouped(source_track, clip_id, dest_track, position)?;
+                        } else {
+                            tl.move_clip(source_track, clip_id, dest_track, position)?;
+                        }
                         let _ = tl.snap_to_adjacent(dest_track, clip_id, snap_threshold);
                         Ok(())
                     },
@@ -244,11 +317,25 @@ impl App {
                 track_index,
                 position,
             } => {
-                let result = self.project.command_history.execute(
-                    &mut self.project.timeline,
-                    "Cut clip",
-                    |tl| tl.cut_at(track_index, position),
-                );
+                let has_link = self.project.timeline.track(track_index)
+                    .ok()
+                    .and_then(|t| t.clip_at(position))
+                    .and_then(|c| c.link_id)
+                    .is_some();
+
+                let result = if has_link {
+                    self.project.command_history.execute(
+                        &mut self.project.timeline,
+                        "Cut clip",
+                        |tl| tl.cut_at_grouped(track_index, position),
+                    )
+                } else {
+                    self.project.command_history.execute(
+                        &mut self.project.timeline,
+                        "Cut clip",
+                        |tl| tl.cut_at(track_index, position).map(|pair| vec![pair]),
+                    )
+                };
                 match result {
                     Ok(_) => {
                         self.status_message = "Clip cut".into();
@@ -264,10 +351,22 @@ impl App {
                 clip_id,
                 new_end,
             } => {
+                let has_link = self.project.timeline.track(track_index)
+                    .ok()
+                    .and_then(|t| t.get_clip(clip_id))
+                    .and_then(|c| c.link_id)
+                    .is_some();
+
                 let result = self.project.command_history.execute(
                     &mut self.project.timeline,
                     "Resize clip",
-                    |tl| tl.resize_clip(track_index, clip_id, new_end),
+                    |tl| {
+                        if has_link {
+                            tl.resize_clip_grouped(track_index, clip_id, new_end)
+                        } else {
+                            tl.resize_clip(track_index, clip_id, new_end)
+                        }
+                    },
                 );
                 if let Err(e) = result {
                     self.status_message = format!("Resize failed: {e}");
@@ -312,18 +411,40 @@ impl App {
                         start: TimelinePosition::zero(),
                         end: TimelinePosition::from_secs_f64(asset.duration.as_secs_f64()),
                     };
-                    let clip = Clip::new(asset_id, position, source_range);
-                    let result = self.project.command_history.execute(
-                        &mut self.project.timeline,
-                        "Place clip",
-                        |tl| tl.add_clip_trimming_overlaps(track_index, clip),
-                    );
-                    match result {
-                        Ok(()) => {
-                            self.status_message = "Clip placed".into();
+                    let has_audio = asset.has_audio;
+                    let audio_track = self.project.timeline.find_paired_audio_track(track_index);
+
+                    if has_audio && audio_track.is_some() {
+                        let audio_track = audio_track.unwrap();
+                        let result = self.project.command_history.execute(
+                            &mut self.project.timeline,
+                            "Place clip",
+                            |tl| {
+                                tl.add_clip_with_audio(track_index, audio_track, asset_id, position, source_range)
+                            },
+                        );
+                        match result {
+                            Ok(_) => {
+                                self.status_message = "Clip placed".into();
+                            }
+                            Err(e) => {
+                                self.status_message = format!("Place failed: {e}");
+                            }
                         }
-                        Err(e) => {
-                            self.status_message = format!("Place failed: {e}");
+                    } else {
+                        let clip = Clip::new(asset_id, position, source_range);
+                        let result = self.project.command_history.execute(
+                            &mut self.project.timeline,
+                            "Place clip",
+                            |tl| tl.add_clip_trimming_overlaps(track_index, clip),
+                        );
+                        match result {
+                            Ok(()) => {
+                                self.status_message = "Clip placed".into();
+                            }
+                            Err(e) => {
+                                self.status_message = format!("Place failed: {e}");
+                            }
                         }
                     }
                 } else {
@@ -337,12 +458,20 @@ impl App {
                 self.playback_start_wall = Some(Instant::now());
                 self.playback_start_pos = self.playback_position;
                 self.send_decode_seek(true);
+                self.send_audio_decode_seek(true);
+                if let Some(player) = &self.audio_player {
+                    player.play();
+                }
                 Task::none()
             }
             Message::Pause => {
                 self.is_playing = false;
                 self.playback_start_wall = None;
                 self.send_decode_stop();
+                self.send_audio_decode_stop();
+                if let Some(player) = &self.audio_player {
+                    player.pause();
+                }
                 Task::none()
             }
             Message::TogglePlayback => {
@@ -367,19 +496,25 @@ impl App {
                             new_pos as f32 * self.timeline_zoom - visible_width * 0.5;
                     }
 
-                    // Check if we've crossed into a different clip
+                    // Check if we've crossed into a different video clip
                     let current_clip_id =
                         self.clip_at_position(self.playback_position).map(|(_, c)| c.id);
                     if current_clip_id != self.decode_clip_id {
                         self.send_decode_seek(true);
-                        // Mark stale so poll_decoded_frame discards any raced
-                        // frames from the old decode context (wrong time offset).
                         self.drain_stale = true;
+                    }
+
+                    // Check if audio clip changed
+                    let current_audio_id =
+                        self.audio_clip_at_position(self.playback_position).map(|(_, c)| c.id);
+                    if current_audio_id != self.audio_decode_clip_id {
+                        self.send_audio_decode_seek(true);
                     }
                 }
 
-                // Drain decoded frames from the channel
+                // Drain decoded frames from the channels
                 self.poll_decoded_frame();
+                self.poll_decoded_audio();
                 Task::none()
             }
             Message::SeekTo(pos) => {
@@ -582,11 +717,25 @@ impl App {
         column![controls, canvas].spacing(4).into()
     }
 
-    /// Find the clip at the given playback position across all tracks.
+    /// Find the video clip at the given playback position (searches only video tracks).
     pub fn clip_at_position(&self, pos: TimelinePosition) -> Option<(usize, &Clip)> {
         for (i, track) in self.project.timeline.tracks.iter().enumerate() {
-            if let Some(clip) = track.clip_at(pos) {
-                return Some((i, clip));
+            if track.track_type == TrackType::Video {
+                if let Some(clip) = track.clip_at(pos) {
+                    return Some((i, clip));
+                }
+            }
+        }
+        None
+    }
+
+    /// Find the audio clip at the given playback position (searches only audio tracks).
+    pub fn audio_clip_at_position(&self, pos: TimelinePosition) -> Option<(usize, &Clip)> {
+        for (i, track) in self.project.timeline.tracks.iter().enumerate() {
+            if track.track_type == TrackType::Audio {
+                if let Some(clip) = track.clip_at(pos) {
+                    return Some((i, clip));
+                }
             }
         }
         None
@@ -700,6 +849,77 @@ impl App {
                 // Frame is ahead of playback — hold it for a future tick
                 self.pending_frame = Some(frame);
                 return;
+            }
+        }
+    }
+    /// Send a seek request to the audio decode thread for the current playback position.
+    fn send_audio_decode_seek(&mut self, continuous: bool) {
+        // Drain stale audio from the channel
+        if let Some(rx) = &self.audio_decode_rx {
+            while rx.try_recv().is_ok() {}
+        }
+
+        let clip_info =
+            self.audio_clip_at_position(self.playback_position)
+                .map(|(_, clip)| {
+                    (
+                        clip.id,
+                        clip.asset_id,
+                        clip.timeline_range.start.as_secs_f64(),
+                        clip.source_range.start.as_secs_f64(),
+                    )
+                });
+
+        if let Some((clip_id, asset_id, clip_tl_start, clip_src_start)) = clip_info {
+            let playback_pos = self.playback_position.as_secs_f64();
+            let source_time = clip_src_start + (playback_pos - clip_tl_start);
+            let path = self
+                .project
+                .source_library
+                .get(asset_id)
+                .map(|a| a.path.clone());
+
+            if let Some(path) = path {
+                self.audio_decode_clip_id = Some(clip_id);
+                self.audio_decode_time_offset = clip_tl_start - clip_src_start;
+                if let Some(tx) = &self.audio_decode_tx {
+                    let _ = tx.send(AudioDecodeRequest::Seek {
+                        path,
+                        time: source_time,
+                        continuous,
+                    });
+                }
+                return;
+            }
+        }
+        self.audio_decode_clip_id = None;
+        self.send_audio_decode_stop();
+        if let Some(player) = &self.audio_player {
+            player.stop();
+        }
+    }
+
+    /// Tell the audio decode thread to stop.
+    fn send_audio_decode_stop(&self) {
+        if let Some(tx) = &self.audio_decode_tx {
+            let _ = tx.send(AudioDecodeRequest::Stop);
+        }
+    }
+
+    /// Drain decoded audio frames and feed them to the audio player.
+    fn poll_decoded_audio(&mut self) {
+        if self.audio_decode_clip_id.is_none() {
+            if let Some(rx) = &self.audio_decode_rx {
+                while rx.try_recv().is_ok() {}
+            }
+            return;
+        }
+
+        if let Some(rx) = &self.audio_decode_rx {
+            while let Ok(audio) = rx.try_recv() {
+                if let Some(player) = &self.audio_player {
+                    player.queue_audio(audio.samples, audio.sample_rate, audio.channels);
+                }
             }
         }
     }
@@ -841,6 +1061,130 @@ fn decode_worker(
                 }
                 Ok(None) => {
                     // EOF
+                    running = false;
+                }
+                Err(_) => {
+                    running = false;
+                }
+            }
+        }
+    }
+}
+
+/// Cached audio decoder state for the audio decode worker thread.
+struct CachedAudioDecoder {
+    path: PathBuf,
+    decoder: zeditor_media::audio_decoder::FfmpegAudioDecoder,
+    last_pts: f64,
+}
+
+/// Background audio decode worker thread. Mirrors the video decode worker pattern.
+fn audio_decode_worker(
+    request_rx: mpsc::Receiver<AudioDecodeRequest>,
+    audio_tx: mpsc::SyncSender<DecodedAudio>,
+) {
+    use zeditor_media::audio_decoder::FfmpegAudioDecoder;
+
+    let mut decoder_state: Option<CachedAudioDecoder> = None;
+    let mut running = false;
+    let mut is_continuous = false;
+    let mut target_time: f64 = 0.0;
+    let mut seeking_to_target = false;
+
+    loop {
+        let request = if running {
+            match request_rx.try_recv() {
+                Ok(req) => Some(req),
+                Err(mpsc::TryRecvError::Empty) => None,
+                Err(mpsc::TryRecvError::Disconnected) => return,
+            }
+        } else {
+            match request_rx.recv() {
+                Ok(req) => Some(req),
+                Err(_) => return,
+            }
+        };
+
+        if let Some(request) = request {
+            match request {
+                AudioDecodeRequest::Seek {
+                    path,
+                    time,
+                    continuous,
+                } => {
+                    let needs_open = match &decoder_state {
+                        Some(cached) => cached.path != path,
+                        None => true,
+                    };
+                    if needs_open {
+                        match FfmpegAudioDecoder::open(&path) {
+                            Ok(decoder) => {
+                                decoder_state = Some(CachedAudioDecoder {
+                                    path,
+                                    decoder,
+                                    last_pts: -1.0,
+                                });
+                            }
+                            Err(_) => {
+                                running = false;
+                                continue;
+                            }
+                        }
+                    }
+                    let cached = decoder_state.as_mut().unwrap();
+
+                    let needs_seek = time < cached.last_pts
+                        || (time - cached.last_pts) > 2.0
+                        || cached.last_pts < 0.0;
+
+                    if needs_seek {
+                        if cached.decoder.seek_to(time).is_err() {
+                            running = false;
+                            continue;
+                        }
+                        cached.last_pts = -1.0;
+                        seeking_to_target = true;
+                    } else {
+                        seeking_to_target = false;
+                    }
+                    target_time = time;
+                    is_continuous = continuous;
+                    running = true;
+                }
+                AudioDecodeRequest::Stop => {
+                    running = false;
+                    continue;
+                }
+            }
+        }
+
+        if running {
+            let cached = decoder_state.as_mut().unwrap();
+            match cached.decoder.decode_next_audio_frame() {
+                Ok(Some(frame)) => {
+                    cached.last_pts = frame.pts_secs;
+
+                    // Skip pre-target frames after seek
+                    if seeking_to_target && frame.pts_secs < target_time - 0.05 {
+                        continue;
+                    }
+                    seeking_to_target = false;
+
+                    let decoded = DecodedAudio {
+                        samples: frame.samples,
+                        sample_rate: frame.sample_rate,
+                        channels: frame.channels,
+                        pts_secs: frame.pts_secs,
+                    };
+                    if audio_tx.send(decoded).is_err() {
+                        return;
+                    }
+
+                    if !is_continuous {
+                        running = false;
+                    }
+                }
+                Ok(None) => {
                     running = false;
                 }
                 Err(_) => {

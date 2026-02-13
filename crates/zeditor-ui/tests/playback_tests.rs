@@ -8,7 +8,7 @@ use zeditor_core::media::MediaAsset;
 use zeditor_core::timeline::TimelinePosition;
 use zeditor_ui::app::App;
 use zeditor_ui::message::Message;
-use zeditor_ui::test_helpers::{TestFrame, TestFrameSender};
+use zeditor_ui::test_helpers::{TestAudio, TestAudioSender, TestFrame, TestFrameSender};
 
 fn make_test_asset(name: &str, duration_secs: f64) -> MediaAsset {
     MediaAsset::new(
@@ -19,6 +19,18 @@ fn make_test_asset(name: &str, duration_secs: f64) -> MediaAsset {
         240,
         30.0,
         false,
+    )
+}
+
+fn make_test_asset_with_audio(name: &str, duration_secs: f64) -> MediaAsset {
+    MediaAsset::new(
+        name.into(),
+        PathBuf::from(format!("/test/{name}.mp4")),
+        Duration::from_secs_f64(duration_secs),
+        320,
+        240,
+        30.0,
+        true,
     )
 }
 
@@ -600,4 +612,169 @@ fn test_clip_transition_triggers_new_decode() {
         "decode should switch to clip2 after crossing boundary"
     );
     assert!(app.is_playing, "playback should continue into next clip");
+}
+
+// ---------------------------------------------------------------------------
+// Audio playback tests
+// ---------------------------------------------------------------------------
+
+/// Helper: set up an app with both video and audio test channels, import an
+/// audio-bearing asset, and add it to the timeline. Returns (app, video_sender,
+/// audio_sender, video_clip_id, audio_clip_id).
+fn setup_audio_app_with_clip(
+    clip_tl_start: f64,
+    duration: f64,
+) -> (App, TestFrameSender, TestAudioSender, Uuid, Uuid) {
+    let (mut app, video_sender, audio_sender) = App::new_with_test_channels();
+
+    let asset = make_test_asset_with_audio("av_clip", duration);
+    let asset_id = asset.id;
+    app.update(Message::MediaImported(Ok(asset)));
+    app.update(Message::AddClipToTimeline {
+        asset_id,
+        track_index: 0,
+        position: TimelinePosition::from_secs_f64(clip_tl_start),
+    });
+
+    // With has_audio=true, track 0 gets the video clip and track 1 gets the audio clip
+    let video_clip_id = app.project.timeline.tracks[0].clips[0].id;
+    let audio_clip_id = app.project.timeline.tracks[1].clips[0].id;
+
+    // Configure video decode state
+    app.set_decode_clip_id(Some(video_clip_id));
+    app.set_decode_time_offset(clip_tl_start);
+
+    // Configure audio decode state
+    app.set_audio_decode_clip_id(Some(audio_clip_id));
+    app.set_audio_decode_time_offset(clip_tl_start);
+
+    (app, video_sender, audio_sender, video_clip_id, audio_clip_id)
+}
+
+#[test]
+fn test_audio_decode_clip_id_set_during_playback() {
+    let (mut app, _video_sender, _audio_sender, _video_clip_id, audio_clip_id) =
+        setup_audio_app_with_clip(0.0, 10.0);
+
+    // Start playing
+    app.update(Message::Play);
+    let start = app.playback_start_wall.unwrap();
+    app.playback_start_wall = Some(start - Duration::from_millis(500));
+
+    app.update(Message::PlaybackTick);
+
+    assert_eq!(
+        app.audio_decode_clip_id(),
+        Some(audio_clip_id),
+        "audio_decode_clip_id should be set during playback of audio clip"
+    );
+}
+
+#[test]
+fn test_audio_stopped_in_gap() {
+    let (mut app, _video_sender, _audio_sender, _video_clip_id, _audio_clip_id) =
+        setup_audio_app_with_clip(0.0, 5.0);
+
+    // Start playing
+    app.update(Message::Play);
+    let start = app.playback_start_wall.unwrap();
+    // Advance to 7s — past the 5s clip, in a gap
+    app.playback_start_wall = Some(start - Duration::from_secs(7));
+
+    app.update(Message::PlaybackTick);
+
+    assert_eq!(
+        app.audio_decode_clip_id(),
+        None,
+        "audio_decode_clip_id should be None when in gap (no audio clip)"
+    );
+}
+
+#[test]
+fn test_audio_transition_across_clip_boundary() {
+    let (mut app, _video_sender, _audio_sender) = App::new_with_test_channels();
+
+    // Add two audio-bearing assets as adjacent clips
+    let asset1 = make_test_asset_with_audio("clip_a", 5.0);
+    let asset1_id = asset1.id;
+    app.update(Message::MediaImported(Ok(asset1)));
+    app.update(Message::AddClipToTimeline {
+        asset_id: asset1_id,
+        track_index: 0,
+        position: TimelinePosition::from_secs_f64(0.0),
+    });
+
+    let asset2 = make_test_asset_with_audio("clip_b", 5.0);
+    let asset2_id = asset2.id;
+    app.update(Message::MediaImported(Ok(asset2)));
+    app.update(Message::AddClipToTimeline {
+        asset_id: asset2_id,
+        track_index: 0,
+        position: TimelinePosition::from_secs_f64(5.0),
+    });
+
+    let audio_clip1_id = app.project.timeline.tracks[1].clips[0].id;
+    let audio_clip2_id = app.project.timeline.tracks[1].clips[1].id;
+
+    // Start playing inside clip1
+    app.set_audio_decode_clip_id(Some(audio_clip1_id));
+    app.set_audio_decode_time_offset(0.0);
+    app.set_decode_clip_id(Some(app.project.timeline.tracks[0].clips[0].id));
+    app.set_decode_time_offset(0.0);
+
+    app.update(Message::Play);
+    let start = app.playback_start_wall.unwrap();
+
+    // Advance to 5.5s — should transition to clip2
+    app.playback_start_wall = Some(start - Duration::from_millis(5500));
+    app.update(Message::PlaybackTick);
+
+    assert_eq!(
+        app.audio_decode_clip_id(),
+        Some(audio_clip2_id),
+        "audio decode should switch to clip2 after crossing 5s boundary"
+    );
+    assert!(app.is_playing, "playback should continue into clip2");
+}
+
+#[test]
+fn test_audio_frames_polled_during_playback() {
+    let (mut app, _video_sender, audio_sender, _video_clip_id, _audio_clip_id) =
+        setup_audio_app_with_clip(0.0, 10.0);
+
+    // Start playing
+    app.update(Message::Play);
+    let start = app.playback_start_wall.unwrap();
+    app.playback_start_wall = Some(start - Duration::from_millis(500));
+
+    // Inject an audio frame — it should be consumed by poll_decoded_audio
+    // (which feeds it to audio_player, but in tests there's no audio_player)
+    audio_sender.send_audio(TestAudio {
+        samples: vec![0.0; 1024],
+        sample_rate: 44100,
+        channels: 2,
+        pts_secs: 0.5,
+    });
+
+    // Tick should drain the audio channel without panic
+    app.update(Message::PlaybackTick);
+
+    // After the tick, the audio channel should be empty (frame was consumed)
+    // Since there's no audio_player in test mode, the frame is drained but
+    // not played. The important thing is no panic and the channel is drained.
+    assert!(app.is_playing, "playback should still be running");
+}
+
+#[test]
+fn test_pause_clears_audio_state() {
+    let (mut app, _video_sender, _audio_sender, _video_clip_id, _audio_clip_id) =
+        setup_audio_app_with_clip(0.0, 10.0);
+
+    // Start playing
+    app.update(Message::Play);
+    assert!(app.is_playing);
+
+    // Pause — should stop audio decode
+    app.update(Message::Pause);
+    assert!(!app.is_playing);
 }

@@ -83,6 +83,10 @@ pub struct Clip {
     pub timeline_range: TimeRange,
     /// The portion of the source media used (in/out points).
     pub source_range: TimeRange,
+    /// Link ID for paired clips (e.g. video+audio from same source).
+    /// Clips with the same link_id move/resize/cut together.
+    #[serde(default)]
+    pub link_id: Option<Uuid>,
 }
 
 impl Clip {
@@ -102,6 +106,7 @@ impl Clip {
             asset_id,
             timeline_range,
             source_range,
+            link_id: None,
         }
     }
 
@@ -122,19 +127,42 @@ pub struct TrimPreview {
     pub trimmed_end: Option<f64>,
 }
 
+/// Whether a track holds video or audio clips.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum TrackType {
+    #[default]
+    Video,
+    Audio,
+}
+
 /// A track containing an ordered sequence of non-overlapping clips.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct Track {
     pub name: String,
     pub clips: Vec<Clip>,
+    #[serde(default)]
+    pub track_type: TrackType,
+    /// Tracks sharing a group_id are grouped (e.g. Video 1 + Audio 1).
+    #[serde(default)]
+    pub group_id: Option<Uuid>,
 }
 
 impl Track {
-    pub fn new(name: impl Into<String>) -> Self {
+    pub fn new(name: impl Into<String>, track_type: TrackType) -> Self {
         Self {
             name: name.into(),
             clips: Vec::new(),
+            track_type,
+            group_id: None,
         }
+    }
+
+    pub fn video(name: impl Into<String>) -> Self {
+        Self::new(name, TrackType::Video)
+    }
+
+    pub fn audio(name: impl Into<String>) -> Self {
+        Self::new(name, TrackType::Audio)
     }
 
     /// Add a clip, checking for overlaps with existing clips.
@@ -215,6 +243,7 @@ impl Track {
                         start: right_source_start,
                         end: existing.source_range.end,
                     },
+                    link_id: existing.link_id,
                 };
                 to_add.push(right_piece);
 
@@ -418,10 +447,65 @@ impl Timeline {
         Self { tracks: Vec::new() }
     }
 
-    pub fn add_track(&mut self, name: impl Into<String>) -> usize {
+    pub fn add_track(&mut self, name: impl Into<String>, track_type: TrackType) -> usize {
         let idx = self.tracks.len();
-        self.tracks.push(Track::new(name));
+        self.tracks.push(Track::new(name, track_type));
         idx
+    }
+
+    pub fn add_track_with_group(
+        &mut self,
+        name: impl Into<String>,
+        track_type: TrackType,
+        group_id: Option<Uuid>,
+    ) -> usize {
+        let idx = self.tracks.len();
+        let mut track = Track::new(name, track_type);
+        track.group_id = group_id;
+        self.tracks.push(track);
+        idx
+    }
+
+    /// Find all track indices that share the same group_id as the given track.
+    pub fn group_members(&self, track_index: usize) -> Vec<usize> {
+        let group_id = match self.tracks.get(track_index) {
+            Some(track) => track.group_id,
+            None => return vec![],
+        };
+        match group_id {
+            Some(gid) => self
+                .tracks
+                .iter()
+                .enumerate()
+                .filter(|(_, t)| t.group_id == Some(gid))
+                .map(|(i, _)| i)
+                .collect(),
+            None => vec![track_index],
+        }
+    }
+
+    /// Find all clips across all tracks that share the given link_id.
+    /// Returns (track_index, clip_id) pairs.
+    pub fn find_linked_clips(&self, link_id: Uuid) -> Vec<(usize, Uuid)> {
+        let mut result = Vec::new();
+        for (i, track) in self.tracks.iter().enumerate() {
+            for clip in &track.clips {
+                if clip.link_id == Some(link_id) {
+                    result.push((i, clip.id));
+                }
+            }
+        }
+        result
+    }
+
+    /// Find the audio track paired with a video track via group_id.
+    pub fn find_paired_audio_track(&self, video_track_index: usize) -> Option<usize> {
+        let group_id = self.tracks.get(video_track_index)?.group_id?;
+        self.tracks
+            .iter()
+            .enumerate()
+            .find(|(i, t)| *i != video_track_index && t.group_id == Some(group_id) && t.track_type == TrackType::Audio)
+            .map(|(i, _)| i)
     }
 
     pub fn track(&self, index: usize) -> Result<&Track> {
@@ -472,6 +556,8 @@ impl Timeline {
         let source_split =
             TimelinePosition(clip.source_range.start.as_duration() + offset_in_clip);
 
+        let clip_link_id = clip.link_id;
+
         // Left clip: original start to cut position.
         let left = Clip {
             id: Uuid::new_v4(),
@@ -484,6 +570,7 @@ impl Timeline {
                 start: clip.source_range.start,
                 end: source_split,
             },
+            link_id: clip_link_id,
         };
 
         // Right clip: cut position to original end.
@@ -498,6 +585,7 @@ impl Timeline {
                 start: source_split,
                 end: clip.source_range.end,
             },
+            link_id: clip_link_id,
         };
 
         let left_id = left.id;
@@ -631,6 +719,180 @@ impl Timeline {
         } else {
             Ok(None)
         }
+    }
+
+    /// Add a clip to both video and audio tracks with a shared link_id.
+    /// Returns (video_clip_id, audio_clip_id).
+    pub fn add_clip_with_audio(
+        &mut self,
+        video_track: usize,
+        audio_track: usize,
+        asset_id: Uuid,
+        position: TimelinePosition,
+        source_range: TimeRange,
+    ) -> Result<(Uuid, Uuid)> {
+        let link_id = Uuid::new_v4();
+
+        let mut video_clip = Clip::new(asset_id, position, source_range);
+        video_clip.link_id = Some(link_id);
+        let video_clip_id = video_clip.id;
+
+        let mut audio_clip = Clip::new(asset_id, position, source_range);
+        audio_clip.link_id = Some(link_id);
+        let audio_clip_id = audio_clip.id;
+
+        self.track_mut(video_track)?.add_clip_trimming_overlaps(video_clip);
+        self.track_mut(audio_track)?.add_clip_trimming_overlaps(audio_clip);
+
+        Ok((video_clip_id, audio_clip_id))
+    }
+
+    /// Move a clip and all its linked clips by the same delta.
+    pub fn move_clip_grouped(
+        &mut self,
+        source_track: usize,
+        clip_id: Uuid,
+        dest_track: usize,
+        new_position: TimelinePosition,
+    ) -> Result<()> {
+        // Get the original clip's position and link_id
+        let (old_position, link_id) = {
+            let track = self.track(source_track)?;
+            let clip = track.get_clip(clip_id).ok_or(CoreError::ClipNotFound(clip_id))?;
+            (clip.timeline_range.start, clip.link_id)
+        };
+
+        // Move the primary clip
+        self.move_clip(source_track, clip_id, dest_track, new_position)?;
+
+        // If linked, move linked clips by same delta
+        if let Some(link_id) = link_id {
+            let delta_secs = new_position.as_secs_f64() - old_position.as_secs_f64();
+            let linked = self.find_linked_clips(link_id);
+            for (track_idx, linked_clip_id) in linked {
+                if linked_clip_id == clip_id {
+                    continue;
+                }
+                let linked_pos = {
+                    let track = self.track(track_idx)?;
+                    match track.get_clip(linked_clip_id) {
+                        Some(clip) => clip.timeline_range.start,
+                        None => continue, // linked clip was deleted independently
+                    }
+                };
+                let new_linked_pos = TimelinePosition::from_secs_f64(
+                    (linked_pos.as_secs_f64() + delta_secs).max(0.0)
+                );
+                self.move_clip(track_idx, linked_clip_id, track_idx, new_linked_pos)?;
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Resize a clip and all its linked clips by the same delta.
+    pub fn resize_clip_grouped(
+        &mut self,
+        track_index: usize,
+        clip_id: Uuid,
+        new_end: TimelinePosition,
+    ) -> Result<()> {
+        // Get old end and link_id
+        let (old_end, link_id) = {
+            let track = self.track(track_index)?;
+            let clip = track.get_clip(clip_id).ok_or(CoreError::ClipNotFound(clip_id))?;
+            (clip.timeline_range.end, clip.link_id)
+        };
+
+        // Resize primary clip
+        self.resize_clip(track_index, clip_id, new_end)?;
+
+        // If linked, resize linked clips by same delta
+        if let Some(link_id) = link_id {
+            let delta_secs = new_end.as_secs_f64() - old_end.as_secs_f64();
+            let linked = self.find_linked_clips(link_id);
+            for (track_idx, linked_clip_id) in linked {
+                if linked_clip_id == clip_id {
+                    continue;
+                }
+                let linked_end = {
+                    let track = self.track(track_idx)?;
+                    match track.get_clip(linked_clip_id) {
+                        Some(clip) => clip.timeline_range.end,
+                        None => continue, // linked clip was deleted independently
+                    }
+                };
+                let new_linked_end = TimelinePosition::from_secs_f64(
+                    linked_end.as_secs_f64() + delta_secs
+                );
+                self.resize_clip(track_idx, linked_clip_id, new_linked_end)?;
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Cut at a position, splitting linked clips on all their tracks.
+    /// Returns the (left_id, right_id) pairs for all affected clips.
+    pub fn cut_at_grouped(
+        &mut self,
+        track_index: usize,
+        position: TimelinePosition,
+    ) -> Result<Vec<(Uuid, Uuid)>> {
+        // Find the clip at position and get its link_id
+        let link_id = {
+            let track = self.track(track_index)?;
+            let clip = track
+                .clip_at(position)
+                .ok_or(CoreError::CutOutsideClip { position })?;
+            clip.link_id
+        };
+
+        // Cut the primary clip
+        let (left_id, right_id) = self.cut_at(track_index, position)?;
+
+        let mut results = vec![(left_id, right_id)];
+
+        if let Some(link_id) = link_id {
+            // Find other linked clips (before cut)
+            let linked = self.find_linked_clips(link_id);
+            for (track_idx, linked_clip_id) in linked {
+                if track_idx == track_index {
+                    // These are the newly-cut clips (left/right), skip
+                    continue;
+                }
+                // Check if this linked clip contains the cut position
+                let contains = {
+                    let track = self.track(track_idx)?;
+                    if let Some(clip) = track.get_clip(linked_clip_id) {
+                        clip.timeline_range.contains(position)
+                    } else {
+                        false
+                    }
+                };
+                if contains {
+                    let (l, r) = self.cut_at(track_idx, position)?;
+                    results.push((l, r));
+                }
+            }
+
+            // Assign new matching link_ids: left clips get one link_id, right clips get another
+            let new_left_link = Uuid::new_v4();
+            let new_right_link = Uuid::new_v4();
+            for (l_id, r_id) in &results {
+                // Find and update left clip's link_id
+                for track in &mut self.tracks {
+                    if let Some(clip) = track.get_clip_mut(*l_id) {
+                        clip.link_id = Some(new_left_link);
+                    }
+                    if let Some(clip) = track.get_clip_mut(*r_id) {
+                        clip.link_id = Some(new_right_link);
+                    }
+                }
+            }
+        }
+
+        Ok(results)
     }
 
     /// Get the total duration of the timeline (end of last clip across all tracks).

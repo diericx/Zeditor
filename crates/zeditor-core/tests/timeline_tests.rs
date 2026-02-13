@@ -15,7 +15,7 @@ fn make_clip(asset_id: Uuid, start_secs: f64, duration_secs: f64) -> Clip {
 #[test]
 fn test_add_clip_to_track() {
     let mut timeline = Timeline::new();
-    timeline.add_track("Video 1");
+    timeline.add_track("Video 1", TrackType::Video);
 
     let asset_id = Uuid::new_v4();
     let clip = make_clip(asset_id, 0.0, 5.0);
@@ -27,7 +27,7 @@ fn test_add_clip_to_track() {
 #[test]
 fn test_add_multiple_clips_no_overlap() {
     let mut timeline = Timeline::new();
-    timeline.add_track("Video 1");
+    timeline.add_track("Video 1", TrackType::Video);
 
     let asset_id = Uuid::new_v4();
     timeline
@@ -46,7 +46,7 @@ fn test_add_multiple_clips_no_overlap() {
 #[test]
 fn test_add_clip_overlap_fails() {
     let mut timeline = Timeline::new();
-    timeline.add_track("Video 1");
+    timeline.add_track("Video 1", TrackType::Video);
 
     let asset_id = Uuid::new_v4();
     timeline
@@ -60,7 +60,7 @@ fn test_add_clip_overlap_fails() {
 #[test]
 fn test_cut_clip() {
     let mut timeline = Timeline::new();
-    timeline.add_track("Video 1");
+    timeline.add_track("Video 1", TrackType::Video);
 
     let asset_id = Uuid::new_v4();
     let clip = make_clip(asset_id, 0.0, 10.0);
@@ -86,7 +86,7 @@ fn test_cut_clip() {
 #[test]
 fn test_cut_at_clip_boundary_fails() {
     let mut timeline = Timeline::new();
-    timeline.add_track("Video 1");
+    timeline.add_track("Video 1", TrackType::Video);
 
     let asset_id = Uuid::new_v4();
     timeline
@@ -105,7 +105,7 @@ fn test_cut_at_clip_boundary_fails() {
 #[test]
 fn test_move_clip_same_track() {
     let mut timeline = Timeline::new();
-    timeline.add_track("Video 1");
+    timeline.add_track("Video 1", TrackType::Video);
 
     let asset_id = Uuid::new_v4();
     let clip = make_clip(asset_id, 0.0, 5.0);
@@ -130,8 +130,8 @@ fn test_move_clip_same_track() {
 #[test]
 fn test_move_clip_between_tracks() {
     let mut timeline = Timeline::new();
-    timeline.add_track("Video 1");
-    timeline.add_track("Video 2");
+    timeline.add_track("Video 1", TrackType::Video);
+    timeline.add_track("Video 2", TrackType::Video);
 
     let asset_id = Uuid::new_v4();
     let clip = make_clip(asset_id, 0.0, 5.0);
@@ -150,7 +150,7 @@ fn test_move_clip_between_tracks() {
 #[test]
 fn test_resize_clip() {
     let mut timeline = Timeline::new();
-    timeline.add_track("Video 1");
+    timeline.add_track("Video 1", TrackType::Video);
 
     let asset_id = Uuid::new_v4();
     let clip = make_clip(asset_id, 0.0, 5.0);
@@ -171,7 +171,7 @@ fn test_resize_clip() {
 #[test]
 fn test_snap_to_adjacent() {
     let mut timeline = Timeline::new();
-    timeline.add_track("Video 1");
+    timeline.add_track("Video 1", TrackType::Video);
 
     let asset_id = Uuid::new_v4();
     // Clip A at 0..5s
@@ -200,7 +200,7 @@ fn test_snap_to_adjacent() {
 #[test]
 fn test_snap_no_adjacent_within_threshold() {
     let mut timeline = Timeline::new();
-    timeline.add_track("Video 1");
+    timeline.add_track("Video 1", TrackType::Video);
 
     let asset_id = Uuid::new_v4();
     timeline
@@ -222,8 +222,8 @@ fn test_snap_no_adjacent_within_threshold() {
 #[test]
 fn test_timeline_duration() {
     let mut timeline = Timeline::new();
-    timeline.add_track("Video 1");
-    timeline.add_track("Video 2");
+    timeline.add_track("Video 1", TrackType::Video);
+    timeline.add_track("Video 2", TrackType::Video);
 
     let asset_id = Uuid::new_v4();
     // Track 0: clips up to 8s
@@ -260,7 +260,7 @@ fn test_time_range_contains() {
 #[test]
 fn test_add_clip_trims_left_overlap() {
     let mut timeline = Timeline::new();
-    timeline.add_track("Video 1");
+    timeline.add_track("Video 1", TrackType::Video);
 
     let asset_id = Uuid::new_v4();
     // Existing clip [0, 10)
@@ -285,7 +285,7 @@ fn test_add_clip_trims_left_overlap() {
 #[test]
 fn test_add_clip_removes_fully_covered() {
     let mut timeline = Timeline::new();
-    timeline.add_track("Video 1");
+    timeline.add_track("Video 1", TrackType::Video);
 
     let asset_id = Uuid::new_v4();
     // Existing clip [3, 7)
@@ -307,7 +307,7 @@ fn test_add_clip_removes_fully_covered() {
 #[test]
 fn test_add_clip_trims_right_overlap() {
     let mut timeline = Timeline::new();
-    timeline.add_track("Video 1");
+    timeline.add_track("Video 1", TrackType::Video);
 
     let asset_id = Uuid::new_v4();
     // Existing clip [5, 15)
@@ -337,7 +337,7 @@ fn test_add_clip_trims_right_overlap() {
 #[test]
 fn test_add_clip_splits_spanning_clip() {
     let mut timeline = Timeline::new();
-    timeline.add_track("Video 1");
+    timeline.add_track("Video 1", TrackType::Video);
 
     let asset_id = Uuid::new_v4();
     // Existing clip [0, 20) with source [0, 20)
@@ -375,7 +375,7 @@ fn test_add_clip_splits_spanning_clip() {
 #[test]
 fn test_move_clip_trims_overlap() {
     let mut timeline = Timeline::new();
-    timeline.add_track("Video 1");
+    timeline.add_track("Video 1", TrackType::Video);
 
     let asset_id = Uuid::new_v4();
     // Clip A [0, 5), Clip B [5, 15)
@@ -405,7 +405,7 @@ fn test_move_clip_trims_overlap() {
 #[test]
 fn test_move_clip_splits_target() {
     let mut timeline = Timeline::new();
-    timeline.add_track("Video 1");
+    timeline.add_track("Video 1", TrackType::Video);
 
     let asset_id = Uuid::new_v4();
     // Clip A [0, 3) (small), Clip B [5, 20) (big)
@@ -439,7 +439,7 @@ fn test_move_clip_splits_target() {
 #[test]
 fn test_move_clip_engulfs_smaller() {
     let mut timeline = Timeline::new();
-    timeline.add_track("Video 1");
+    timeline.add_track("Video 1", TrackType::Video);
 
     let asset_id = Uuid::new_v4();
     // Clip A [0, 10) (big), Clip B [15, 18) (small)
@@ -488,7 +488,7 @@ fn test_time_range_overlaps() {
 #[test]
 fn test_preview_trim_left() {
     let mut timeline = Timeline::new();
-    timeline.add_track("Video 1");
+    timeline.add_track("Video 1", TrackType::Video);
 
     let asset_id = Uuid::new_v4();
     // Existing clip [0, 10)
@@ -509,7 +509,7 @@ fn test_preview_trim_left() {
 #[test]
 fn test_preview_trim_right() {
     let mut timeline = Timeline::new();
-    timeline.add_track("Video 1");
+    timeline.add_track("Video 1", TrackType::Video);
 
     let asset_id = Uuid::new_v4();
     // Existing clip [5, 15)
@@ -528,7 +528,7 @@ fn test_preview_trim_right() {
 #[test]
 fn test_preview_full_cover() {
     let mut timeline = Timeline::new();
-    timeline.add_track("Video 1");
+    timeline.add_track("Video 1", TrackType::Video);
 
     let asset_id = Uuid::new_v4();
     // Existing clip [3, 7)
@@ -547,7 +547,7 @@ fn test_preview_full_cover() {
 #[test]
 fn test_preview_split() {
     let mut timeline = Timeline::new();
-    timeline.add_track("Video 1");
+    timeline.add_track("Video 1", TrackType::Video);
 
     let asset_id = Uuid::new_v4();
     // Existing clip [0, 20)
@@ -571,7 +571,7 @@ fn test_preview_split() {
 #[test]
 fn test_preview_no_overlap() {
     let mut timeline = Timeline::new();
-    timeline.add_track("Video 1");
+    timeline.add_track("Video 1", TrackType::Video);
 
     let asset_id = Uuid::new_v4();
     // Existing clip [0, 5)
@@ -587,7 +587,7 @@ fn test_preview_no_overlap() {
 #[test]
 fn test_preview_snap_to_adjacent_end() {
     let mut timeline = Timeline::new();
-    timeline.add_track("Video 1");
+    timeline.add_track("Video 1", TrackType::Video);
 
     let asset_id = Uuid::new_v4();
     // Clip A at [0, 5)
@@ -605,7 +605,7 @@ fn test_preview_snap_to_adjacent_end() {
 #[test]
 fn test_preview_snap_to_adjacent_start() {
     let mut timeline = Timeline::new();
-    timeline.add_track("Video 1");
+    timeline.add_track("Video 1", TrackType::Video);
 
     let asset_id = Uuid::new_v4();
     // Clip A at [5, 10)
@@ -623,7 +623,7 @@ fn test_preview_snap_to_adjacent_start() {
 #[test]
 fn test_preview_snap_no_match() {
     let mut timeline = Timeline::new();
-    timeline.add_track("Video 1");
+    timeline.add_track("Video 1", TrackType::Video);
 
     let asset_id = Uuid::new_v4();
     // Clip A at [0, 5)
@@ -640,7 +640,7 @@ fn test_preview_snap_no_match() {
 #[test]
 fn test_preview_snap_uses_trimmed_edges() {
     let mut timeline = Timeline::new();
-    timeline.add_track("Video 1");
+    timeline.add_track("Video 1", TrackType::Video);
 
     let asset_id = Uuid::new_v4();
     // Clip A at [0, 10)
@@ -685,4 +685,297 @@ fn test_preview_snap_uses_trimmed_edges() {
     // Both are gap 0, so effectively already snapped. Should return Some(3.0).
     assert!(snap.is_some());
     assert!((snap.unwrap() - 3.0).abs() < 0.001);
+}
+
+// ===== Grouped operations tests =====
+
+#[test]
+fn test_track_type_and_group_id() {
+    let mut timeline = Timeline::new();
+    let group_id = uuid::Uuid::new_v4();
+    let v = timeline.add_track_with_group("Video 1", TrackType::Video, Some(group_id));
+    let a = timeline.add_track_with_group("Audio 1", TrackType::Audio, Some(group_id));
+
+    assert_eq!(timeline.tracks[v].track_type, TrackType::Video);
+    assert_eq!(timeline.tracks[a].track_type, TrackType::Audio);
+    assert_eq!(timeline.tracks[v].group_id, Some(group_id));
+    assert_eq!(timeline.tracks[a].group_id, Some(group_id));
+}
+
+#[test]
+fn test_group_members() {
+    let mut timeline = Timeline::new();
+    let group_id = uuid::Uuid::new_v4();
+    let v = timeline.add_track_with_group("Video 1", TrackType::Video, Some(group_id));
+    let a = timeline.add_track_with_group("Audio 1", TrackType::Audio, Some(group_id));
+    timeline.add_track("Standalone", TrackType::Video);
+
+    let members = timeline.group_members(v);
+    assert_eq!(members, vec![v, a]);
+
+    let members = timeline.group_members(a);
+    assert_eq!(members, vec![v, a]);
+
+    // Standalone track has no group
+    let members = timeline.group_members(2);
+    assert_eq!(members, vec![2]);
+}
+
+#[test]
+fn test_find_paired_audio_track() {
+    let mut timeline = Timeline::new();
+    let group_id = uuid::Uuid::new_v4();
+    timeline.add_track_with_group("Video 1", TrackType::Video, Some(group_id));
+    timeline.add_track_with_group("Audio 1", TrackType::Audio, Some(group_id));
+
+    assert_eq!(timeline.find_paired_audio_track(0), Some(1));
+    assert_eq!(timeline.find_paired_audio_track(1), None); // audio track has no paired audio
+}
+
+#[test]
+fn test_add_clip_with_audio() {
+    let mut timeline = Timeline::new();
+    let group_id = uuid::Uuid::new_v4();
+    timeline.add_track_with_group("Video 1", TrackType::Video, Some(group_id));
+    timeline.add_track_with_group("Audio 1", TrackType::Audio, Some(group_id));
+
+    let asset_id = Uuid::new_v4();
+    let source_range = TimeRange::new(
+        TimelinePosition::zero(),
+        TimelinePosition::from_secs_f64(5.0),
+    ).unwrap();
+
+    let (vid, aud) = timeline.add_clip_with_audio(0, 1, asset_id, TimelinePosition::zero(), source_range).unwrap();
+
+    // Both tracks have one clip
+    assert_eq!(timeline.tracks[0].clips.len(), 1);
+    assert_eq!(timeline.tracks[1].clips.len(), 1);
+
+    let video_clip = timeline.tracks[0].get_clip(vid).unwrap();
+    let audio_clip = timeline.tracks[1].get_clip(aud).unwrap();
+
+    // Same link_id
+    assert!(video_clip.link_id.is_some());
+    assert_eq!(video_clip.link_id, audio_clip.link_id);
+
+    // Same position and source range
+    assert_eq!(video_clip.timeline_range.start, audio_clip.timeline_range.start);
+    assert_eq!(video_clip.timeline_range.end, audio_clip.timeline_range.end);
+}
+
+#[test]
+fn test_find_linked_clips() {
+    let mut timeline = Timeline::new();
+    let group_id = uuid::Uuid::new_v4();
+    timeline.add_track_with_group("Video 1", TrackType::Video, Some(group_id));
+    timeline.add_track_with_group("Audio 1", TrackType::Audio, Some(group_id));
+
+    let asset_id = Uuid::new_v4();
+    let source_range = TimeRange::new(
+        TimelinePosition::zero(),
+        TimelinePosition::from_secs_f64(5.0),
+    ).unwrap();
+
+    let (vid, aud) = timeline.add_clip_with_audio(0, 1, asset_id, TimelinePosition::zero(), source_range).unwrap();
+
+    let link_id = timeline.tracks[0].get_clip(vid).unwrap().link_id.unwrap();
+    let linked = timeline.find_linked_clips(link_id);
+
+    assert_eq!(linked.len(), 2);
+    assert!(linked.contains(&(0, vid)));
+    assert!(linked.contains(&(1, aud)));
+}
+
+#[test]
+fn test_move_clip_grouped() {
+    let mut timeline = Timeline::new();
+    let group_id = uuid::Uuid::new_v4();
+    timeline.add_track_with_group("Video 1", TrackType::Video, Some(group_id));
+    timeline.add_track_with_group("Audio 1", TrackType::Audio, Some(group_id));
+
+    let asset_id = Uuid::new_v4();
+    let source_range = TimeRange::new(
+        TimelinePosition::zero(),
+        TimelinePosition::from_secs_f64(5.0),
+    ).unwrap();
+
+    let (vid, aud) = timeline.add_clip_with_audio(0, 1, asset_id, TimelinePosition::zero(), source_range).unwrap();
+
+    // Move the video clip to 3.0s → audio should also move to 3.0s
+    timeline.move_clip_grouped(0, vid, 0, TimelinePosition::from_secs_f64(3.0)).unwrap();
+
+    let video_clip = timeline.tracks[0].get_clip(vid).unwrap();
+    let audio_clip = timeline.tracks[1].get_clip(aud).unwrap();
+
+    assert_eq!(video_clip.timeline_range.start, TimelinePosition::from_secs_f64(3.0));
+    assert_eq!(video_clip.timeline_range.end, TimelinePosition::from_secs_f64(8.0));
+    assert_eq!(audio_clip.timeline_range.start, TimelinePosition::from_secs_f64(3.0));
+    assert_eq!(audio_clip.timeline_range.end, TimelinePosition::from_secs_f64(8.0));
+}
+
+#[test]
+fn test_resize_clip_grouped() {
+    let mut timeline = Timeline::new();
+    let group_id = uuid::Uuid::new_v4();
+    timeline.add_track_with_group("Video 1", TrackType::Video, Some(group_id));
+    timeline.add_track_with_group("Audio 1", TrackType::Audio, Some(group_id));
+
+    let asset_id = Uuid::new_v4();
+    let source_range = TimeRange::new(
+        TimelinePosition::zero(),
+        TimelinePosition::from_secs_f64(5.0),
+    ).unwrap();
+
+    let (vid, aud) = timeline.add_clip_with_audio(0, 1, asset_id, TimelinePosition::zero(), source_range).unwrap();
+
+    // Resize video to end at 8.0 → audio should also end at 8.0
+    timeline.resize_clip_grouped(0, vid, TimelinePosition::from_secs_f64(8.0)).unwrap();
+
+    let video_clip = timeline.tracks[0].get_clip(vid).unwrap();
+    let audio_clip = timeline.tracks[1].get_clip(aud).unwrap();
+
+    assert_eq!(video_clip.timeline_range.end, TimelinePosition::from_secs_f64(8.0));
+    assert_eq!(audio_clip.timeline_range.end, TimelinePosition::from_secs_f64(8.0));
+}
+
+#[test]
+fn test_cut_at_grouped() {
+    let mut timeline = Timeline::new();
+    let group_id = uuid::Uuid::new_v4();
+    timeline.add_track_with_group("Video 1", TrackType::Video, Some(group_id));
+    timeline.add_track_with_group("Audio 1", TrackType::Audio, Some(group_id));
+
+    let asset_id = Uuid::new_v4();
+    let source_range = TimeRange::new(
+        TimelinePosition::zero(),
+        TimelinePosition::from_secs_f64(10.0),
+    ).unwrap();
+
+    let (_vid, _aud) = timeline.add_clip_with_audio(0, 1, asset_id, TimelinePosition::zero(), source_range).unwrap();
+
+    let results = timeline.cut_at_grouped(0, TimelinePosition::from_secs_f64(4.0)).unwrap();
+
+    // Should have cut both tracks
+    assert_eq!(results.len(), 2);
+    assert_eq!(timeline.tracks[0].clips.len(), 2);
+    assert_eq!(timeline.tracks[1].clips.len(), 2);
+
+    // Left clips should have matching link_ids
+    let (v_left, v_right) = results[0];
+    let (a_left, a_right) = results[1];
+
+    let v_left_clip = timeline.tracks[0].get_clip(v_left).unwrap();
+    let a_left_clip = timeline.tracks[1].get_clip(a_left).unwrap();
+    assert_eq!(v_left_clip.link_id, a_left_clip.link_id);
+    assert!(v_left_clip.link_id.is_some());
+
+    // Right clips should have matching link_ids (different from left)
+    let v_right_clip = timeline.tracks[0].get_clip(v_right).unwrap();
+    let a_right_clip = timeline.tracks[1].get_clip(a_right).unwrap();
+    assert_eq!(v_right_clip.link_id, a_right_clip.link_id);
+    assert!(v_right_clip.link_id.is_some());
+    assert_ne!(v_left_clip.link_id, v_right_clip.link_id);
+
+    // Verify cut positions
+    assert_eq!(v_left_clip.timeline_range.end, TimelinePosition::from_secs_f64(4.0));
+    assert_eq!(v_right_clip.timeline_range.start, TimelinePosition::from_secs_f64(4.0));
+    assert_eq!(a_left_clip.timeline_range.end, TimelinePosition::from_secs_f64(4.0));
+    assert_eq!(a_right_clip.timeline_range.start, TimelinePosition::from_secs_f64(4.0));
+}
+
+#[test]
+fn test_grouped_move_with_overlap_trimming() {
+    let mut timeline = Timeline::new();
+    let group_id = uuid::Uuid::new_v4();
+    timeline.add_track_with_group("Video 1", TrackType::Video, Some(group_id));
+    timeline.add_track_with_group("Audio 1", TrackType::Audio, Some(group_id));
+
+    let asset_id = Uuid::new_v4();
+    let source_range = TimeRange::new(
+        TimelinePosition::zero(),
+        TimelinePosition::from_secs_f64(5.0),
+    ).unwrap();
+
+    // Add linked pair at 0s
+    let (vid, aud) = timeline.add_clip_with_audio(0, 1, asset_id, TimelinePosition::zero(), source_range).unwrap();
+
+    // Add another clip on video track at 8s (will overlap after move)
+    let blocker = make_clip(asset_id, 8.0, 5.0);
+    timeline.add_clip(0, blocker).unwrap();
+    // Add another clip on audio track at 8s
+    let audio_blocker = make_clip(asset_id, 8.0, 5.0);
+    timeline.add_clip(1, audio_blocker).unwrap();
+
+    // Move linked pair to 7s → [7, 12) overlaps [8, 13) on both tracks → should trim
+    timeline.move_clip_grouped(0, vid, 0, TimelinePosition::from_secs_f64(7.0)).unwrap();
+
+    let video_clip = timeline.tracks[0].get_clip(vid).unwrap();
+    let audio_clip = timeline.tracks[1].get_clip(aud).unwrap();
+
+    assert_eq!(video_clip.timeline_range.start, TimelinePosition::from_secs_f64(7.0));
+    assert_eq!(audio_clip.timeline_range.start, TimelinePosition::from_secs_f64(7.0));
+}
+
+#[test]
+fn test_track_type_serialization_roundtrip() {
+    let mut timeline = Timeline::new();
+    let group_id = uuid::Uuid::new_v4();
+    timeline.add_track_with_group("Video 1", TrackType::Video, Some(group_id));
+    timeline.add_track_with_group("Audio 1", TrackType::Audio, Some(group_id));
+
+    let asset_id = Uuid::new_v4();
+    let source_range = TimeRange::new(
+        TimelinePosition::zero(),
+        TimelinePosition::from_secs_f64(5.0),
+    ).unwrap();
+
+    timeline.add_clip_with_audio(0, 1, asset_id, TimelinePosition::zero(), source_range).unwrap();
+
+    let json = serde_json::to_string(&timeline).unwrap();
+    let restored: Timeline = serde_json::from_str(&json).unwrap();
+
+    assert_eq!(restored.tracks[0].track_type, TrackType::Video);
+    assert_eq!(restored.tracks[1].track_type, TrackType::Audio);
+    assert_eq!(restored.tracks[0].group_id, Some(group_id));
+    assert_eq!(restored.tracks[1].group_id, Some(group_id));
+
+    let vid_clip = &restored.tracks[0].clips[0];
+    let aud_clip = &restored.tracks[1].clips[0];
+    assert!(vid_clip.link_id.is_some());
+    assert_eq!(vid_clip.link_id, aud_clip.link_id);
+}
+
+#[test]
+fn test_undo_redo_grouped_operations() {
+    use zeditor_core::commands::CommandHistory;
+
+    let mut timeline = Timeline::new();
+    let group_id = uuid::Uuid::new_v4();
+    timeline.add_track_with_group("Video 1", TrackType::Video, Some(group_id));
+    timeline.add_track_with_group("Audio 1", TrackType::Audio, Some(group_id));
+    let mut history = CommandHistory::new();
+
+    let asset_id = Uuid::new_v4();
+    let source_range = TimeRange::new(
+        TimelinePosition::zero(),
+        TimelinePosition::from_secs_f64(5.0),
+    ).unwrap();
+
+    // Add linked clips via command history
+    history.execute(&mut timeline, "Add linked clips", |tl| {
+        tl.add_clip_with_audio(0, 1, asset_id, TimelinePosition::zero(), source_range)
+    }).unwrap();
+
+    assert_eq!(timeline.tracks[0].clips.len(), 1);
+    assert_eq!(timeline.tracks[1].clips.len(), 1);
+
+    // Undo
+    history.undo(&mut timeline).unwrap();
+    assert_eq!(timeline.tracks[0].clips.len(), 0);
+    assert_eq!(timeline.tracks[1].clips.len(), 0);
+
+    // Redo
+    history.redo(&mut timeline).unwrap();
+    assert_eq!(timeline.tracks[0].clips.len(), 1);
+    assert_eq!(timeline.tracks[1].clips.len(), 1);
 }

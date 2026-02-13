@@ -1,4 +1,5 @@
 pub mod app;
+pub mod audio_player;
 pub mod message;
 pub mod views;
 pub mod widgets;

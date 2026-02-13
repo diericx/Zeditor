@@ -14,7 +14,7 @@ fn make_clip(asset_id: Uuid, start_secs: f64, duration_secs: f64) -> Clip {
 #[test]
 fn test_undo_redo() {
     let mut timeline = Timeline::new();
-    timeline.add_track("Video 1");
+    timeline.add_track("Video 1", TrackType::Video);
     let mut history = CommandHistory::new();
 
     let asset_id = Uuid::new_v4();
@@ -44,7 +44,7 @@ fn test_undo_redo() {
 #[test]
 fn test_multiple_undo_redo() {
     let mut timeline = Timeline::new();
-    timeline.add_track("Video 1");
+    timeline.add_track("Video 1", TrackType::Video);
     let mut history = CommandHistory::new();
 
     let asset_id = Uuid::new_v4();
@@ -78,7 +78,7 @@ fn test_multiple_undo_redo() {
 #[test]
 fn test_redo_cleared_on_new_command() {
     let mut timeline = Timeline::new();
-    timeline.add_track("Video 1");
+    timeline.add_track("Video 1", TrackType::Video);
     let mut history = CommandHistory::new();
 
     let asset_id = Uuid::new_v4();
@@ -120,7 +120,7 @@ fn test_redo_empty_fails() {
 #[test]
 fn test_command_descriptions() {
     let mut timeline = Timeline::new();
-    timeline.add_track("Video 1");
+    timeline.add_track("Video 1", TrackType::Video);
     let mut history = CommandHistory::new();
 
     let asset_id = Uuid::new_v4();

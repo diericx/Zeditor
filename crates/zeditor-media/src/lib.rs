@@ -1,3 +1,4 @@
+pub mod audio_decoder;
 pub mod decoder;
 pub mod encoder;
 pub mod error;

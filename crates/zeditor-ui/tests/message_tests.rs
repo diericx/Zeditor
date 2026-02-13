@@ -168,7 +168,13 @@ fn test_remove_asset() {
 fn test_move_clip_flow() {
     let mut app = App::new();
 
-    let asset = make_test_asset("clip1", 5.0);
+    // Use no_audio asset to test simple move without linked audio clip
+    let asset = MediaAsset::new(
+        "clip1".into(),
+        PathBuf::from("/test/clip1.mp4"),
+        Duration::from_secs_f64(5.0),
+        1920, 1080, 30.0, false,
+    );
     let asset_id = asset.id;
     app.update(Message::MediaImported(Ok(asset)));
 
@@ -611,4 +617,226 @@ fn test_b_key_sets_blade_mode() {
         repeat: false,
     }));
     assert_eq!(app.tool_mode, ToolMode::Blade);
+}
+
+// ===== Grouped operation tests =====
+
+#[test]
+fn test_add_clip_with_audio_creates_both() {
+    let mut app = App::new();
+
+    let asset = make_test_asset("clip1", 5.0); // has_audio: true
+    let asset_id = asset.id;
+    app.update(Message::MediaImported(Ok(asset)));
+
+    app.update(Message::AddClipToTimeline {
+        asset_id,
+        track_index: 0,
+        position: TimelinePosition::zero(),
+    });
+
+    // Video track should have 1 clip
+    assert_eq!(app.project.timeline.tracks[0].clips.len(), 1);
+    // Audio track should also have 1 clip
+    assert_eq!(app.project.timeline.tracks[1].clips.len(), 1);
+
+    // They should share a link_id
+    let vid_link = app.project.timeline.tracks[0].clips[0].link_id;
+    let aud_link = app.project.timeline.tracks[1].clips[0].link_id;
+    assert!(vid_link.is_some());
+    assert_eq!(vid_link, aud_link);
+}
+
+#[test]
+fn test_add_clip_without_audio_creates_only_video() {
+    let mut app = App::new();
+
+    let asset = MediaAsset::new(
+        "clip1".into(),
+        PathBuf::from("/test/clip1.mp4"),
+        Duration::from_secs_f64(5.0),
+        1920, 1080, 30.0, false,
+    );
+    let asset_id = asset.id;
+    app.update(Message::MediaImported(Ok(asset)));
+
+    app.update(Message::AddClipToTimeline {
+        asset_id,
+        track_index: 0,
+        position: TimelinePosition::zero(),
+    });
+
+    assert_eq!(app.project.timeline.tracks[0].clips.len(), 1);
+    assert_eq!(app.project.timeline.tracks[1].clips.len(), 0);
+    assert!(app.project.timeline.tracks[0].clips[0].link_id.is_none());
+}
+
+#[test]
+fn test_cut_linked_pair_creates_four_clips() {
+    let mut app = App::new();
+
+    let asset = make_test_asset("clip1", 10.0);
+    let asset_id = asset.id;
+    app.update(Message::MediaImported(Ok(asset)));
+
+    app.update(Message::AddClipToTimeline {
+        asset_id,
+        track_index: 0,
+        position: TimelinePosition::zero(),
+    });
+
+    // Both tracks have 1 clip
+    assert_eq!(app.project.timeline.tracks[0].clips.len(), 1);
+    assert_eq!(app.project.timeline.tracks[1].clips.len(), 1);
+
+    // Cut at 4s
+    app.update(Message::CutClip {
+        track_index: 0,
+        position: TimelinePosition::from_secs_f64(4.0),
+    });
+
+    // Both tracks should have 2 clips each (total 4)
+    assert_eq!(app.project.timeline.tracks[0].clips.len(), 2);
+    assert_eq!(app.project.timeline.tracks[1].clips.len(), 2);
+    assert_eq!(app.status_message, "Clip cut");
+}
+
+#[test]
+fn test_move_linked_pair() {
+    let mut app = App::new();
+
+    let asset = make_test_asset("clip1", 5.0);
+    let asset_id = asset.id;
+    app.update(Message::MediaImported(Ok(asset)));
+
+    app.update(Message::AddClipToTimeline {
+        asset_id,
+        track_index: 0,
+        position: TimelinePosition::zero(),
+    });
+
+    let vid_id = app.project.timeline.tracks[0].clips[0].id;
+
+    // Move video clip to 3s → audio should also move
+    app.update(Message::MoveClip {
+        source_track: 0,
+        clip_id: vid_id,
+        dest_track: 0,
+        position: TimelinePosition::from_secs_f64(3.0),
+    });
+
+    let vid = app.project.timeline.tracks[0].get_clip(vid_id).unwrap();
+    assert_eq!(vid.timeline_range.start, TimelinePosition::from_secs_f64(3.0));
+
+    let aud = &app.project.timeline.tracks[1].clips[0];
+    assert_eq!(aud.timeline_range.start, TimelinePosition::from_secs_f64(3.0));
+}
+
+#[test]
+fn test_resize_linked_pair() {
+    let mut app = App::new();
+
+    let asset = make_test_asset("clip1", 5.0);
+    let asset_id = asset.id;
+    app.update(Message::MediaImported(Ok(asset)));
+
+    app.update(Message::AddClipToTimeline {
+        asset_id,
+        track_index: 0,
+        position: TimelinePosition::zero(),
+    });
+
+    let vid_id = app.project.timeline.tracks[0].clips[0].id;
+
+    // Resize video clip to 8s → audio should also resize
+    app.update(Message::ResizeClip {
+        track_index: 0,
+        clip_id: vid_id,
+        new_end: TimelinePosition::from_secs_f64(8.0),
+    });
+
+    let vid = app.project.timeline.tracks[0].get_clip(vid_id).unwrap();
+    assert_eq!(vid.timeline_range.end, TimelinePosition::from_secs_f64(8.0));
+
+    let aud = &app.project.timeline.tracks[1].clips[0];
+    assert_eq!(aud.timeline_range.end, TimelinePosition::from_secs_f64(8.0));
+}
+
+#[test]
+fn test_place_selected_clip_with_audio() {
+    let mut app = App::new();
+
+    let asset = make_test_asset("clip1", 5.0);
+    let asset_id = asset.id;
+    app.update(Message::MediaImported(Ok(asset)));
+
+    app.selected_asset_id = Some(asset_id);
+
+    app.update(Message::PlaceSelectedClip {
+        asset_id,
+        track_index: 0,
+        position: TimelinePosition::from_secs_f64(2.0),
+    });
+
+    assert_eq!(app.project.timeline.tracks[0].clips.len(), 1);
+    assert_eq!(app.project.timeline.tracks[1].clips.len(), 1);
+
+    let vid = &app.project.timeline.tracks[0].clips[0];
+    let aud = &app.project.timeline.tracks[1].clips[0];
+    assert_eq!(vid.timeline_range.start, TimelinePosition::from_secs_f64(2.0));
+    assert_eq!(aud.timeline_range.start, TimelinePosition::from_secs_f64(2.0));
+    assert_eq!(vid.link_id, aud.link_id);
+}
+
+#[test]
+fn test_undo_redo_grouped_add() {
+    let mut app = App::new();
+
+    let asset = make_test_asset("clip1", 5.0);
+    let asset_id = asset.id;
+    app.update(Message::MediaImported(Ok(asset)));
+
+    app.update(Message::AddClipToTimeline {
+        asset_id,
+        track_index: 0,
+        position: TimelinePosition::zero(),
+    });
+
+    assert_eq!(app.project.timeline.tracks[0].clips.len(), 1);
+    assert_eq!(app.project.timeline.tracks[1].clips.len(), 1);
+
+    app.update(Message::Undo);
+    assert_eq!(app.project.timeline.tracks[0].clips.len(), 0);
+    assert_eq!(app.project.timeline.tracks[1].clips.len(), 0);
+
+    app.update(Message::Redo);
+    assert_eq!(app.project.timeline.tracks[0].clips.len(), 1);
+    assert_eq!(app.project.timeline.tracks[1].clips.len(), 1);
+}
+
+#[test]
+fn test_clip_at_position_returns_video_only() {
+    let mut app = App::new();
+
+    let asset = make_test_asset("clip1", 5.0);
+    let asset_id = asset.id;
+    app.update(Message::MediaImported(Ok(asset)));
+
+    app.update(Message::AddClipToTimeline {
+        asset_id,
+        track_index: 0,
+        position: TimelinePosition::zero(),
+    });
+
+    // clip_at_position should return only the video clip (track 0)
+    let result = app.clip_at_position(TimelinePosition::from_secs_f64(2.0));
+    assert!(result.is_some());
+    let (track_idx, _) = result.unwrap();
+    assert_eq!(track_idx, 0);
+
+    // audio_clip_at_position should return the audio clip (track 1)
+    let result = app.audio_clip_at_position(TimelinePosition::from_secs_f64(2.0));
+    assert!(result.is_some());
+    let (track_idx, _) = result.unwrap();
+    assert_eq!(track_idx, 1);
 }

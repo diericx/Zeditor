@@ -3,7 +3,7 @@ use iced::widget::canvas;
 use iced::{border, Color, Point, Rectangle, Renderer, Size, Theme};
 use uuid::Uuid;
 
-use zeditor_core::timeline::{Timeline, TimelinePosition};
+use zeditor_core::timeline::{Timeline, TimelinePosition, TrackType};
 
 use crate::message::{Message, ToolMode};
 
@@ -468,10 +468,21 @@ impl<'a> canvas::Program<Message> for TimelineCanvas<'a> {
         for (i, track) in self.timeline.tracks.iter().enumerate() {
             let track_top = RULER_HEIGHT + i as f32 * TRACK_HEIGHT;
 
-            let bg = if i % 2 == 0 {
-                Color::from_rgb(0.15, 0.15, 0.18)
-            } else {
-                Color::from_rgb(0.17, 0.17, 0.20)
+            let bg = match track.track_type {
+                TrackType::Audio => {
+                    if i % 2 == 0 {
+                        Color::from_rgb(0.13, 0.15, 0.20)
+                    } else {
+                        Color::from_rgb(0.15, 0.17, 0.22)
+                    }
+                }
+                TrackType::Video => {
+                    if i % 2 == 0 {
+                        Color::from_rgb(0.15, 0.15, 0.18)
+                    } else {
+                        Color::from_rgb(0.17, 0.17, 0.20)
+                    }
+                }
             };
             frame.fill_rectangle(
                 Point::new(0.0, track_top),
@@ -723,11 +734,11 @@ impl<'a> TimelineCanvas<'a> {
 mod tests {
     use super::*;
     use iced::widget::canvas::Program;
-    use zeditor_core::timeline::{Clip, TimeRange, Timeline};
+    use zeditor_core::timeline::{Clip, TimeRange, Timeline, TrackType};
 
     fn make_test_timeline() -> Timeline {
         let mut tl = Timeline::new();
-        tl.add_track("Video 1");
+        tl.add_track("Video 1", TrackType::Video);
 
         let asset_id = Uuid::new_v4();
         let source_range = TimeRange {

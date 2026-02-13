@@ -13,6 +13,7 @@ zeditor-media = { path = "../zeditor-media" }
 iced = { version = "0.14", features = ["canvas", "image", "tokio"] }
 uuid = { workspace = true }
 rfd = "0.15"
+rodio = "0.20"
 
 [features]
 test-helpers = []

@@ -8,6 +8,9 @@ pub enum MediaError {
     #[error("no video stream found")]
     NoVideoStream,
 
+    #[error("no audio stream found")]
+    NoAudioStream,
+
     #[error("decoder error: {0}")]
     DecoderError(String),
 
