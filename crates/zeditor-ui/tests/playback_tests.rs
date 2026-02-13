@@ -839,3 +839,28 @@ fn test_audio_adjacent_clip_transition_switches_decode() {
     app.update(Message::PlaybackTick);
     assert!(app.is_playing, "playback should continue into clip2");
 }
+
+#[test]
+fn test_timeline_click_stops_audio_decode() {
+    // When clicking the timeline to move the playback cursor during playback,
+    // audio decode should stop (not just video).
+    let (mut app, _video_sender, _audio_sender, _video_clip_id, audio_clip_id) =
+        setup_audio_app_with_clip(0.0, 10.0);
+
+    // Start playing
+    app.update(Message::Play);
+    assert!(app.is_playing);
+    assert_eq!(app.audio_decode_clip_id(), Some(audio_clip_id));
+
+    // Click the timeline at 5s — should pause everything including audio
+    app.update(Message::TimelineClickEmpty(
+        TimelinePosition::from_secs_f64(5.0),
+    ));
+
+    assert!(!app.is_playing, "clicking timeline should pause playback");
+    assert_eq!(
+        app.playback_position,
+        TimelinePosition::from_secs_f64(5.0),
+        "cursor should move to clicked position"
+    );
+}

@@ -227,7 +227,9 @@ impl Track {
             let ex_end = existing.timeline_range.end;
 
             if ex_start < new_start && ex_end > new_end {
-                // Existing clip spans the entire new clip → split into left + right
+                // Existing clip spans the entire new clip → split into left + right.
+                // Preserve link_id on both pieces; the Timeline-level method handles
+                // mirroring the split on linked tracks and reassigning link_ids.
                 let right_source_start = TimelinePosition(
                     existing.source_range.start.as_duration()
                         + (new_end.as_duration() - ex_start.as_duration()),
@@ -524,8 +526,100 @@ impl Timeline {
     }
 
     /// Add a clip to the specified track, trimming overlapping clips to make room.
+    /// If any existing linked clips are split, the linked partner on its paired
+    /// track is also split at the same boundaries, and new link_ids are assigned
+    /// so left pieces stay in one group and right pieces form a new group.
     pub fn add_clip_trimming_overlaps(&mut self, track_index: usize, clip: Clip) -> Result<()> {
+        let new_start = clip.timeline_range.start;
+        let new_end = clip.timeline_range.end;
+
+        // Pre-scan: identify linked clips on this track that will be split
+        // (those whose range fully spans the new clip's range).
+        let mut split_link_ids: Vec<Uuid> = Vec::new();
+        {
+            let track = self.track(track_index)?;
+            for existing in &track.clips {
+                if existing.timeline_range.start < new_start
+                    && existing.timeline_range.end > new_end
+                {
+                    if let Some(link_id) = existing.link_id {
+                        split_link_ids.push(link_id);
+                    }
+                }
+            }
+        }
+
+        // Perform the add/split on the primary track
         self.track_mut(track_index)?.add_clip_trimming_overlaps(clip);
+
+        // Mirror each split on linked partner tracks
+        for old_link_id in &split_link_ids {
+            let linked = self.find_linked_clips(*old_link_id);
+            for (linked_track_idx, linked_clip_id) in linked {
+                if linked_track_idx == track_index {
+                    continue; // skip the already-split pieces on the primary track
+                }
+
+                // Check if the linked clip needs cutting at new_start
+                let needs_start_cut = self.track(linked_track_idx)
+                    .ok()
+                    .and_then(|t| t.get_clip(linked_clip_id))
+                    .map(|c| {
+                        c.timeline_range.start < new_start
+                            && c.timeline_range.end > new_start
+                    })
+                    .unwrap_or(false);
+
+                if needs_start_cut {
+                    let _ = self.cut_at(linked_track_idx, new_start);
+                }
+
+                // Check if the clip at new_end needs cutting (may be a different
+                // clip now after the first cut)
+                let needs_end_cut = self.track(linked_track_idx)
+                    .ok()
+                    .and_then(|t| t.clip_at(new_end))
+                    .map(|c| {
+                        c.link_id == Some(*old_link_id)
+                            && c.timeline_range.start < new_end
+                            && c.timeline_range.end > new_end
+                    })
+                    .unwrap_or(false);
+
+                if needs_end_cut {
+                    let _ = self.cut_at(linked_track_idx, new_end);
+                }
+            }
+
+            // Reassign link_ids: left pieces keep old, right pieces get new,
+            // middle pieces (between new_start..new_end) lose their link.
+            let new_right_link = Uuid::new_v4();
+            let all_with_link = self.find_linked_clips(*old_link_id);
+
+            for (ti, ci) in all_with_link {
+                let clip_start = match self.track(ti)
+                    .ok()
+                    .and_then(|t| t.get_clip(ci))
+                {
+                    Some(c) => c.timeline_range.start,
+                    None => continue,
+                };
+
+                if clip_start >= new_end {
+                    // Right piece → new group
+                    if let Some(c) = self.track_mut(ti).ok().and_then(|t| t.get_clip_mut(ci)) {
+                        c.link_id = Some(new_right_link);
+                    }
+                } else if clip_start >= new_start {
+                    // Middle piece → orphaned (no partner on the other track)
+                    if let Some(c) = self.track_mut(ti).ok().and_then(|t| t.get_clip_mut(ci)) {
+                        c.link_id = None;
+                    }
+                }
+                // Left piece (clip_start < new_start) keeps old link_id
+            }
+        }
+
         Ok(())
     }
 
@@ -599,6 +693,7 @@ impl Timeline {
     }
 
     /// Move a clip from one track/position to another, trimming overlapping clips.
+    /// If the move splits a linked clip, the linked partner is also split.
     pub fn move_clip(
         &mut self,
         source_track: usize,
@@ -614,7 +709,7 @@ impl Timeline {
             end: new_position + duration_pos,
         };
 
-        self.track_mut(dest_track)?.add_clip_trimming_overlaps(clip);
+        self.add_clip_trimming_overlaps(dest_track, clip)?;
         Ok(())
     }
 
@@ -741,8 +836,8 @@ impl Timeline {
         audio_clip.link_id = Some(link_id);
         let audio_clip_id = audio_clip.id;
 
-        self.track_mut(video_track)?.add_clip_trimming_overlaps(video_clip);
-        self.track_mut(audio_track)?.add_clip_trimming_overlaps(audio_clip);
+        self.add_clip_trimming_overlaps(video_track, video_clip)?;
+        self.add_clip_trimming_overlaps(audio_track, audio_clip)?;
 
         Ok((video_clip_id, audio_clip_id))
     }

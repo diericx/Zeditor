@@ -979,3 +979,81 @@ fn test_undo_redo_grouped_operations() {
     assert_eq!(timeline.tracks[0].clips.len(), 1);
     assert_eq!(timeline.tracks[1].clips.len(), 1);
 }
+
+#[test]
+fn test_split_by_overlap_mirrors_on_linked_track() {
+    // When a linked clip is split by add_clip_trimming_overlaps (dragging a
+    // smaller clip into the middle of a larger one), the linked audio clip
+    // should also be split at the same boundaries. Left pieces keep the
+    // original link_id, right pieces get a new link_id, and the middle audio
+    // piece (with no video partner) loses its link_id.
+    let mut timeline = Timeline::new();
+    let group_id = Uuid::new_v4();
+    timeline.add_track_with_group("Video 1", TrackType::Video, Some(group_id));
+    timeline.add_track_with_group("Audio 1", TrackType::Audio, Some(group_id));
+
+    let asset_id = Uuid::new_v4();
+    let source_range = TimeRange {
+        start: TimelinePosition::zero(),
+        end: TimelinePosition::from_secs_f64(20.0),
+    };
+    // Add linked clips at [0, 20)
+    timeline
+        .add_clip_with_audio(0, 1, asset_id, TimelinePosition::zero(), source_range)
+        .unwrap();
+
+    let original_link_id = timeline.tracks[0].clips[0].link_id;
+    assert!(original_link_id.is_some(), "clips should be linked before split");
+
+    // Drop a new clip at [5, 10) on the video track, splitting the linked clip
+    let new_clip = make_clip(Uuid::new_v4(), 5.0, 5.0);
+    timeline.add_clip_trimming_overlaps(0, new_clip).unwrap();
+
+    // Video track: [left_v 0-5), [new 5-10), [right_v 10-20)
+    assert_eq!(timeline.tracks[0].clips.len(), 3);
+    let left_v = &timeline.tracks[0].clips[0];
+    let middle_v = &timeline.tracks[0].clips[1];
+    let right_v = &timeline.tracks[0].clips[2];
+
+    assert_eq!(left_v.timeline_range.start, TimelinePosition::zero());
+    assert_eq!(left_v.timeline_range.end, TimelinePosition::from_secs_f64(5.0));
+    assert_eq!(right_v.timeline_range.start, TimelinePosition::from_secs_f64(10.0));
+    assert_eq!(right_v.timeline_range.end, TimelinePosition::from_secs_f64(20.0));
+
+    // Audio track should also be split: [left_a 0-5), [mid_a 5-10), [right_a 10-20)
+    assert_eq!(
+        timeline.tracks[1].clips.len(), 3,
+        "audio track should have 3 clips after mirrored split"
+    );
+    let left_a = &timeline.tracks[1].clips[0];
+    let mid_a = &timeline.tracks[1].clips[1];
+    let right_a = &timeline.tracks[1].clips[2];
+
+    assert_eq!(left_a.timeline_range.start, TimelinePosition::zero());
+    assert_eq!(left_a.timeline_range.end, TimelinePosition::from_secs_f64(5.0));
+    assert_eq!(mid_a.timeline_range.start, TimelinePosition::from_secs_f64(5.0));
+    assert_eq!(mid_a.timeline_range.end, TimelinePosition::from_secs_f64(10.0));
+    assert_eq!(right_a.timeline_range.start, TimelinePosition::from_secs_f64(10.0));
+    assert_eq!(right_a.timeline_range.end, TimelinePosition::from_secs_f64(20.0));
+
+    // Left video + left audio share the original link_id
+    assert_eq!(left_v.link_id, original_link_id);
+    assert_eq!(left_a.link_id, original_link_id);
+
+    // Right video + right audio share a NEW link_id (different from original)
+    assert!(right_v.link_id.is_some(), "right video should have link_id");
+    assert_eq!(right_v.link_id, right_a.link_id, "right video and audio should share link_id");
+    assert_ne!(right_v.link_id, original_link_id, "right pieces should have new link_id");
+
+    // Middle audio has no video partner → no link
+    assert!(mid_a.link_id.is_none(), "middle audio (no video partner) should have no link_id");
+
+    // New clip has no link
+    assert!(middle_v.link_id.is_none(), "new clip should have no link_id");
+
+    // Verify groups work: dragging left_v should only find left_a, not right_v
+    let left_linked = timeline.find_linked_clips(original_link_id.unwrap());
+    assert_eq!(left_linked.len(), 2, "left group should have exactly 2 clips");
+    let right_linked = timeline.find_linked_clips(right_v.link_id.unwrap());
+    assert_eq!(right_linked.len(), 2, "right group should have exactly 2 clips");
+}

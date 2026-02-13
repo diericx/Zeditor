@@ -395,6 +395,10 @@ impl App {
                 if self.is_playing {
                     self.is_playing = false;
                     self.playback_start_wall = None;
+                    self.send_audio_decode_stop();
+                    if let Some(player) = &self.audio_player {
+                        player.pause();
+                    }
                 }
                 self.playback_position = pos;
                 self.send_decode_seek(false); // scrub, not continuous
