@@ -43,6 +43,7 @@ pub struct SourceDragPreview {
     pub duration_secs: f64,
     pub track_index: usize,
     pub position: TimelinePosition,
+    pub audio_track_index: Option<usize>,
 }
 
 /// App-level drag state tracking.

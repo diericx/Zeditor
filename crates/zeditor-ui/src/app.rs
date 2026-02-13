@@ -1012,11 +1012,17 @@ impl App {
             }
         };
         let asset = self.project.source_library.get(asset_id)?;
+        let audio_track_index = if asset.has_audio {
+            self.project.timeline.find_paired_audio_track(track_index)
+        } else {
+            None
+        };
         Some(SourceDragPreview {
             asset_id,
             duration_secs: asset.duration.as_secs_f64(),
             track_index,
             position,
+            audio_track_index,
         })
     }
 

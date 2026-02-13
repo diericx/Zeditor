@@ -39,10 +39,17 @@ Right now the media management is looking rough. Let's fix that to look a bit mo
 
 ### Phase 4: Timeline Preview + Drag Overlay
 - Added `source_drag: Option<SourceDragPreview>` field to `TimelineCanvas` struct
-- In `TimelineCanvas::draw()`: when `source_drag` is Some, draws the clip at preview position using `draw_clip_shape()` (same color/style as real clips), plus computes and renders red semi-transparent trim preview overlaps on existing clips that would be affected
 - `view_timeline()` computes `SourceDragPreview` from `drag_state` via `compute_source_drag_preview()` helper; wraps timeline in `mouse_area` with `on_enter`/`on_exit`/`on_move` when dragging
 - Added `view_drag_overlay()`: renders semi-transparent ghost copy of the source card (thumbnail + filename) at cursor position using `stack!` overlay; non-interactive so mouse events pass through
 - `view()` wraps base layout in `stack!` with ghost overlay when `drag_state` is Some
+
+### Phase 4b: Accurate Timeline Preview (user feedback)
+- **Replaced red overlay rendering** with integrated final-state preview: the timeline now looks identical during hover to how it will look after drop
+- Added `audio_track_index: Option<usize>` to `SourceDragPreview` — computed via `find_paired_audio_track()` in `compute_source_drag_preview()`
+- Added `SourceDragDrawInfo` struct in `timeline_canvas.rs` — pre-computed before the track loop, holds trim preview maps for both video and audio tracks using `preview_trim_overlaps()`
+- In the clip drawing loop: clips affected by the source drop are drawn in their trimmed/split final form (using `draw_clip_shape()` for each `TrimPreview` piece), not with red overlays
+- New source clips drawn on both video AND audio tracks inside the track loop (same color/style as real clips)
+- Removed the entire old post-loop red overlay rendering block
 
 ### Phase 5: Tests
 - Updated existing simulator tests that referenced removed "Select"/"Add to Timeline" buttons

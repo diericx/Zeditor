@@ -558,6 +558,65 @@ impl<'a> canvas::Program<Message> for TimelineCanvas<'a> {
             HashMap::new()
         };
 
+        // Pre-compute source drag preview info (trim maps for affected tracks)
+        struct SourceDragDrawInfo {
+            video_track: usize,
+            audio_track: Option<usize>,
+            start_px: f32,
+            width_px: f32,
+            duration_secs: f64,
+            asset_id: Uuid,
+            video_preview_map: HashMap<Uuid, Vec<TrimPreview>>,
+            audio_preview_map: HashMap<Uuid, Vec<TrimPreview>>,
+        }
+
+        let source_drag_info: Option<SourceDragDrawInfo> = self.source_drag.as_ref().and_then(|preview| {
+            if preview.track_index >= self.timeline.tracks.len() {
+                return None;
+            }
+            let start_secs = preview.position.as_secs_f64();
+            let end_secs = start_secs + preview.duration_secs;
+            let start_px = self.secs_to_px(start_secs);
+            let end_px = self.secs_to_px(end_secs);
+
+            let video_preview_map = if let Ok(track) = self.timeline.track(preview.track_index) {
+                let previews = track.preview_trim_overlaps(start_secs, end_secs, None);
+                let mut map: HashMap<Uuid, Vec<_>> = HashMap::new();
+                for p in previews {
+                    map.entry(p.clip_id).or_default().push(p);
+                }
+                map
+            } else {
+                HashMap::new()
+            };
+
+            let audio_preview_map = if let Some(audio_idx) = preview.audio_track_index {
+                if let Ok(track) = self.timeline.track(audio_idx) {
+                    let previews = track.preview_trim_overlaps(start_secs, end_secs, None);
+                    let mut map: HashMap<Uuid, Vec<_>> = HashMap::new();
+                    for p in previews {
+                        map.entry(p.clip_id).or_default().push(p);
+                    }
+                    map
+                } else {
+                    HashMap::new()
+                }
+            } else {
+                HashMap::new()
+            };
+
+            Some(SourceDragDrawInfo {
+                video_track: preview.track_index,
+                audio_track: preview.audio_track_index,
+                start_px,
+                width_px: (end_px - start_px).max(4.0),
+                duration_secs: preview.duration_secs,
+                asset_id: preview.asset_id,
+                video_preview_map,
+                audio_preview_map,
+            })
+        });
+
         // Track lanes
         for (i, track) in self.timeline.tracks.iter().enumerate() {
             let track_top = RULER_HEIGHT + i as f32 * TRACK_HEIGHT;
@@ -676,6 +735,34 @@ impl<'a> canvas::Program<Message> for TimelineCanvas<'a> {
                             continue;
                         }
                     }
+
+                    // Check if this clip is affected by source drag preview
+                    if let Some(ref sd_info) = source_drag_info {
+                        let preview_map = if i == sd_info.video_track {
+                            Some(&sd_info.video_preview_map)
+                        } else if sd_info.audio_track == Some(i) {
+                            Some(&sd_info.audio_preview_map)
+                        } else {
+                            None
+                        };
+                        if let Some(map) = preview_map {
+                            if let Some(previews) = map.get(&clip.id) {
+                                let color = color_from_uuid(clip.asset_id);
+                                for preview in previews {
+                                    if let (Some(ts), Some(te)) =
+                                        (preview.trimmed_start, preview.trimmed_end)
+                                    {
+                                        let px = self.secs_to_px(ts);
+                                        let pw = (self.secs_to_px(te) - px).max(4.0);
+                                        draw_clip_shape(
+                                            &mut frame, px, pw, track_top, color, te - ts,
+                                        );
+                                    }
+                                }
+                                continue;
+                            }
+                        }
+                    }
                 }
 
                 // Dragged clip: draw at effective (snapped) position
@@ -710,6 +797,21 @@ impl<'a> canvas::Program<Message> for TimelineCanvas<'a> {
 
                 let color = color_from_uuid(clip.asset_id);
                 draw_clip_shape(&mut frame, draw_x, draw_width.max(4.0), track_top, color, dur);
+            }
+
+            // Draw source drag new clips on this track
+            if let Some(ref sd_info) = source_drag_info {
+                if i == sd_info.video_track || sd_info.audio_track == Some(i) {
+                    let color = color_from_uuid(sd_info.asset_id);
+                    draw_clip_shape(
+                        &mut frame,
+                        sd_info.start_px,
+                        sd_info.width_px,
+                        track_top,
+                        color,
+                        sd_info.duration_secs,
+                    );
+                }
             }
         }
 
@@ -753,67 +855,6 @@ impl<'a> canvas::Program<Message> for TimelineCanvas<'a> {
                             Size::new(1.0, total_track_height - RULER_HEIGHT),
                             Color::from_rgb(1.0, 0.6, 0.0),
                         );
-                    }
-                }
-            }
-        }
-
-        // Source drag preview: draw clip at preview position as if it were placed
-        if let Some(ref preview) = self.source_drag {
-            if preview.track_index < self.timeline.tracks.len() {
-                let track_top = RULER_HEIGHT + preview.track_index as f32 * TRACK_HEIGHT;
-                let start_px = self.secs_to_px(preview.position.as_secs_f64());
-                let end_px = self.secs_to_px(preview.position.as_secs_f64() + preview.duration_secs);
-                let width = (end_px - start_px).max(4.0);
-                let color = color_from_uuid(preview.asset_id);
-
-                draw_clip_shape(&mut frame, start_px, width, track_top, color, preview.duration_secs);
-
-                // Draw trim preview overlaps on existing clips
-                let preview_start = preview.position.as_secs_f64();
-                let preview_end = preview_start + preview.duration_secs;
-                if let Ok(track) = self.timeline.track(preview.track_index) {
-                    let trim_previews = track.preview_trim_overlaps(preview_start, preview_end, None);
-                    for tp in &trim_previews {
-                        if let (Some(ts), Some(te)) = (tp.trimmed_start, tp.trimmed_end) {
-                            // Original extent of the clip being trimmed
-                            if let Some(orig_clip) = track.get_clip(tp.clip_id) {
-                                let orig_start = orig_clip.timeline_range.start.as_secs_f64();
-                                let orig_end = orig_clip.timeline_range.end.as_secs_f64();
-                                // The removed portion(s) - draw red overlay
-                                // If the clip's start got trimmed forward
-                                if ts > orig_start {
-                                    let trim_start_px = self.secs_to_px(orig_start);
-                                    let trim_end_px = self.secs_to_px(ts);
-                                    frame.fill_rectangle(
-                                        Point::new(trim_start_px, track_top + 2.0),
-                                        Size::new(trim_end_px - trim_start_px, TRACK_HEIGHT - 4.0),
-                                        Color { r: 1.0, g: 0.0, b: 0.0, a: 0.25 },
-                                    );
-                                }
-                                // If the clip's end got trimmed backward
-                                if te < orig_end {
-                                    let trim_start_px = self.secs_to_px(te);
-                                    let trim_end_px = self.secs_to_px(orig_end);
-                                    frame.fill_rectangle(
-                                        Point::new(trim_start_px, track_top + 2.0),
-                                        Size::new(trim_end_px - trim_start_px, TRACK_HEIGHT - 4.0),
-                                        Color { r: 1.0, g: 0.0, b: 0.0, a: 0.25 },
-                                    );
-                                }
-                            }
-                        } else {
-                            // Clip would be completely removed - draw red over whole clip
-                            if let Some(orig_clip) = track.get_clip(tp.clip_id) {
-                                let clip_start_px = self.secs_to_px(orig_clip.timeline_range.start.as_secs_f64());
-                                let clip_end_px = self.secs_to_px(orig_clip.timeline_range.end.as_secs_f64());
-                                frame.fill_rectangle(
-                                    Point::new(clip_start_px, track_top + 2.0),
-                                    Size::new(clip_end_px - clip_start_px, TRACK_HEIGHT - 4.0),
-                                    Color { r: 1.0, g: 0.0, b: 0.0, a: 0.25 },
-                                );
-                            }
-                        }
                     }
                 }
             }
