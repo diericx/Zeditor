@@ -126,18 +126,18 @@ fn test_view_shows_imported_assets() {
 }
 
 #[test]
-fn test_click_add_to_timeline_button() {
+fn test_drag_to_timeline_adds_clip() {
     let mut app = App::new();
 
     let asset = make_test_asset("intro", 5.0);
+    let asset_id = asset.id;
     app.update(Message::MediaImported(Ok(asset)));
 
-    let mut ui = simulator(app.view());
-    let _ = ui.click("Add to Timeline");
-
-    for msg in ui.into_messages() {
-        app.update(msg);
-    }
+    // Simulate full drag workflow via messages
+    app.update(Message::StartDragFromSource(asset_id));
+    app.update(Message::DragEnteredTimeline);
+    app.update(Message::DragOverTimeline(iced::Point::new(200.0, 70.0)));
+    app.update(Message::DragReleased);
 
     assert_eq!(app.project.timeline.tracks[0].clips.len(), 1);
     assert_eq!(app.status_message, "Clip added");
@@ -215,24 +215,23 @@ fn test_click_import_button() {
 }
 
 #[test]
-fn test_select_asset_shows_highlight() {
+fn test_select_asset_shows_placement_hint() {
     let mut app = App::new();
     let asset = make_test_asset("my_clip", 5.0);
     let asset_id = asset.id;
     app.update(Message::MediaImported(Ok(asset)));
 
-    // Before selection: "Select" button visible
+    // Before selection: no placement hint
     {
         let mut ui = simulator(app.view());
-        assert!(ui.find("Select").is_ok());
+        assert!(ui.find("my_clip").is_ok(), "Should display asset name in card");
     }
 
     // Select the asset
     app.update(Message::SelectSourceAsset(Some(asset_id)));
 
-    // After selection: "Selected" button visible + placement hint
+    // After selection: placement hint visible
     let mut ui = simulator(app.view());
-    assert!(ui.find("Selected").is_ok());
     assert!(ui.find("Click timeline to place clip").is_ok());
 }
 
@@ -242,14 +241,14 @@ fn test_full_simulator_workflow() {
 
     // Import an asset.
     let asset = make_test_asset("scene1", 10.0);
+    let asset_id = asset.id;
     app.update(Message::MediaImported(Ok(asset)));
 
-    // Click "Add to Timeline" via simulator.
-    let mut ui = simulator(app.view());
-    let _ = ui.click("Add to Timeline");
-    for msg in ui.into_messages() {
-        app.update(msg);
-    }
+    // Drag to timeline via messages.
+    app.update(Message::StartDragFromSource(asset_id));
+    app.update(Message::DragEnteredTimeline);
+    app.update(Message::DragOverTimeline(iced::Point::new(100.0, 70.0)));
+    app.update(Message::DragReleased);
 
     assert_eq!(app.project.timeline.tracks[0].clips.len(), 1);
 
@@ -341,5 +340,68 @@ fn test_view_renders_with_open_edit_menu() {
     app.open_menu = Some(MenuId::Edit);
 
     // Should not panic when rendering with open Edit menu
+    let _ui = simulator(app.view());
+}
+
+// ===== Brief 8: Media management simulator tests =====
+
+#[test]
+fn test_view_shows_source_card_with_name() {
+    let mut app = App::new();
+    let asset = make_test_asset("my_video_clip", 5.0);
+    app.update(Message::MediaImported(Ok(asset)));
+
+    let mut ui = simulator(app.view());
+    assert!(
+        ui.find("my_video_clip").is_ok(),
+        "Should display asset name in source card"
+    );
+}
+
+#[test]
+fn test_view_renders_thumbnail_grid() {
+    let mut app = App::new();
+
+    // Import two assets
+    let asset1 = make_test_asset("clip_a", 5.0);
+    let asset2 = make_test_asset("clip_b", 3.0);
+    app.update(Message::MediaImported(Ok(asset1)));
+    app.update(Message::MediaImported(Ok(asset2)));
+
+    // Should render without panic
+    let mut ui = simulator(app.view());
+    assert!(ui.find("clip_a").is_ok());
+    assert!(ui.find("clip_b").is_ok());
+}
+
+#[test]
+fn test_view_renders_with_drag_state() {
+    let mut app = App::new();
+    let asset = make_test_asset("dragging_clip", 5.0);
+    let asset_id = asset.id;
+    app.update(Message::MediaImported(Ok(asset)));
+
+    // Set up drag state
+    app.update(Message::StartDragFromSource(asset_id));
+    app.update(Message::DragMoved(iced::Point::new(300.0, 200.0)));
+
+    // Should render without panic with drag overlay
+    let _ui = simulator(app.view());
+}
+
+#[test]
+fn test_view_renders_onion_skin_during_drag() {
+    let mut app = App::new();
+    let asset = make_test_asset("onion_clip", 5.0);
+    let asset_id = asset.id;
+    app.update(Message::MediaImported(Ok(asset)));
+
+    // Set up drag over timeline
+    app.update(Message::StartDragFromSource(asset_id));
+    app.update(Message::DragEnteredTimeline);
+    app.update(Message::DragOverTimeline(iced::Point::new(200.0, 70.0)));
+    app.update(Message::DragMoved(iced::Point::new(200.0, 400.0)));
+
+    // Should render both ghost overlay and timeline preview without panic
     let _ui = simulator(app.view());
 }

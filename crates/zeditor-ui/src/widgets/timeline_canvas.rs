@@ -7,7 +7,7 @@ use uuid::Uuid;
 
 use zeditor_core::timeline::{Timeline, TimelinePosition, TrimPreview, TrackType};
 
-use crate::message::{Message, ToolMode};
+use crate::message::{Message, SourceDragPreview, ToolMode};
 
 const RULER_HEIGHT: f32 = 20.0;
 const TRACK_HEIGHT: f32 = 50.0;
@@ -61,6 +61,7 @@ pub struct TimelineCanvas<'a> {
     pub zoom: f32,
     pub scroll_offset: f32,
     pub tool_mode: ToolMode,
+    pub source_drag: Option<SourceDragPreview>,
 }
 
 impl<'a> TimelineCanvas<'a> {
@@ -757,6 +758,67 @@ impl<'a> canvas::Program<Message> for TimelineCanvas<'a> {
             }
         }
 
+        // Source drag preview: draw clip at preview position as if it were placed
+        if let Some(ref preview) = self.source_drag {
+            if preview.track_index < self.timeline.tracks.len() {
+                let track_top = RULER_HEIGHT + preview.track_index as f32 * TRACK_HEIGHT;
+                let start_px = self.secs_to_px(preview.position.as_secs_f64());
+                let end_px = self.secs_to_px(preview.position.as_secs_f64() + preview.duration_secs);
+                let width = (end_px - start_px).max(4.0);
+                let color = color_from_uuid(preview.asset_id);
+
+                draw_clip_shape(&mut frame, start_px, width, track_top, color, preview.duration_secs);
+
+                // Draw trim preview overlaps on existing clips
+                let preview_start = preview.position.as_secs_f64();
+                let preview_end = preview_start + preview.duration_secs;
+                if let Ok(track) = self.timeline.track(preview.track_index) {
+                    let trim_previews = track.preview_trim_overlaps(preview_start, preview_end, None);
+                    for tp in &trim_previews {
+                        if let (Some(ts), Some(te)) = (tp.trimmed_start, tp.trimmed_end) {
+                            // Original extent of the clip being trimmed
+                            if let Some(orig_clip) = track.get_clip(tp.clip_id) {
+                                let orig_start = orig_clip.timeline_range.start.as_secs_f64();
+                                let orig_end = orig_clip.timeline_range.end.as_secs_f64();
+                                // The removed portion(s) - draw red overlay
+                                // If the clip's start got trimmed forward
+                                if ts > orig_start {
+                                    let trim_start_px = self.secs_to_px(orig_start);
+                                    let trim_end_px = self.secs_to_px(ts);
+                                    frame.fill_rectangle(
+                                        Point::new(trim_start_px, track_top + 2.0),
+                                        Size::new(trim_end_px - trim_start_px, TRACK_HEIGHT - 4.0),
+                                        Color { r: 1.0, g: 0.0, b: 0.0, a: 0.25 },
+                                    );
+                                }
+                                // If the clip's end got trimmed backward
+                                if te < orig_end {
+                                    let trim_start_px = self.secs_to_px(te);
+                                    let trim_end_px = self.secs_to_px(orig_end);
+                                    frame.fill_rectangle(
+                                        Point::new(trim_start_px, track_top + 2.0),
+                                        Size::new(trim_end_px - trim_start_px, TRACK_HEIGHT - 4.0),
+                                        Color { r: 1.0, g: 0.0, b: 0.0, a: 0.25 },
+                                    );
+                                }
+                            }
+                        } else {
+                            // Clip would be completely removed - draw red over whole clip
+                            if let Some(orig_clip) = track.get_clip(tp.clip_id) {
+                                let clip_start_px = self.secs_to_px(orig_clip.timeline_range.start.as_secs_f64());
+                                let clip_end_px = self.secs_to_px(orig_clip.timeline_range.end.as_secs_f64());
+                                frame.fill_rectangle(
+                                    Point::new(clip_start_px, track_top + 2.0),
+                                    Size::new(clip_end_px - clip_start_px, TRACK_HEIGHT - 4.0),
+                                    Color { r: 1.0, g: 0.0, b: 0.0, a: 0.25 },
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         vec![frame.into_geometry()]
     }
 
@@ -886,6 +948,7 @@ mod tests {
             zoom: 100.0,
             scroll_offset: 0.0,
             tool_mode: ToolMode::Arrow,
+            source_drag: None,
         };
         let secs = canvas.px_to_secs(200.0);
         assert!((secs - 2.0).abs() < 0.001);
@@ -901,6 +964,7 @@ mod tests {
             zoom: 100.0,
             scroll_offset: 50.0,
             tool_mode: ToolMode::Arrow,
+            source_drag: None,
         };
         let px = canvas.secs_to_px(2.0);
         assert!((px - 150.0).abs() < 0.001);
@@ -916,6 +980,7 @@ mod tests {
             zoom: 100.0,
             scroll_offset: 0.0,
             tool_mode: ToolMode::Arrow,
+            source_drag: None,
         };
         let result = canvas.hit_test_clip(300.0, RULER_HEIGHT + 25.0);
         assert!(result.is_some());
@@ -934,6 +999,7 @@ mod tests {
             zoom: 100.0,
             scroll_offset: 0.0,
             tool_mode: ToolMode::Arrow,
+            source_drag: None,
         };
         let result = canvas.hit_test_clip(597.0, RULER_HEIGHT + 25.0);
         assert!(result.is_some());
@@ -951,6 +1017,7 @@ mod tests {
             zoom: 100.0,
             scroll_offset: 0.0,
             tool_mode: ToolMode::Arrow,
+            source_drag: None,
         };
         let result = canvas.hit_test_clip(50.0, RULER_HEIGHT + 25.0);
         assert!(result.is_none());
@@ -973,6 +1040,7 @@ mod tests {
             zoom: 100.0,
             scroll_offset: 200.0, // scrolled right, so negative px → negative secs
             tool_mode: ToolMode::Arrow,
+            source_drag: None,
         };
         // px_to_secs(-100) with scroll 200 = (-100 + 200)/100 = 1.0 (positive)
         // But with px=0 and large scroll offset, raw can go negative
@@ -995,6 +1063,7 @@ mod tests {
             zoom: 100.0,
             scroll_offset: 0.0,
             tool_mode: ToolMode::Blade,
+            source_drag: None,
         };
         let mut state = TimelineCanvasState::default();
         let bounds = Rectangle::new(Point::ORIGIN, Size::new(800.0, 200.0));
@@ -1023,6 +1092,7 @@ mod tests {
             zoom: 100.0,
             scroll_offset: 0.0,
             tool_mode: ToolMode::Arrow,
+            source_drag: None,
         };
 
         // Simulate a drag state where the user tries to drag left of 0
@@ -1091,6 +1161,7 @@ mod tests {
             zoom: 100.0,
             scroll_offset: 0.0,
             tool_mode: ToolMode::Arrow,
+            source_drag: None,
         };
 
         // Video clip starts at 1.0s. Drag to 3.0s → delta = 2.0s.
@@ -1145,6 +1216,7 @@ mod tests {
             zoom: 100.0,
             scroll_offset: 0.0,
             tool_mode: ToolMode::Arrow,
+            source_drag: None,
         };
 
         // Video clip is [1.0, 6.0) → end_px = 600
@@ -1187,6 +1259,7 @@ mod tests {
             zoom: 100.0,
             scroll_offset: 0.0,
             tool_mode: ToolMode::Arrow,
+            source_drag: None,
         };
 
         let mut state = TimelineCanvasState::default();

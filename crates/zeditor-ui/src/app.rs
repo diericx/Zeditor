@@ -2,15 +2,17 @@ use std::path::PathBuf;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
-use iced::widget::{button, center, column, container, mouse_area, opaque, row, scrollable, stack, text};
-use iced::{keyboard, time, Background, Border, Color, Element, Length, Subscription, Task};
+use std::collections::HashMap;
+
+use iced::widget::{button, center, column, container, image, mouse_area, opaque, row, scrollable, stack, text, Space};
+use iced::{event, keyboard, mouse, time, window, Background, Border, Color, Element, Event, Length, Padding, Point, Subscription, Task};
 use uuid::Uuid;
 
 use zeditor_core::project::Project;
 use zeditor_core::timeline::{Clip, TimeRange, TimelinePosition, TrackType};
 
 use crate::audio_player::AudioPlayer;
-use crate::message::{MenuAction, MenuId, Message, ToolMode};
+use crate::message::{DragPayload, DragState, MenuAction, MenuId, Message, SourceDragPreview, ToolMode};
 use crate::widgets::timeline_canvas::TimelineCanvas;
 
 /// Preview resolution cap. 4K frames are scaled down to this for display.
@@ -69,6 +71,9 @@ pub struct App {
     pub timeline_scroll: f32,
     pub tool_mode: ToolMode,
     pub open_menu: Option<MenuId>,
+    pub thumbnails: HashMap<Uuid, iced::widget::image::Handle>,
+    pub drag_state: Option<DragState>,
+    pub hovered_asset_id: Option<Uuid>,
     decode_tx: Option<mpsc::Sender<DecodeRequest>>,
     pub(crate) decode_rx: Option<mpsc::Receiver<DecodedFrame>>,
     pub(crate) decode_clip_id: Option<Uuid>,
@@ -101,6 +106,9 @@ impl Default for App {
             timeline_scroll: 0.0,
             tool_mode: ToolMode::default(),
             open_menu: None,
+            thumbnails: HashMap::new(),
+            drag_state: None,
+            hovered_asset_id: None,
             decode_tx: None,
             decode_rx: None,
             decode_clip_id: None,
@@ -153,6 +161,11 @@ impl App {
         // Always tick: 16ms when playing (60fps), 100ms when paused (for scrub frames)
         let tick_ms = if self.is_playing { 16 } else { 100 };
         subs.push(time::every(Duration::from_millis(tick_ms)).map(|_| Message::PlaybackTick));
+
+        // Global mouse tracking during drag
+        if self.drag_state.is_some() {
+            subs.push(event::listen_with(drag_event_filter));
+        }
 
         Subscription::batch(subs)
     }
@@ -210,11 +223,32 @@ impl App {
                 match result {
                     Ok(asset) => {
                         self.status_message = format!("Imported: {}", asset.name);
+                        let asset_id = asset.id;
+                        let path = asset.path.clone();
                         self.project.source_library.import(asset);
+                        // Spawn thumbnail generation in the background
+                        return Task::perform(
+                            async move {
+                                let result = zeditor_media::thumbnail::generate_thumbnail_rgba_scaled(
+                                    &path, 160, 90,
+                                )
+                                .map(|frame| (frame.data, frame.width, frame.height))
+                                .map_err(|e| format!("{e}"));
+                                (asset_id, result)
+                            },
+                            |(asset_id, result)| Message::ThumbnailGenerated { asset_id, result },
+                        );
                     }
                     Err(e) => {
                         self.status_message = format!("Import failed: {e}");
                     }
+                }
+                Task::none()
+            }
+            Message::ThumbnailGenerated { asset_id, result } => {
+                if let Ok((data, width, height)) = result {
+                    let handle = iced::widget::image::Handle::from_rgba(width, height, data);
+                    self.thumbnails.insert(asset_id, handle);
                 }
                 Task::none()
             }
@@ -231,6 +265,102 @@ impl App {
             }
             Message::SelectSourceAsset(id) => {
                 self.selected_asset_id = id;
+                Task::none()
+            }
+            Message::SourceCardHovered(id) => {
+                self.hovered_asset_id = id;
+                Task::none()
+            }
+            Message::StartDragFromSource(asset_id) => {
+                if let Some(asset) = self.project.source_library.get(asset_id) {
+                    let thumbnail = self.thumbnails.get(&asset_id).cloned();
+                    self.drag_state = Some(DragState {
+                        payload: DragPayload::SourceAsset {
+                            asset_id,
+                            thumbnail,
+                            name: asset.name.clone(),
+                        },
+                        cursor_position: Point::ORIGIN,
+                        over_timeline: false,
+                        timeline_track: None,
+                        timeline_position: None,
+                    });
+                }
+                Task::none()
+            }
+            Message::DragMoved(position) => {
+                if let Some(drag) = &mut self.drag_state {
+                    drag.cursor_position = position;
+                }
+                Task::none()
+            }
+            Message::DragReleased => {
+                if let Some(drag) = self.drag_state.take() {
+                    if drag.over_timeline {
+                        let DragPayload::SourceAsset { asset_id, .. } = &drag.payload;
+                        if let (Some(track_index), Some(position)) =
+                            (drag.timeline_track, drag.timeline_position)
+                        {
+                            return self.update(Message::AddClipToTimeline {
+                                asset_id: *asset_id,
+                                track_index,
+                                position,
+                            });
+                        }
+                    }
+                }
+                Task::none()
+            }
+            Message::DragEnteredTimeline => {
+                if let Some(drag) = &mut self.drag_state {
+                    drag.over_timeline = true;
+                }
+                Task::none()
+            }
+            Message::DragExitedTimeline => {
+                if let Some(drag) = &mut self.drag_state {
+                    drag.over_timeline = false;
+                    drag.timeline_track = None;
+                    drag.timeline_position = None;
+                }
+                Task::none()
+            }
+            Message::DragOverTimeline(point) => {
+                if let Some(drag) = &mut self.drag_state {
+                    // Account for controls row height (~30px) and ruler height (20px)
+                    let controls_height = 30.0_f32;
+                    let ruler_height = 20.0_f32;
+                    let track_height = 50.0_f32;
+
+                    let secs = ((point.x + self.timeline_scroll) / self.timeline_zoom) as f64;
+                    let secs = secs.max(0.0);
+
+                    let track_y = point.y - controls_height - ruler_height;
+                    let track_index = if track_y < 0.0 {
+                        0
+                    } else {
+                        let idx = (track_y / track_height) as usize;
+                        idx.min(self.project.timeline.tracks.len().saturating_sub(1))
+                    };
+
+                    // Only place on video tracks
+                    let video_track_index = self
+                        .project
+                        .timeline
+                        .tracks
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, t)| t.track_type == TrackType::Video)
+                        .map(|(i, _)| i)
+                        .min_by_key(|&i| {
+                            let diff = if i > track_index { i - track_index } else { track_index - i };
+                            diff
+                        })
+                        .unwrap_or(0);
+
+                    drag.timeline_track = Some(video_track_index);
+                    drag.timeline_position = Some(TimelinePosition::from_secs_f64(secs));
+                }
                 Task::none()
             }
             Message::AddClipToTimeline {
@@ -534,6 +664,13 @@ impl App {
             }
             Message::KeyboardEvent(event) => {
                 if let keyboard::Event::KeyPressed { key, .. } = event {
+                    // Escape cancels drag
+                    if self.drag_state.is_some() {
+                        if matches!(key.as_ref(), keyboard::Key::Named(keyboard::key::Named::Escape)) {
+                            self.drag_state = None;
+                        }
+                        return Task::none();
+                    }
                     // When a menu is open, Escape closes it and all other keys are swallowed
                     if self.open_menu.is_some() {
                         if matches!(key.as_ref(), keyboard::Key::Named(keyboard::key::Named::Escape)) {
@@ -653,7 +790,7 @@ impl App {
 
         let top_row = row![source_panel, video_viewport].spacing(4);
 
-        if self.open_menu.is_some() {
+        let base_layout: Element<'_, Message> = if self.open_menu.is_some() {
             let click_off: Element<'_, Message> = mouse_area(
                 container("")
                     .width(Length::Fill)
@@ -679,6 +816,17 @@ impl App {
                 .spacing(4)
                 .padding(4)
                 .into()
+        };
+
+        // Add drag ghost overlay if dragging
+        if let Some(drag) = &self.drag_state {
+            let ghost = self.view_drag_overlay(drag);
+            stack![base_layout, ghost]
+                .width(Length::Fill)
+                .height(Length::Fill)
+                .into()
+        } else {
+            base_layout
         }
     }
 
@@ -688,47 +836,93 @@ impl App {
         let import_btn =
             button(text("Import").size(14)).on_press(Message::OpenFileDialog);
 
-        let assets: Vec<Element<'_, Message>> = self
-            .project
-            .source_library
-            .assets()
-            .iter()
-            .map(|asset| {
-                let is_selected = self.selected_asset_id == Some(asset.id);
-                let label = text(&asset.name).size(14);
-                let select_btn = if is_selected {
-                    button(text("Selected").size(12))
-                        .on_press(Message::SelectSourceAsset(None))
-                        .style(button::success)
-                } else {
-                    button(text("Select").size(12))
-                        .on_press(Message::SelectSourceAsset(Some(asset.id)))
-                };
-                let add_btn = button(text("Add to Timeline").size(12)).on_press(
-                    Message::AddClipToTimeline {
-                        asset_id: asset.id,
-                        track_index: 0,
-                        position: self.project.timeline.track(0).map_or(
-                            TimelinePosition::zero(),
-                            |t| t.end_position(),
-                        ),
-                    },
+        let assets = self.project.source_library.assets();
+        let mut grid_rows: Vec<Element<'_, Message>> = Vec::new();
+
+        // Build 2-column grid
+        let mut i = 0;
+        while i < assets.len() {
+            let card1 = self.view_source_card(&assets[i]);
+            if i + 1 < assets.len() {
+                let card2 = self.view_source_card(&assets[i + 1]);
+                grid_rows.push(row![card1, card2].spacing(6).into());
+            } else {
+                grid_rows.push(
+                    row![card1, Space::new().width(130)]
+                        .spacing(6)
+                        .into(),
                 );
-                row![label, select_btn, add_btn].spacing(5).into()
-            })
-            .collect();
+            }
+            i += 2;
+        }
 
-        let asset_list = scrollable(column(assets).spacing(4));
+        let asset_grid = scrollable(column(grid_rows).spacing(6));
 
-        let add_to_tl_btn = if self.selected_asset_id.is_some() {
+        let hint = if self.selected_asset_id.is_some() {
             text("Click timeline to place clip").size(12)
         } else {
             text("").size(12)
         };
 
-        column![title, import_btn, asset_list, add_to_tl_btn]
+        column![title, import_btn, asset_grid, hint]
             .spacing(8)
             .width(300)
+            .into()
+    }
+
+    fn view_source_card<'a>(&'a self, asset: &'a zeditor_core::media::MediaAsset) -> Element<'a, Message> {
+        let is_hovered = self.hovered_asset_id == Some(asset.id);
+        let asset_id = asset.id;
+
+        // Thumbnail or placeholder
+        let thumb_content: Element<'_, Message> = if let Some(handle) = self.thumbnails.get(&asset_id) {
+            image(handle.clone())
+                .width(120)
+                .height(68)
+                .content_fit(iced::ContentFit::Cover)
+                .into()
+        } else {
+            container(center(text("...").size(14).color(Color::from_rgb(0.5, 0.5, 0.5))))
+                .width(120)
+                .height(68)
+                .style(|_theme| container::Style {
+                    background: Some(Background::Color(Color::from_rgb(0.2, 0.2, 0.22))),
+                    ..Default::default()
+                })
+                .into()
+        };
+
+        let border_color = if is_hovered {
+            Color::from_rgb(0.3, 0.5, 0.9)
+        } else {
+            Color::TRANSPARENT
+        };
+
+        let name_label = text(&asset.name)
+            .size(11)
+            .color(Color::WHITE)
+            .width(120)
+            .center();
+
+        let card = container(
+            column![thumb_content, name_label].spacing(2).align_x(iced::Alignment::Center),
+        )
+        .padding(4)
+        .width(130)
+        .style(move |_theme| container::Style {
+            background: Some(Background::Color(Color::from_rgb(0.18, 0.18, 0.20))),
+            border: Border {
+                color: border_color,
+                width: 2.0,
+                radius: 6.0.into(),
+            },
+            ..Default::default()
+        });
+
+        mouse_area(card)
+            .on_enter(Message::SourceCardHovered(Some(asset_id)))
+            .on_exit(Message::SourceCardHovered(None))
+            .on_press(Message::StartDragFromSource(asset_id))
             .into()
     }
 
@@ -776,6 +970,9 @@ impl App {
         let redo_btn = button(text("Redo").size(12)).on_press(Message::Redo);
         let controls = row![undo_btn, redo_btn].spacing(5);
 
+        // Compute source drag preview for the canvas
+        let source_drag = self.compute_source_drag_preview();
+
         let canvas = iced::widget::canvas(TimelineCanvas {
             timeline: &self.project.timeline,
             playback_position: self.playback_position,
@@ -783,11 +980,44 @@ impl App {
             zoom: self.timeline_zoom,
             scroll_offset: self.timeline_scroll,
             tool_mode: self.tool_mode,
+            source_drag,
         })
         .width(Length::Fill)
         .height(200);
 
-        column![controls, canvas].spacing(4).into()
+        let timeline_content: Element<'_, Message> = column![controls, canvas].spacing(4).into();
+
+        // When dragging, wrap timeline in mouse_area for enter/exit/move detection
+        if self.drag_state.is_some() {
+            mouse_area(timeline_content)
+                .on_enter(Message::DragEnteredTimeline)
+                .on_exit(Message::DragExitedTimeline)
+                .on_move(Message::DragOverTimeline)
+                .into()
+        } else {
+            timeline_content
+        }
+    }
+
+    fn compute_source_drag_preview(&self) -> Option<SourceDragPreview> {
+        let drag = self.drag_state.as_ref()?;
+        if !drag.over_timeline {
+            return None;
+        }
+        let (asset_id, track_index, position) = match &drag.payload {
+            DragPayload::SourceAsset { asset_id, .. } => {
+                let track_index = drag.timeline_track?;
+                let position = drag.timeline_position?;
+                (*asset_id, track_index, position)
+            }
+        };
+        let asset = self.project.source_library.get(asset_id)?;
+        Some(SourceDragPreview {
+            asset_id,
+            duration_secs: asset.duration.as_secs_f64(),
+            track_index,
+            position,
+        })
     }
 
     fn view_menu_bar(&self) -> Element<'_, Message> {
@@ -909,6 +1139,68 @@ impl App {
             }
         })
         .into()
+    }
+
+    fn view_drag_overlay<'a>(&'a self, drag: &'a DragState) -> Element<'a, Message> {
+        let (thumbnail, name) = match &drag.payload {
+            DragPayload::SourceAsset { thumbnail, name, .. } => (thumbnail.clone(), name.as_str()),
+        };
+
+        let thumb_content: Element<'_, Message> = if let Some(handle) = thumbnail {
+            image(handle)
+                .width(120)
+                .height(68)
+                .content_fit(iced::ContentFit::Cover)
+                .into()
+        } else {
+            container(center(text("...").size(14).color(Color::from_rgb(0.5, 0.5, 0.5))))
+                .width(120)
+                .height(68)
+                .style(|_theme| container::Style {
+                    background: Some(Background::Color(Color::from_rgb(0.2, 0.2, 0.22))),
+                    ..Default::default()
+                })
+                .into()
+        };
+
+        let name_label = text(name)
+            .size(11)
+            .color(Color::WHITE)
+            .width(120)
+            .center();
+
+        let card = container(
+            column![thumb_content, name_label].spacing(2).align_x(iced::Alignment::Center),
+        )
+        .padding(4)
+        .width(130)
+        .style(|_theme| container::Style {
+            background: Some(Background::Color(Color {
+                r: 0.18,
+                g: 0.18,
+                b: 0.20,
+                a: 0.7,
+            })),
+            border: Border {
+                color: Color::from_rgb(0.3, 0.5, 0.9),
+                width: 2.0,
+                radius: 6.0.into(),
+            },
+            ..Default::default()
+        });
+
+        // Position at cursor with offset so card is centered on cursor
+        let cursor = drag.cursor_position;
+        container(card)
+            .padding(Padding {
+                top: (cursor.y - 45.0).max(0.0),
+                left: (cursor.x - 65.0).max(0.0),
+                right: 0.0,
+                bottom: 0.0,
+            })
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .into()
     }
 
     /// Find the video clip at the given playback position (searches only video tracks).
@@ -1137,6 +1429,20 @@ pub fn rgb24_to_rgba32(rgb: &[u8], width: u32, height: u32) -> Vec<u8> {
         rgba.push(255);
     }
     rgba
+}
+
+/// Event filter for global mouse tracking during drag operations.
+/// Plain function pointer (not closure) as required by `event::listen_with`.
+fn drag_event_filter(event: Event, _status: event::Status, _window: window::Id) -> Option<Message> {
+    match event {
+        Event::Mouse(mouse::Event::CursorMoved { position }) => {
+            Some(Message::DragMoved(position))
+        }
+        Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)) => {
+            Some(Message::DragReleased)
+        }
+        _ => None,
+    }
 }
 
 /// Cached decoder state for the decode worker thread.

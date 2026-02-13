@@ -26,6 +26,35 @@ pub enum MenuAction {
     Redo,
 }
 
+/// Payload describing what is being dragged. Extensible for future drag sources.
+#[derive(Debug, Clone)]
+pub enum DragPayload {
+    SourceAsset {
+        asset_id: Uuid,
+        thumbnail: Option<iced::widget::image::Handle>,
+        name: String,
+    },
+}
+
+/// Preview state for a source asset being dragged over the timeline.
+#[derive(Debug, Clone)]
+pub struct SourceDragPreview {
+    pub asset_id: Uuid,
+    pub duration_secs: f64,
+    pub track_index: usize,
+    pub position: TimelinePosition,
+}
+
+/// App-level drag state tracking.
+#[derive(Debug, Clone)]
+pub struct DragState {
+    pub payload: DragPayload,
+    pub cursor_position: iced::Point,
+    pub over_timeline: bool,
+    pub timeline_track: Option<usize>,
+    pub timeline_position: Option<TimelinePosition>,
+}
+
 #[derive(Debug, Clone)]
 pub enum Message {
     // Source library
@@ -35,6 +64,23 @@ pub enum Message {
     OpenFileDialog,
     FileDialogResult(Vec<PathBuf>),
     SelectSourceAsset(Option<Uuid>),
+
+    // Thumbnails
+    ThumbnailGenerated {
+        asset_id: Uuid,
+        result: Result<(Vec<u8>, u32, u32), String>,
+    },
+
+    // Source card hover
+    SourceCardHovered(Option<Uuid>),
+
+    // Drag from source
+    StartDragFromSource(Uuid),
+    DragMoved(iced::Point),
+    DragReleased,
+    DragEnteredTimeline,
+    DragExitedTimeline,
+    DragOverTimeline(iced::Point),
 
     // Timeline
     AddClipToTimeline {

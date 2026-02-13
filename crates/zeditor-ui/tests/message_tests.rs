@@ -1014,3 +1014,217 @@ fn test_keyboard_swallowed_when_menu_open() {
     assert_eq!(app.tool_mode, ToolMode::Arrow, "key should be swallowed when menu is open");
     assert!(app.open_menu.is_some(), "menu should remain open");
 }
+
+// ===== Brief 8: Media management & drag-to-timeline tests =====
+
+use zeditor_ui::message::DragPayload;
+
+#[test]
+fn test_thumbnail_generated_stores_handle() {
+    let mut app = App::new();
+    let asset = make_test_asset("clip1", 5.0);
+    let asset_id = asset.id;
+    app.update(Message::MediaImported(Ok(asset)));
+
+    // Simulate successful thumbnail generation (4x2 RGBA image = 32 bytes)
+    let data = vec![128u8; 4 * 2 * 4];
+    app.update(Message::ThumbnailGenerated {
+        asset_id,
+        result: Ok((data, 4, 2)),
+    });
+
+    assert!(app.thumbnails.contains_key(&asset_id));
+}
+
+#[test]
+fn test_thumbnail_generated_error_no_crash() {
+    let mut app = App::new();
+    let asset = make_test_asset("clip1", 5.0);
+    let asset_id = asset.id;
+    app.update(Message::MediaImported(Ok(asset)));
+
+    app.update(Message::ThumbnailGenerated {
+        asset_id,
+        result: Err("decode error".into()),
+    });
+
+    // Should not crash, and no thumbnail stored
+    assert!(!app.thumbnails.contains_key(&asset_id));
+}
+
+#[test]
+fn test_source_card_hover_state() {
+    let mut app = App::new();
+    let asset = make_test_asset("clip1", 5.0);
+    let asset_id = asset.id;
+    app.update(Message::MediaImported(Ok(asset)));
+
+    assert!(app.hovered_asset_id.is_none());
+
+    app.update(Message::SourceCardHovered(Some(asset_id)));
+    assert_eq!(app.hovered_asset_id, Some(asset_id));
+
+    app.update(Message::SourceCardHovered(None));
+    assert!(app.hovered_asset_id.is_none());
+}
+
+#[test]
+fn test_start_drag_from_source() {
+    let mut app = App::new();
+    let asset = make_test_asset("clip1", 5.0);
+    let asset_id = asset.id;
+    app.update(Message::MediaImported(Ok(asset)));
+
+    app.update(Message::StartDragFromSource(asset_id));
+
+    let drag = app.drag_state.as_ref().expect("drag_state should be Some");
+    match &drag.payload {
+        DragPayload::SourceAsset { asset_id: id, name, .. } => {
+            assert_eq!(*id, asset_id);
+            assert_eq!(name, "clip1");
+        }
+    }
+    assert!(!drag.over_timeline);
+}
+
+#[test]
+fn test_start_drag_nonexistent_asset_no_crash() {
+    let mut app = App::new();
+    app.update(Message::StartDragFromSource(uuid::Uuid::new_v4()));
+    assert!(app.drag_state.is_none());
+}
+
+#[test]
+fn test_drag_moved_updates_position() {
+    let mut app = App::new();
+    let asset = make_test_asset("clip1", 5.0);
+    let asset_id = asset.id;
+    app.update(Message::MediaImported(Ok(asset)));
+    app.update(Message::StartDragFromSource(asset_id));
+
+    app.update(Message::DragMoved(iced::Point::new(100.0, 200.0)));
+
+    let drag = app.drag_state.as_ref().unwrap();
+    assert_eq!(drag.cursor_position, iced::Point::new(100.0, 200.0));
+}
+
+#[test]
+fn test_drag_entered_timeline() {
+    let mut app = App::new();
+    let asset = make_test_asset("clip1", 5.0);
+    let asset_id = asset.id;
+    app.update(Message::MediaImported(Ok(asset)));
+    app.update(Message::StartDragFromSource(asset_id));
+
+    assert!(!app.drag_state.as_ref().unwrap().over_timeline);
+
+    app.update(Message::DragEnteredTimeline);
+    assert!(app.drag_state.as_ref().unwrap().over_timeline);
+}
+
+#[test]
+fn test_drag_exited_timeline() {
+    let mut app = App::new();
+    let asset = make_test_asset("clip1", 5.0);
+    let asset_id = asset.id;
+    app.update(Message::MediaImported(Ok(asset)));
+    app.update(Message::StartDragFromSource(asset_id));
+    app.update(Message::DragEnteredTimeline);
+    assert!(app.drag_state.as_ref().unwrap().over_timeline);
+
+    app.update(Message::DragExitedTimeline);
+    let drag = app.drag_state.as_ref().unwrap();
+    assert!(!drag.over_timeline);
+    assert!(drag.timeline_track.is_none());
+    assert!(drag.timeline_position.is_none());
+}
+
+#[test]
+fn test_drag_over_timeline_computes_position() {
+    let mut app = App::new();
+    let asset = make_test_asset("clip1", 5.0);
+    let asset_id = asset.id;
+    app.update(Message::MediaImported(Ok(asset)));
+    app.update(Message::StartDragFromSource(asset_id));
+    app.update(Message::DragEnteredTimeline);
+
+    // Simulate cursor at x=200, y=70 (past controls + ruler + into track 0)
+    app.update(Message::DragOverTimeline(iced::Point::new(200.0, 70.0)));
+
+    let drag = app.drag_state.as_ref().unwrap();
+    assert!(drag.timeline_track.is_some());
+    assert!(drag.timeline_position.is_some());
+    // At default zoom 100, x=200 → 2.0 seconds
+    let pos = drag.timeline_position.unwrap();
+    assert!((pos.as_secs_f64() - 2.0).abs() < 0.1);
+}
+
+#[test]
+fn test_drag_released_over_timeline_adds_clip() {
+    let mut app = App::new();
+    let asset = make_test_asset("clip1", 5.0);
+    let asset_id = asset.id;
+    app.update(Message::MediaImported(Ok(asset)));
+    app.update(Message::StartDragFromSource(asset_id));
+    app.update(Message::DragEnteredTimeline);
+    app.update(Message::DragOverTimeline(iced::Point::new(200.0, 70.0)));
+
+    app.update(Message::DragReleased);
+
+    assert!(app.drag_state.is_none());
+    assert_eq!(app.project.timeline.tracks[0].clips.len(), 1);
+    assert_eq!(app.status_message, "Clip added");
+}
+
+#[test]
+fn test_drag_released_off_timeline_no_clip() {
+    let mut app = App::new();
+    let asset = make_test_asset("clip1", 5.0);
+    let asset_id = asset.id;
+    app.update(Message::MediaImported(Ok(asset)));
+    app.update(Message::StartDragFromSource(asset_id));
+    // Don't enter timeline — just release
+    app.update(Message::DragReleased);
+
+    assert!(app.drag_state.is_none());
+    assert_eq!(app.project.timeline.tracks[0].clips.len(), 0);
+}
+
+#[test]
+fn test_escape_cancels_drag() {
+    let mut app = App::new();
+    let asset = make_test_asset("clip1", 5.0);
+    let asset_id = asset.id;
+    app.update(Message::MediaImported(Ok(asset)));
+    app.update(Message::StartDragFromSource(asset_id));
+    assert!(app.drag_state.is_some());
+
+    app.update(Message::KeyboardEvent(iced::keyboard::Event::KeyPressed {
+        key: iced::keyboard::Key::Named(iced::keyboard::key::Named::Escape),
+        modified_key: iced::keyboard::Key::Named(iced::keyboard::key::Named::Escape),
+        physical_key: iced::keyboard::key::Physical::Unidentified(
+            iced::keyboard::key::NativeCode::Unidentified,
+        ),
+        location: iced::keyboard::Location::Standard,
+        modifiers: iced::keyboard::Modifiers::empty(),
+        text: None,
+        repeat: false,
+    }));
+
+    assert!(app.drag_state.is_none());
+}
+
+#[test]
+fn test_drag_released_clears_state() {
+    let mut app = App::new();
+    let asset = make_test_asset("clip1", 5.0);
+    let asset_id = asset.id;
+    app.update(Message::MediaImported(Ok(asset)));
+    app.update(Message::StartDragFromSource(asset_id));
+    app.update(Message::DragEnteredTimeline);
+    app.update(Message::DragOverTimeline(iced::Point::new(100.0, 70.0)));
+    app.update(Message::DragReleased);
+
+    // After release, drag state is cleared
+    assert!(app.drag_state.is_none());
+}

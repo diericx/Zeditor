@@ -19,3 +19,16 @@ pub fn generate_thumbnail_at(path: &Path, timestamp_secs: f64) -> Result<VideoFr
         .decode_next_frame()?
         .ok_or_else(|| crate::error::MediaError::DecoderError("no frame at timestamp".into()))
 }
+
+/// Generate a thumbnail scaled to fit within max_width x max_height, in RGBA format.
+/// Ready for use with `iced::widget::image::Handle::from_rgba()`.
+pub fn generate_thumbnail_rgba_scaled(
+    path: &Path,
+    max_width: u32,
+    max_height: u32,
+) -> Result<VideoFrame> {
+    let mut decoder = FfmpegDecoder::open(path)?;
+    decoder
+        .decode_next_frame_rgba_scaled(max_width, max_height)?
+        .ok_or_else(|| crate::error::MediaError::DecoderError("no frames in video".into()))
+}
