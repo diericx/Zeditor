@@ -165,6 +165,66 @@ impl Track {
             .find(|c| c.timeline_range.contains(pos))
     }
 
+    /// Add a clip, trimming any existing overlapping clips to make room.
+    ///
+    /// - If an existing clip starts before the new clip → trim its end to the new clip's start
+    /// - If an existing clip is fully inside the new clip → remove it
+    /// - If an existing clip starts within the new clip but extends past → trim its start to the new clip's end
+    pub fn add_clip_trimming_overlaps(&mut self, new_clip: Clip) {
+        let new_start = new_clip.timeline_range.start;
+        let new_end = new_clip.timeline_range.end;
+
+        let mut to_remove = Vec::new();
+
+        for (i, existing) in self.clips.iter_mut().enumerate() {
+            if !existing.timeline_range.overlaps(&new_clip.timeline_range) {
+                continue;
+            }
+
+            let ex_start = existing.timeline_range.start;
+            let ex_end = existing.timeline_range.end;
+
+            if ex_start < new_start && ex_end > new_end {
+                // Existing clip spans the entire new clip — trim end to new_start
+                // (we don't split; just trim the left portion)
+                let trimmed_duration =
+                    new_start.as_duration() - ex_start.as_duration();
+                existing.timeline_range.end = new_start;
+                existing.source_range.end = TimelinePosition(
+                    existing.source_range.start.as_duration() + trimmed_duration,
+                );
+            } else if ex_start >= new_start && ex_end <= new_end {
+                // Fully covered — mark for removal
+                to_remove.push(i);
+            } else if ex_start < new_start {
+                // Existing starts before new clip, ends inside → trim end
+                let trimmed_duration =
+                    new_start.as_duration() - ex_start.as_duration();
+                existing.timeline_range.end = new_start;
+                existing.source_range.end = TimelinePosition(
+                    existing.source_range.start.as_duration() + trimmed_duration,
+                );
+            } else {
+                // Existing starts inside new clip, extends past → trim start
+                let cut_amount =
+                    new_end.as_duration() - ex_start.as_duration();
+                existing.timeline_range.start = new_end;
+                existing.source_range.start = TimelinePosition(
+                    existing.source_range.start.as_duration() + cut_amount,
+                );
+            }
+        }
+
+        // Remove fully covered clips (reverse order to preserve indices)
+        for i in to_remove.into_iter().rev() {
+            self.clips.remove(i);
+        }
+
+        self.clips.push(new_clip);
+        self.clips
+            .sort_by_key(|c| c.timeline_range.start.as_duration());
+    }
+
     /// Get the end position of the last clip on this track.
     pub fn end_position(&self) -> TimelinePosition {
         self.clips
@@ -204,6 +264,12 @@ impl Timeline {
     /// Add a clip to the specified track.
     pub fn add_clip(&mut self, track_index: usize, clip: Clip) -> Result<()> {
         self.track_mut(track_index)?.add_clip(clip)
+    }
+
+    /// Add a clip to the specified track, trimming overlapping clips to make room.
+    pub fn add_clip_trimming_overlaps(&mut self, track_index: usize, clip: Clip) -> Result<()> {
+        self.track_mut(track_index)?.add_clip_trimming_overlaps(clip);
+        Ok(())
     }
 
     /// Cut the clip at the given position, splitting it into two clips.

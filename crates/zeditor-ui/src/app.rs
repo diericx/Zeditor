@@ -55,6 +55,8 @@ pub struct App {
     pub(crate) decode_time_offset: f64,
     /// Frame received from decode thread but not yet displayed (PTS ahead of playback).
     pending_frame: Option<DecodedFrame>,
+    /// After a decode transition, discard frames that are too far ahead (stale from old context).
+    drain_stale: bool,
 }
 
 impl Default for App {
@@ -75,6 +77,7 @@ impl Default for App {
             decode_clip_id: None,
             decode_time_offset: 0.0,
             pending_frame: None,
+            drain_stale: false,
         }
     }
 }
@@ -199,7 +202,7 @@ impl App {
                     let result = self.project.command_history.execute(
                         &mut self.project.timeline,
                         "Add clip",
-                        |tl| tl.add_clip(track_index, clip),
+                        |tl| tl.add_clip_trimming_overlaps(track_index, clip),
                     );
                     match result {
                         Ok(()) => {
@@ -288,8 +291,12 @@ impl App {
                 Task::none()
             }
             Message::TimelineClickEmpty(pos) => {
+                if self.is_playing {
+                    self.is_playing = false;
+                    self.playback_start_wall = None;
+                }
                 self.playback_position = pos;
-                self.send_decode_seek(self.is_playing);
+                self.send_decode_seek(false); // scrub, not continuous
                 Task::none()
             }
             Message::PlaceSelectedClip {
@@ -307,7 +314,7 @@ impl App {
                     let result = self.project.command_history.execute(
                         &mut self.project.timeline,
                         "Place clip",
-                        |tl| tl.add_clip(track_index, clip),
+                        |tl| tl.add_clip_trimming_overlaps(track_index, clip),
                     );
                     match result {
                         Ok(()) => {
@@ -347,16 +354,6 @@ impl App {
                 if let Some(start_wall) = self.playback_start_wall {
                     let elapsed = start_wall.elapsed().as_secs_f64();
                     let new_pos = self.playback_start_pos.as_secs_f64() + elapsed;
-                    let timeline_dur = self.project.timeline.duration().as_secs_f64();
-                    if new_pos >= timeline_dur && timeline_dur > 0.0 {
-                        self.playback_position =
-                            TimelinePosition::from_secs_f64(timeline_dur);
-                        self.is_playing = false;
-                        self.playback_start_wall = None;
-                        self.send_decode_stop();
-                        self.poll_decoded_frame();
-                        return Task::none();
-                    }
                     self.playback_position = TimelinePosition::from_secs_f64(new_pos);
 
                     // Auto-scroll: keep playhead visible
@@ -373,6 +370,9 @@ impl App {
                         self.clip_at_position(self.playback_position).map(|(_, c)| c.id);
                     if current_clip_id != self.decode_clip_id {
                         self.send_decode_seek(true);
+                        // Mark stale so poll_decoded_frame discards any raced
+                        // frames from the old decode context (wrong time offset).
+                        self.drain_stale = true;
                     }
                 }
 
@@ -626,6 +626,9 @@ impl App {
             }
         }
         self.decode_clip_id = None;
+        self.current_frame = None;
+        self.pending_frame = None;
+        self.send_decode_stop();
     }
 
     /// Tell the decode thread to stop decoding.
@@ -638,6 +641,18 @@ impl App {
     /// Display decoded frames that are due according to the playback clock.
     /// Holds frames whose PTS is ahead of the current playback position.
     fn poll_decoded_frame(&mut self) {
+        // If no clip is being decoded, drain any stale frames from the channel
+        // and ensure the display is black. This prevents a race where the decode
+        // worker sends one last frame after send_decode_seek drained the channel.
+        if self.decode_clip_id.is_none() {
+            self.pending_frame = None;
+            self.current_frame = None;
+            if let Some(rx) = &self.decode_rx {
+                while rx.try_recv().is_ok() {}
+            }
+            return;
+        }
+
         let playback_secs = self.playback_position.as_secs_f64();
 
         loop {
@@ -662,7 +677,13 @@ impl App {
                 self.current_frame = Some(iced::widget::image::Handle::from_rgba(
                     frame.width, frame.height, frame.rgba,
                 ));
+                self.drain_stale = false;
                 // Loop to check if there's an even more recent frame also due
+            } else if self.drain_stale {
+                // After a decode transition, frames that are too far ahead are
+                // stale leftovers from the old context (wrong time offset).
+                // Discard them and try the next frame from the channel.
+                continue;
             } else {
                 // Frame is ahead of playback — hold it for a future tick
                 self.pending_frame = Some(frame);

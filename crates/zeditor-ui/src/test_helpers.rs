@@ -48,4 +48,9 @@ impl App {
     pub fn set_decode_clip_id(&mut self, clip_id: Option<Uuid>) {
         self.decode_clip_id = clip_id;
     }
+
+    /// Get the clip ID currently being decoded.
+    pub fn decode_clip_id(&self) -> Option<Uuid> {
+        self.decode_clip_id
+    }
 }

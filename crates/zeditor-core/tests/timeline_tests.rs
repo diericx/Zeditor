@@ -258,6 +258,83 @@ fn test_time_range_contains() {
 }
 
 #[test]
+fn test_add_clip_trims_left_overlap() {
+    let mut timeline = Timeline::new();
+    timeline.add_track("Video 1");
+
+    let asset_id = Uuid::new_v4();
+    // Existing clip [0, 10)
+    timeline
+        .add_clip(0, make_clip(asset_id, 0.0, 10.0))
+        .unwrap();
+
+    // New clip [5, 15) — should trim existing to [0, 5)
+    timeline
+        .add_clip_trimming_overlaps(0, make_clip(asset_id, 5.0, 10.0))
+        .unwrap();
+
+    assert_eq!(timeline.tracks[0].clips.len(), 2);
+    let first = &timeline.tracks[0].clips[0];
+    assert_eq!(first.timeline_range.start, TimelinePosition::from_secs_f64(0.0));
+    assert_eq!(first.timeline_range.end, TimelinePosition::from_secs_f64(5.0));
+    // Source range should also be trimmed to 5s duration
+    let src_dur = first.source_range.end.as_secs_f64() - first.source_range.start.as_secs_f64();
+    assert!((src_dur - 5.0).abs() < 0.001);
+}
+
+#[test]
+fn test_add_clip_removes_fully_covered() {
+    let mut timeline = Timeline::new();
+    timeline.add_track("Video 1");
+
+    let asset_id = Uuid::new_v4();
+    // Existing clip [3, 7)
+    timeline
+        .add_clip(0, make_clip(asset_id, 3.0, 4.0))
+        .unwrap();
+
+    // New clip [0, 10) — fully covers existing, should remove it
+    timeline
+        .add_clip_trimming_overlaps(0, make_clip(asset_id, 0.0, 10.0))
+        .unwrap();
+
+    assert_eq!(timeline.tracks[0].clips.len(), 1);
+    let clip = &timeline.tracks[0].clips[0];
+    assert_eq!(clip.timeline_range.start, TimelinePosition::from_secs_f64(0.0));
+    assert_eq!(clip.timeline_range.end, TimelinePosition::from_secs_f64(10.0));
+}
+
+#[test]
+fn test_add_clip_trims_right_overlap() {
+    let mut timeline = Timeline::new();
+    timeline.add_track("Video 1");
+
+    let asset_id = Uuid::new_v4();
+    // Existing clip [5, 15)
+    timeline
+        .add_clip(0, make_clip(asset_id, 5.0, 10.0))
+        .unwrap();
+
+    // New clip [0, 8) — should trim existing to [8, 15)
+    timeline
+        .add_clip_trimming_overlaps(0, make_clip(asset_id, 0.0, 8.0))
+        .unwrap();
+
+    assert_eq!(timeline.tracks[0].clips.len(), 2);
+    // Clips should be sorted: [0,8) then [8,15)
+    let first = &timeline.tracks[0].clips[0];
+    assert_eq!(first.timeline_range.start, TimelinePosition::from_secs_f64(0.0));
+    assert_eq!(first.timeline_range.end, TimelinePosition::from_secs_f64(8.0));
+
+    let second = &timeline.tracks[0].clips[1];
+    assert_eq!(second.timeline_range.start, TimelinePosition::from_secs_f64(8.0));
+    assert_eq!(second.timeline_range.end, TimelinePosition::from_secs_f64(15.0));
+    // Source range start should be trimmed by 3s (8-5)
+    let src_start = second.source_range.start.as_secs_f64();
+    assert!((src_start - 3.0).abs() < 0.001);
+}
+
+#[test]
 fn test_time_range_overlaps() {
     let a = TimeRange::new(
         TimelinePosition::from_secs_f64(0.0),

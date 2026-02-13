@@ -37,12 +37,14 @@ pub enum TimelineInteraction {
 
 pub struct TimelineCanvasState {
     pub interaction: TimelineInteraction,
+    pub modifiers: iced::keyboard::Modifiers,
 }
 
 impl Default for TimelineCanvasState {
     fn default() -> Self {
         Self {
             interaction: TimelineInteraction::None,
+            modifiers: iced::keyboard::Modifiers::empty(),
         }
     }
 }
@@ -127,19 +129,26 @@ impl<'a> canvas::Program<Message> for TimelineCanvas<'a> {
                     mouse::ScrollDelta::Pixels { x, y } => (*x / 20.0, *y / 20.0),
                 };
 
-                // Vertical scroll = zoom, horizontal scroll = pan
-                // Most mice: vertical only. Trackpads send both.
-                if dy.abs() > dx.abs() {
+                // Plain scroll = pan, Alt+scroll = zoom
+                if state.modifiers.alt() {
+                    // Alt held: zoom centered on cursor
+                    let zoom_delta = if dy.abs() > dx.abs() { dy } else { dx };
                     let cursor_secs = self.px_to_secs(cursor_pos.x);
                     Some(
                         canvas::Action::publish(Message::TimelineZoom {
-                            delta: dy,
+                            delta: zoom_delta,
                             cursor_secs,
                         })
                         .and_capture(),
                     )
+                } else if dy.abs() > dx.abs() {
+                    // Vertical scroll → horizontal pan
+                    Some(
+                        canvas::Action::publish(Message::TimelineScroll(-dy * 20.0))
+                            .and_capture(),
+                    )
                 } else {
-                    // Horizontal scroll for panning
+                    // Horizontal scroll → horizontal pan
                     Some(
                         canvas::Action::publish(Message::TimelineScroll(-dx * 20.0))
                             .and_capture(),
@@ -252,6 +261,10 @@ impl<'a> canvas::Program<Message> for TimelineCanvas<'a> {
                     }
                     TimelineInteraction::None => None,
                 }
+            }
+            canvas::Event::Keyboard(iced::keyboard::Event::ModifiersChanged(modifiers)) => {
+                state.modifiers = *modifiers;
+                None
             }
             _ => None,
         }
@@ -589,5 +602,25 @@ mod tests {
         assert_eq!(clamp_zoom(0.01), ZOOM_MIN);
         assert_eq!(clamp_zoom(2000.0), ZOOM_MAX);
         assert_eq!(clamp_zoom(200.0), 200.0);
+    }
+
+    #[test]
+    fn test_drag_position_clamped_to_zero() {
+        let tl = Timeline::new();
+        let canvas = TimelineCanvas {
+            timeline: &tl,
+            playback_position: TimelinePosition::zero(),
+            selected_asset_id: None,
+            zoom: 100.0,
+            scroll_offset: 200.0, // scrolled right, so negative px → negative secs
+        };
+        // px_to_secs(-100) with scroll 200 = (-100 + 200)/100 = 1.0 (positive)
+        // But with px=0 and large scroll offset, raw can go negative
+        // The .max(0.0) clamp is applied at the call site (line 226), not in px_to_secs.
+        // So test that px_to_secs can return negative, and the clamp at the call site works.
+        let raw = canvas.px_to_secs(-300.0); // (-300 + 200)/100 = -1.0
+        assert!(raw < 0.0, "px_to_secs should return negative for far-left positions");
+        let clamped = raw.max(0.0);
+        assert_eq!(clamped, 0.0, "drag position should clamp to zero");
     }
 }

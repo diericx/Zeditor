@@ -252,7 +252,7 @@ fn test_playback_tick_advances_position() {
 }
 
 #[test]
-fn test_playback_stops_at_end() {
+fn test_playback_continues_past_end() {
     let mut app = App::new();
 
     let asset = make_test_asset("clip1", 1.0);
@@ -271,7 +271,9 @@ fn test_playback_stops_at_end() {
     app.playback_start_wall = Some(start - Duration::from_secs(5));
 
     app.update(Message::PlaybackTick);
-    assert!(!app.is_playing);
+    // Playback should continue past the end — user stops manually
+    assert!(app.is_playing);
+    assert!(app.playback_position.as_secs_f64() > 1.0);
 }
 
 #[test]
@@ -434,6 +436,80 @@ fn test_move_clip_with_snap() {
     assert!(
         (start - 5.0).abs() < 0.01,
         "Expected snap to 5.0s, got {start}"
+    );
+}
+
+#[test]
+fn test_click_during_playback_pauses_and_moves_cursor() {
+    let mut app = App::new();
+
+    // Add content so playback doesn't immediately stop
+    let asset = make_test_asset("clip1", 30.0);
+    let asset_id = asset.id;
+    app.update(Message::MediaImported(Ok(asset)));
+    app.update(Message::AddClipToTimeline {
+        asset_id,
+        track_index: 0,
+        position: TimelinePosition::zero(),
+    });
+
+    // Start playing
+    app.update(Message::Play);
+    assert!(app.is_playing);
+    assert!(app.playback_start_wall.is_some());
+
+    // Click timeline at 15s while playing
+    app.update(Message::TimelineClickEmpty(
+        TimelinePosition::from_secs_f64(15.0),
+    ));
+
+    // Should be paused at 15s
+    assert!(!app.is_playing, "clicking timeline during playback should pause");
+    assert!(
+        app.playback_start_wall.is_none(),
+        "playback_start_wall should be cleared on pause"
+    );
+    assert_eq!(
+        app.playback_position,
+        TimelinePosition::from_secs_f64(15.0),
+        "cursor should move to clicked position"
+    );
+}
+
+#[test]
+fn test_place_overlapping_clip_trims_previous() {
+    let mut app = App::new();
+
+    let asset = make_test_asset("clip1", 5.0);
+    let asset_id = asset.id;
+    app.update(Message::MediaImported(Ok(asset)));
+
+    // Add first clip at 0s (5s long → [0, 5))
+    app.update(Message::AddClipToTimeline {
+        asset_id,
+        track_index: 0,
+        position: TimelinePosition::zero(),
+    });
+    assert_eq!(app.project.timeline.tracks[0].clips.len(), 1);
+
+    // Place second clip at 3s — overlaps [3, 8), should trim first to [0, 3)
+    app.update(Message::PlaceSelectedClip {
+        asset_id,
+        track_index: 0,
+        position: TimelinePosition::from_secs_f64(3.0),
+    });
+
+    assert_eq!(app.project.timeline.tracks[0].clips.len(), 2);
+    let first = &app.project.timeline.tracks[0].clips[0];
+    assert_eq!(first.timeline_range.start, TimelinePosition::zero());
+    assert_eq!(
+        first.timeline_range.end,
+        TimelinePosition::from_secs_f64(3.0)
+    );
+    let second = &app.project.timeline.tracks[0].clips[1];
+    assert_eq!(
+        second.timeline_range.start,
+        TimelinePosition::from_secs_f64(3.0)
     );
 }
 

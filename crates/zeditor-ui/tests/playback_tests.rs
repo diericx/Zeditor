@@ -301,3 +301,303 @@ fn test_e2e_decode_and_playback_sequence() {
         "test video should be longer than 1s (got {duration})"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Playback past end and clip transition tests
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_playback_past_last_clip_continues_with_black() {
+    let (mut app, _sender) = App::new_with_test_channel();
+
+    let asset = make_test_asset("clip1", 5.0);
+    let asset_id = asset.id;
+    app.update(Message::MediaImported(Ok(asset)));
+    app.update(Message::AddClipToTimeline {
+        asset_id,
+        track_index: 0,
+        position: TimelinePosition::from_secs_f64(0.0),
+    });
+
+    let clip_id = app.project.timeline.tracks[0].clips[0].id;
+    app.set_decode_clip_id(Some(clip_id));
+    app.set_decode_time_offset(0.0);
+
+    // Start playing and advance to 7s (past the 5s clip)
+    app.update(Message::Play);
+    let start = app.playback_start_wall.unwrap();
+    app.playback_start_wall = Some(start - Duration::from_secs(7));
+
+    app.update(Message::PlaybackTick);
+
+    // Should still be playing
+    assert!(app.is_playing, "playback should continue past last clip");
+    assert!(
+        app.playback_position.as_secs_f64() > 5.0,
+        "position should be past the clip end"
+    );
+    // No clip at position 7s → frame should be cleared (black)
+    assert!(
+        app.current_frame.is_none(),
+        "should show black (no frame) past last clip"
+    );
+}
+
+#[test]
+fn test_playback_transitions_between_adjacent_clips() {
+    let (mut app, _sender) = App::new_with_test_channel();
+
+    let asset1 = make_test_asset("clip_a", 5.0);
+    let asset1_id = asset1.id;
+    app.update(Message::MediaImported(Ok(asset1)));
+    app.update(Message::AddClipToTimeline {
+        asset_id: asset1_id,
+        track_index: 0,
+        position: TimelinePosition::from_secs_f64(0.0),
+    });
+
+    let asset2 = make_test_asset("clip_b", 5.0);
+    let asset2_id = asset2.id;
+    app.update(Message::MediaImported(Ok(asset2)));
+    app.update(Message::AddClipToTimeline {
+        asset_id: asset2_id,
+        track_index: 0,
+        position: TimelinePosition::from_secs_f64(5.0),
+    });
+
+    let clip1_id = app.project.timeline.tracks[0].clips[0].id;
+    let clip2_id = app.project.timeline.tracks[0].clips[1].id;
+
+    // Start playing inside clip1
+    app.set_decode_clip_id(Some(clip1_id));
+    app.set_decode_time_offset(0.0);
+    app.update(Message::Play);
+    let start = app.playback_start_wall.unwrap();
+
+    // Advance to 5.5s — should be inside clip2
+    app.playback_start_wall = Some(start - Duration::from_millis(5500));
+    app.update(Message::PlaybackTick);
+
+    assert_eq!(
+        app.decode_clip_id(),
+        Some(clip2_id),
+        "decode should switch to clip2 after crossing 5s boundary"
+    );
+    assert!(app.is_playing, "playback should continue into clip2");
+}
+
+#[test]
+fn test_adjacent_clip_transition_discards_stale_pending() {
+    // Reproduces: clip1 [0,5), clip2 [5,10). At transition, a stale clip1 frame
+    // races into the channel. With clip2's offset it maps to timeline 10.0 and
+    // would be stored as pending, blocking clip2's real frames forever.
+    let (mut app, sender) = App::new_with_test_channel();
+
+    let asset1 = make_test_asset("clip_a", 5.0);
+    let asset1_id = asset1.id;
+    app.update(Message::MediaImported(Ok(asset1)));
+    app.update(Message::AddClipToTimeline {
+        asset_id: asset1_id,
+        track_index: 0,
+        position: TimelinePosition::from_secs_f64(0.0),
+    });
+
+    let asset2 = make_test_asset("clip_b", 5.0);
+    let asset2_id = asset2.id;
+    app.update(Message::MediaImported(Ok(asset2)));
+    app.update(Message::AddClipToTimeline {
+        asset_id: asset2_id,
+        track_index: 0,
+        position: TimelinePosition::from_secs_f64(5.0),
+    });
+
+    let clip1_id = app.project.timeline.tracks[0].clips[0].id;
+
+    // Playing inside clip1
+    app.set_decode_clip_id(Some(clip1_id));
+    app.set_decode_time_offset(0.0);
+    app.update(Message::Play);
+    let start = app.playback_start_wall.unwrap();
+
+    // Advance to 5.5s — crosses into clip2
+    app.playback_start_wall = Some(start - Duration::from_millis(5500));
+
+    // Inject a stale clip1 frame that will race into the channel.
+    // With clip2's offset (5.0), PTS 4.9 → timeline 9.9, way ahead of 5.5s.
+    sender.send_frame(solid_frame(4.9, 255, 0, 0));
+
+    // Transition tick: should detect clip2, discard stale frame
+    app.update(Message::PlaybackTick);
+
+    // Now inject clip2's first real frame (PTS 0.5, offset 5.0 → timeline 5.5)
+    sender.send_frame(solid_frame(0.5, 0, 255, 0));
+
+    // Next tick: should display clip2's frame, not be blocked by stale pending
+    app.update(Message::PlaybackTick);
+
+    assert!(
+        app.current_frame.is_some(),
+        "clip2's frame should be displayed, not blocked by stale pending"
+    );
+}
+
+#[test]
+fn test_stale_frame_after_clip_end_is_discarded() {
+    // Reproduces race: decode worker sends a frame after transition clears state.
+    let (mut app, sender) = App::new_with_test_channel();
+
+    let asset = make_test_asset("clip1", 5.0);
+    let asset_id = asset.id;
+    app.update(Message::MediaImported(Ok(asset)));
+    app.update(Message::AddClipToTimeline {
+        asset_id,
+        track_index: 0,
+        position: TimelinePosition::from_secs_f64(0.0),
+    });
+
+    let clip_id = app.project.timeline.tracks[0].clips[0].id;
+    app.set_decode_clip_id(Some(clip_id));
+    app.set_decode_time_offset(0.0);
+
+    // Start playing and advance past the clip
+    app.update(Message::Play);
+    let start = app.playback_start_wall.unwrap();
+    app.playback_start_wall = Some(start - Duration::from_secs(7));
+
+    // Inject a stale frame BEFORE the tick — simulates the decode worker
+    // having queued a frame that arrives after the transition logic runs
+    sender.send_frame(solid_frame(4.9, 255, 0, 0));
+
+    // First tick: transition fires, clears state, but poll_decoded_frame
+    // must not re-display the stale frame
+    app.update(Message::PlaybackTick);
+    assert!(
+        app.current_frame.is_none(),
+        "stale frame should be discarded after clip transition to gap"
+    );
+
+    // Inject another stale frame and tick again — should still be black
+    sender.send_frame(solid_frame(5.1, 0, 255, 0));
+    app.update(Message::PlaybackTick);
+    assert!(
+        app.current_frame.is_none(),
+        "subsequent stale frames should also be discarded"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Bug fix tests: black frame on gaps, clip transitions
+// ---------------------------------------------------------------------------
+
+/// Helper: set up an app with two clips and a gap between them.
+/// Clip1: [clip1_start .. clip1_start+dur1], Clip2: [clip2_start .. clip2_start+dur2]
+fn setup_two_clips(
+    clip1_start: f64,
+    dur1: f64,
+    clip2_start: f64,
+    dur2: f64,
+) -> (App, TestFrameSender) {
+    let (mut app, sender) = App::new_with_test_channel();
+
+    let asset1 = make_test_asset("clip_a", dur1);
+    let asset1_id = asset1.id;
+    app.update(Message::MediaImported(Ok(asset1)));
+    app.update(Message::AddClipToTimeline {
+        asset_id: asset1_id,
+        track_index: 0,
+        position: TimelinePosition::from_secs_f64(clip1_start),
+    });
+
+    let asset2 = make_test_asset("clip_b", dur2);
+    let asset2_id = asset2.id;
+    app.update(Message::MediaImported(Ok(asset2)));
+    app.update(Message::AddClipToTimeline {
+        asset_id: asset2_id,
+        track_index: 0,
+        position: TimelinePosition::from_secs_f64(clip2_start),
+    });
+
+    (app, sender)
+}
+
+#[test]
+fn test_play_before_first_clip_shows_no_frame() {
+    let (mut app, _sender) = App::new_with_test_channel();
+
+    // Place clip starting at 30s
+    let asset = make_test_asset("late_clip", 5.0);
+    let asset_id = asset.id;
+    app.update(Message::MediaImported(Ok(asset)));
+    app.update(Message::AddClipToTimeline {
+        asset_id,
+        track_index: 0,
+        position: TimelinePosition::from_secs_f64(30.0),
+    });
+
+    // Set a stale frame to prove it gets cleared
+    app.set_decode_clip_id(None);
+    // Manually set a current_frame to simulate stale state
+    // (In real usage this would be leftover from a previous clip)
+
+    // Play at position 0 — no clip here
+    app.update(Message::Play);
+
+    assert!(
+        app.current_frame.is_none(),
+        "should show black (no frame) when playing before first clip"
+    );
+}
+
+#[test]
+fn test_playback_continues_through_gap_showing_black() {
+    // Clip1: 0-5s, gap: 5-10s, Clip2: 10-15s
+    let (mut app, _sender) = setup_two_clips(0.0, 5.0, 10.0, 5.0);
+
+    let clip1_id = app.project.timeline.tracks[0].clips[0].id;
+
+    // Start playing and advance to 3s (inside clip1)
+    app.set_decode_clip_id(Some(clip1_id));
+    app.set_decode_time_offset(0.0);
+    app.update(Message::Play);
+    let start = app.playback_start_wall.unwrap();
+    // Advance to 6s — inside the gap
+    app.playback_start_wall = Some(start - Duration::from_secs(6));
+
+    app.update(Message::PlaybackTick);
+
+    // Should still be playing
+    assert!(app.is_playing, "playback should continue through gap");
+    // current_frame should be None (black) because no clip at 6s
+    assert!(
+        app.current_frame.is_none(),
+        "should show black (no frame) during gap between clips"
+    );
+}
+
+#[test]
+fn test_clip_transition_triggers_new_decode() {
+    // Clip1: 0-5s, Clip2: 5-10s (adjacent, no gap)
+    let (mut app, _sender) = setup_two_clips(0.0, 5.0, 5.0, 5.0);
+
+    let clip1_id = app.project.timeline.tracks[0].clips[0].id;
+    let clip2_id = app.project.timeline.tracks[0].clips[1].id;
+
+    // Start playing inside clip1
+    app.set_decode_clip_id(Some(clip1_id));
+    app.set_decode_time_offset(0.0);
+    app.update(Message::Play);
+    let start = app.playback_start_wall.unwrap();
+
+    // Advance past clip1 boundary into clip2 (at 5.5s)
+    app.playback_start_wall = Some(start - Duration::from_millis(5500));
+
+    app.update(Message::PlaybackTick);
+
+    // decode_clip_id should have switched to clip2
+    assert_eq!(
+        app.decode_clip_id(),
+        Some(clip2_id),
+        "decode should switch to clip2 after crossing boundary"
+    );
+    assert!(app.is_playing, "playback should continue into next clip");
+}
