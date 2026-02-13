@@ -1152,18 +1152,21 @@ impl App {
             DragPayload::SourceAsset { thumbnail, name, .. } => (thumbnail.clone(), name.as_str()),
         };
 
+        let ghost_alpha = 0.3;
+
         let thumb_content: Element<'_, Message> = if let Some(handle) = thumbnail {
             image(handle)
                 .width(120)
                 .height(68)
                 .content_fit(iced::ContentFit::Cover)
+                .opacity(ghost_alpha)
                 .into()
         } else {
-            container(center(text("...").size(14).color(Color::from_rgb(0.5, 0.5, 0.5))))
+            container(center(text("...").size(14).color(Color { r: 0.5, g: 0.5, b: 0.5, a: ghost_alpha })))
                 .width(120)
                 .height(68)
-                .style(|_theme| container::Style {
-                    background: Some(Background::Color(Color::from_rgb(0.2, 0.2, 0.22))),
+                .style(move |_theme| container::Style {
+                    background: Some(Background::Color(Color { r: 0.2, g: 0.2, b: 0.22, a: ghost_alpha })),
                     ..Default::default()
                 })
                 .into()
@@ -1171,7 +1174,7 @@ impl App {
 
         let name_label = text(name)
             .size(11)
-            .color(Color::WHITE)
+            .color(Color { r: 1.0, g: 1.0, b: 1.0, a: ghost_alpha })
             .width(120)
             .center();
 
@@ -1180,15 +1183,15 @@ impl App {
         )
         .padding(4)
         .width(130)
-        .style(|_theme| container::Style {
+        .style(move |_theme| container::Style {
             background: Some(Background::Color(Color {
                 r: 0.18,
                 g: 0.18,
                 b: 0.20,
-                a: 0.7,
+                a: ghost_alpha,
             })),
             border: Border {
-                color: Color::from_rgb(0.3, 0.5, 0.9),
+                color: Color { r: 0.3, g: 0.5, b: 0.9, a: ghost_alpha },
                 width: 2.0,
                 radius: 6.0.into(),
             },
