@@ -1474,3 +1474,51 @@ fn test_save_then_save_again_no_dialog() {
     // Should NOT say "Opening save dialog..."
     assert!(!app.status_message.contains("dialog"));
 }
+
+// ===== Brief 10: Render tests =====
+
+#[test]
+fn test_render_complete_sets_status() {
+    let mut app = App::new();
+    app.update(Message::RenderComplete(PathBuf::from("/tmp/output.mkv")));
+    assert!(
+        app.status_message.contains("Rendered"),
+        "status: {}",
+        app.status_message
+    );
+    assert!(
+        app.status_message.contains("/tmp/output.mkv"),
+        "status: {}",
+        app.status_message
+    );
+}
+
+#[test]
+fn test_render_error_sets_status() {
+    let mut app = App::new();
+    app.update(Message::RenderError("encoder failed".into()));
+    assert!(
+        app.status_message.contains("Render failed"),
+        "status: {}",
+        app.status_message
+    );
+    assert!(
+        app.status_message.contains("encoder failed"),
+        "status: {}",
+        app.status_message
+    );
+}
+
+#[test]
+fn test_render_dialog_none_cancels() {
+    let mut app = App::new();
+    app.update(Message::RenderFileDialogResult(None));
+    assert_eq!(app.status_message, "Render cancelled");
+}
+
+#[test]
+fn test_menu_render_dispatches() {
+    let mut app = App::new();
+    app.update(Message::MenuAction(MenuAction::Render));
+    assert_eq!(app.status_message, "Opening render dialog...");
+}

@@ -873,6 +873,51 @@ impl App {
                 self.status_message = "New project created".into();
                 Task::none()
             }
+            Message::RenderFileDialogResult(path) => {
+                match path {
+                    Some(mut path) => {
+                        // Ensure .mkv extension
+                        if path.extension().is_none_or(|e| e != "mkv") {
+                            path.set_extension("mkv");
+                        }
+                        self.status_message = "Rendering...".into();
+                        let timeline = self.project.timeline.clone();
+                        let source_library = self.project.source_library.clone();
+                        let config = zeditor_media::renderer::derive_render_config(
+                            &timeline,
+                            &source_library,
+                            path,
+                        );
+                        Task::perform(
+                            async move {
+                                zeditor_media::renderer::render_timeline(
+                                    &timeline,
+                                    &source_library,
+                                    &config,
+                                )
+                                .map(|()| config.output_path.clone())
+                                .map_err(|e| format!("{e}"))
+                            },
+                            |result| match result {
+                                Ok(path) => Message::RenderComplete(path),
+                                Err(e) => Message::RenderError(e),
+                            },
+                        )
+                    }
+                    None => {
+                        self.status_message = "Render cancelled".into();
+                        Task::none()
+                    }
+                }
+            }
+            Message::RenderComplete(path) => {
+                self.status_message = format!("Rendered to {}", path.display());
+                Task::none()
+            }
+            Message::RenderError(msg) => {
+                self.status_message = format!("Render failed: {msg}");
+                Task::none()
+            }
             Message::MenuButtonClicked(id) => {
                 if self.open_menu == Some(id) {
                     self.open_menu = None;
@@ -913,6 +958,20 @@ impl App {
                         )
                     }
                     MenuAction::Save => self.update(Message::SaveProject),
+                    MenuAction::Render => {
+                        self.status_message = "Opening render dialog...".into();
+                        Task::perform(
+                            async {
+                                let handle = rfd::AsyncFileDialog::new()
+                                    .add_filter("MKV Video", &["mkv"])
+                                    .set_title("Render Output")
+                                    .save_file()
+                                    .await;
+                                handle.map(|f| f.path().to_path_buf())
+                            },
+                            Message::RenderFileDialogResult,
+                        )
+                    }
                 }
             }
             Message::Exit => iced::exit(),
@@ -1239,6 +1298,7 @@ impl App {
                 self.menu_item("New Project", MenuAction::NewProject),
                 self.menu_item("Load Project", MenuAction::LoadProject),
                 self.menu_item("Save", MenuAction::Save),
+                self.menu_item("Render", MenuAction::Render),
                 self.menu_item("Exit", MenuAction::Exit),
             ],
             MenuId::Edit => vec![

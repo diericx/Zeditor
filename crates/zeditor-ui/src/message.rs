@@ -21,6 +21,7 @@ pub enum MenuAction {
     NewProject,
     LoadProject,
     Save,
+    Render,
     Exit,
     Undo,
     Redo,
@@ -133,6 +134,11 @@ pub enum Message {
     SaveFileDialogResult(Option<PathBuf>),
     LoadFileDialogResult(Option<PathBuf>),
     NewProject,
+
+    // Render
+    RenderFileDialogResult(Option<PathBuf>),
+    RenderComplete(PathBuf),
+    RenderError(String),
 
     // Menu
     MenuButtonClicked(MenuId),

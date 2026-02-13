@@ -432,3 +432,17 @@ fn test_window_title_updates_after_name_change() {
     app.project.name = "Custom Project".into();
     assert_eq!(app.title(), "Custom Project - Zeditor");
 }
+
+// ===== Brief 10: Render simulator tests =====
+
+#[test]
+fn test_file_menu_shows_render() {
+    let mut app = App::new();
+    app.open_menu = Some(MenuId::File);
+
+    let mut ui = simulator(app.view());
+    assert!(
+        ui.find("Render").is_ok(),
+        "File menu should show 'Render'"
+    );
+}
