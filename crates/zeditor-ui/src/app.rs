@@ -2,15 +2,15 @@ use std::path::PathBuf;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
-use iced::widget::{button, center, column, container, row, scrollable, text};
-use iced::{keyboard, time, Element, Length, Subscription, Task};
+use iced::widget::{button, center, column, container, mouse_area, opaque, row, scrollable, stack, text};
+use iced::{keyboard, time, Background, Border, Color, Element, Length, Subscription, Task};
 use uuid::Uuid;
 
 use zeditor_core::project::Project;
 use zeditor_core::timeline::{Clip, TimeRange, TimelinePosition, TrackType};
 
 use crate::audio_player::AudioPlayer;
-use crate::message::{Message, ToolMode};
+use crate::message::{MenuAction, MenuId, Message, ToolMode};
 use crate::widgets::timeline_canvas::TimelineCanvas;
 
 /// Preview resolution cap. 4K frames are scaled down to this for display.
@@ -68,6 +68,7 @@ pub struct App {
     pub timeline_zoom: f32,
     pub timeline_scroll: f32,
     pub tool_mode: ToolMode,
+    pub open_menu: Option<MenuId>,
     decode_tx: Option<mpsc::Sender<DecodeRequest>>,
     pub(crate) decode_rx: Option<mpsc::Receiver<DecodedFrame>>,
     pub(crate) decode_clip_id: Option<Uuid>,
@@ -99,6 +100,7 @@ impl Default for App {
             timeline_zoom: 100.0,
             timeline_scroll: 0.0,
             tool_mode: ToolMode::default(),
+            open_menu: None,
             decode_tx: None,
             decode_rx: None,
             decode_clip_id: None,
@@ -532,6 +534,13 @@ impl App {
             }
             Message::KeyboardEvent(event) => {
                 if let keyboard::Event::KeyPressed { key, .. } = event {
+                    // When a menu is open, Escape closes it and all other keys are swallowed
+                    if self.open_menu.is_some() {
+                        if matches!(key.as_ref(), keyboard::Key::Named(keyboard::key::Named::Escape)) {
+                            self.open_menu = None;
+                        }
+                        return Task::none();
+                    }
                     match key.as_ref() {
                         keyboard::Key::Named(keyboard::key::Named::Space) => {
                             return self.update(Message::TogglePlayback);
@@ -578,10 +587,48 @@ impl App {
                 Task::none()
             }
             Message::SaveProject | Message::LoadProject(_) => Task::none(),
+            Message::MenuButtonClicked(id) => {
+                if self.open_menu == Some(id) {
+                    self.open_menu = None;
+                } else {
+                    self.open_menu = Some(id);
+                }
+                Task::none()
+            }
+            Message::MenuButtonHovered(id) => {
+                if self.open_menu.is_some() {
+                    self.open_menu = Some(id);
+                }
+                Task::none()
+            }
+            Message::CloseMenu => {
+                self.open_menu = None;
+                Task::none()
+            }
+            Message::MenuAction(action) => {
+                self.open_menu = None;
+                match action {
+                    MenuAction::Undo => return self.update(Message::Undo),
+                    MenuAction::Redo => return self.update(Message::Redo),
+                    MenuAction::Exit => return self.update(Message::Exit),
+                    MenuAction::NewProject => {
+                        self.status_message = "New Project: not yet implemented".into();
+                    }
+                    MenuAction::LoadProject => {
+                        self.status_message = "Load Project: not yet implemented".into();
+                    }
+                    MenuAction::Save => {
+                        self.status_message = "Save: not yet implemented".into();
+                    }
+                }
+                Task::none()
+            }
+            Message::Exit => iced::exit(),
         }
     }
 
     pub fn view(&self) -> Element<'_, Message> {
+        let menu_bar = self.view_menu_bar();
         let source_panel = self.view_source_library();
         let video_viewport = self.view_video_viewport();
         let timeline_panel = self.view_timeline();
@@ -606,11 +653,33 @@ impl App {
 
         let top_row = row![source_panel, video_viewport].spacing(4);
 
-        let content = column![top_row, timeline_panel, status]
-            .spacing(4)
-            .padding(4);
+        if self.open_menu.is_some() {
+            let click_off: Element<'_, Message> = mouse_area(
+                container("")
+                    .width(Length::Fill)
+                    .height(Length::Fill),
+            )
+            .on_press(Message::CloseMenu)
+            .into();
 
-        container(content).into()
+            let dropdown = self.view_dropdown();
+
+            let content_below = column![top_row, timeline_panel, status].spacing(4);
+
+            let stacked_content = stack![content_below, click_off, opaque(dropdown)]
+                .width(Length::Fill)
+                .height(Length::Fill);
+
+            column![menu_bar, stacked_content]
+                .spacing(4)
+                .padding(4)
+                .into()
+        } else {
+            column![menu_bar, top_row, timeline_panel, status]
+                .spacing(4)
+                .padding(4)
+                .into()
+        }
     }
 
     fn view_source_library(&self) -> Element<'_, Message> {
@@ -719,6 +788,127 @@ impl App {
         .height(200);
 
         column![controls, canvas].spacing(4).into()
+    }
+
+    fn view_menu_bar(&self) -> Element<'_, Message> {
+        let file_btn = self.menu_bar_button("File", MenuId::File);
+        let edit_btn = self.menu_bar_button("Edit", MenuId::Edit);
+
+        container(
+            row![file_btn, edit_btn].spacing(2).padding([2, 4]),
+        )
+        .width(Length::Fill)
+        .style(|_theme| container::Style {
+            background: Some(Background::Color(Color::from_rgb(0.20, 0.20, 0.22))),
+            border: Border {
+                color: Color::from_rgb(0.15, 0.15, 0.17),
+                width: 1.0,
+                radius: 0.0.into(),
+            },
+            ..Default::default()
+        })
+        .into()
+    }
+
+    fn menu_bar_button<'a>(&self, label: &'a str, menu_id: MenuId) -> Element<'a, Message> {
+        let is_active = self.open_menu == Some(menu_id);
+
+        let btn = button(text(label).size(14).color(Color::WHITE))
+            .on_press(Message::MenuButtonClicked(menu_id))
+            .padding([4, 10])
+            .style(move |_theme, status| {
+                let bg = if is_active {
+                    Color::from_rgb(0.35, 0.35, 0.38)
+                } else if matches!(status, button::Status::Hovered) {
+                    Color::from_rgb(0.30, 0.30, 0.33)
+                } else {
+                    Color::TRANSPARENT
+                };
+                button::Style {
+                    background: Some(Background::Color(bg)),
+                    text_color: Color::WHITE,
+                    border: Border {
+                        radius: 4.0.into(),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                }
+            });
+
+        mouse_area(btn)
+            .on_enter(Message::MenuButtonHovered(menu_id))
+            .into()
+    }
+
+    fn view_dropdown(&self) -> Element<'_, Message> {
+        let menu_id = self.open_menu.unwrap_or(MenuId::File);
+
+        let items: Vec<Element<'_, Message>> = match menu_id {
+            MenuId::File => vec![
+                self.menu_item("New Project", MenuAction::NewProject),
+                self.menu_item("Load Project", MenuAction::LoadProject),
+                self.menu_item("Save", MenuAction::Save),
+                self.menu_item("Exit", MenuAction::Exit),
+            ],
+            MenuId::Edit => vec![
+                self.menu_item("Undo", MenuAction::Undo),
+                self.menu_item("Redo", MenuAction::Redo),
+            ],
+        };
+
+        let left_offset: f32 = match menu_id {
+            MenuId::File => 8.0,
+            MenuId::Edit => 58.0,
+        };
+
+        let dropdown = container(column(items).spacing(0))
+            .width(180)
+            .padding(4)
+            .style(|_theme| container::Style {
+                background: Some(Background::Color(Color::from_rgb(0.22, 0.22, 0.24))),
+                border: Border {
+                    color: Color::from_rgb(0.15, 0.15, 0.17),
+                    width: 1.0,
+                    radius: 6.0.into(),
+                },
+                ..Default::default()
+            });
+
+        // Position at top-left of content area with left offset
+        container(dropdown)
+            .padding(iced::Padding {
+                top: 0.0,
+                right: 0.0,
+                bottom: 0.0,
+                left: left_offset,
+            })
+            .into()
+    }
+
+    fn menu_item<'a>(&self, label: &'a str, action: MenuAction) -> Element<'a, Message> {
+        button(
+            text(label).size(14).color(Color::WHITE).width(Length::Fill),
+        )
+        .on_press(Message::MenuAction(action))
+        .width(Length::Fill)
+        .padding([6, 12])
+        .style(|_theme, status| {
+            let bg = if matches!(status, button::Status::Hovered) {
+                Color::from_rgb(0.32, 0.32, 0.35)
+            } else {
+                Color::TRANSPARENT
+            };
+            button::Style {
+                background: Some(Background::Color(bg)),
+                text_color: Color::WHITE,
+                border: Border {
+                    radius: 4.0.into(),
+                    ..Default::default()
+                },
+                ..Default::default()
+            }
+        })
+        .into()
     }
 
     /// Find the video clip at the given playback position (searches only video tracks).

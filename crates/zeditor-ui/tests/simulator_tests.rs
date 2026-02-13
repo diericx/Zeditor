@@ -7,7 +7,7 @@ use iced_test::simulator;
 use zeditor_core::media::MediaAsset;
 use zeditor_core::timeline::TimelinePosition;
 use zeditor_ui::app::App;
-use zeditor_ui::message::Message;
+use zeditor_ui::message::{MenuId, Message};
 
 fn make_test_asset(name: &str, duration_secs: f64) -> MediaAsset {
     MediaAsset::new(
@@ -276,4 +276,70 @@ fn test_full_simulator_workflow() {
         app.update(msg);
     }
     assert_eq!(app.project.timeline.tracks[0].clips.len(), 0);
+}
+
+// ===== Menu bar simulator tests =====
+
+#[test]
+fn test_view_shows_menu_bar() {
+    let app = App::new();
+    let mut ui = simulator(app.view());
+
+    assert!(ui.find("File").is_ok(), "Should show 'File' menu button");
+    assert!(ui.find("Edit").is_ok(), "Should show 'Edit' menu button");
+}
+
+#[test]
+fn test_click_file_opens_submenu() {
+    let mut app = App::new();
+
+    // Click File in the menu bar
+    let mut ui = simulator(app.view());
+    let _ = ui.click("File");
+    for msg in ui.into_messages() {
+        app.update(msg);
+    }
+    assert_eq!(app.open_menu, Some(MenuId::File));
+
+    // Now the dropdown should show File menu items
+    let mut ui = simulator(app.view());
+    assert!(ui.find("New Project").is_ok(), "Should show 'New Project'");
+    assert!(ui.find("Save").is_ok(), "Should show 'Save'");
+    assert!(ui.find("Exit").is_ok(), "Should show 'Exit'");
+}
+
+#[test]
+fn test_click_edit_opens_submenu() {
+    let mut app = App::new();
+
+    // Click Edit in the menu bar
+    let mut ui = simulator(app.view());
+    let _ = ui.click("Edit");
+    for msg in ui.into_messages() {
+        app.update(msg);
+    }
+    assert_eq!(app.open_menu, Some(MenuId::Edit));
+
+    // Now the dropdown should show Edit menu items
+    let mut ui = simulator(app.view());
+    assert!(ui.find("Undo").is_ok(), "Should show 'Undo' in Edit menu");
+    assert!(ui.find("Redo").is_ok(), "Should show 'Redo' in Edit menu");
+}
+
+#[test]
+fn test_view_renders_with_open_menu() {
+    let mut app = App::new();
+    app.open_menu = Some(MenuId::File);
+
+    // Should not panic when rendering with open menu
+    let _ui = simulator(app.view());
+}
+
+#[test]
+fn test_view_renders_with_open_edit_menu() {
+    let mut app = App::new();
+    app.open_menu = Some(MenuId::Edit);
+
+    // Should not panic when rendering with open Edit menu
+    let _ui = simulator(app.view());
 }

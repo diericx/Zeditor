@@ -6,7 +6,7 @@ use std::time::Duration;
 use zeditor_core::media::MediaAsset;
 use zeditor_core::timeline::TimelinePosition;
 use zeditor_ui::app::App;
-use zeditor_ui::message::{Message, ToolMode};
+use zeditor_ui::message::{MenuAction, MenuId, Message, ToolMode};
 
 fn make_test_asset(name: &str, duration_secs: f64) -> MediaAsset {
     MediaAsset::new(
@@ -839,4 +839,178 @@ fn test_clip_at_position_returns_video_only() {
     assert!(result.is_some());
     let (track_idx, _) = result.unwrap();
     assert_eq!(track_idx, 1);
+}
+
+// ===== Menu tests =====
+
+#[test]
+fn test_menu_click_opens_file_menu() {
+    let mut app = App::new();
+    assert!(app.open_menu.is_none());
+
+    app.update(Message::MenuButtonClicked(MenuId::File));
+    assert_eq!(app.open_menu, Some(MenuId::File));
+}
+
+#[test]
+fn test_menu_click_toggles_closed() {
+    let mut app = App::new();
+
+    app.update(Message::MenuButtonClicked(MenuId::File));
+    assert_eq!(app.open_menu, Some(MenuId::File));
+
+    app.update(Message::MenuButtonClicked(MenuId::File));
+    assert!(app.open_menu.is_none());
+}
+
+#[test]
+fn test_menu_click_switches_menu() {
+    let mut app = App::new();
+
+    app.update(Message::MenuButtonClicked(MenuId::File));
+    assert_eq!(app.open_menu, Some(MenuId::File));
+
+    app.update(Message::MenuButtonClicked(MenuId::Edit));
+    assert_eq!(app.open_menu, Some(MenuId::Edit));
+}
+
+#[test]
+fn test_menu_hover_switches_when_open() {
+    let mut app = App::new();
+
+    app.update(Message::MenuButtonClicked(MenuId::File));
+    assert_eq!(app.open_menu, Some(MenuId::File));
+
+    app.update(Message::MenuButtonHovered(MenuId::Edit));
+    assert_eq!(app.open_menu, Some(MenuId::Edit));
+}
+
+#[test]
+fn test_menu_hover_noop_when_closed() {
+    let mut app = App::new();
+    assert!(app.open_menu.is_none());
+
+    app.update(Message::MenuButtonHovered(MenuId::Edit));
+    assert!(app.open_menu.is_none());
+}
+
+#[test]
+fn test_close_menu() {
+    let mut app = App::new();
+    app.update(Message::MenuButtonClicked(MenuId::File));
+    assert!(app.open_menu.is_some());
+
+    app.update(Message::CloseMenu);
+    assert!(app.open_menu.is_none());
+}
+
+#[test]
+fn test_menu_action_closes_menu() {
+    let mut app = App::new();
+    app.update(Message::MenuButtonClicked(MenuId::File));
+    assert!(app.open_menu.is_some());
+
+    app.update(Message::MenuAction(MenuAction::NewProject));
+    assert!(app.open_menu.is_none());
+}
+
+#[test]
+fn test_menu_undo_action() {
+    let mut app = App::new();
+
+    let asset = make_test_asset("clip1", 5.0);
+    let asset_id = asset.id;
+    app.update(Message::MediaImported(Ok(asset)));
+    app.update(Message::AddClipToTimeline {
+        asset_id,
+        track_index: 0,
+        position: TimelinePosition::zero(),
+    });
+    assert_eq!(app.project.timeline.tracks[0].clips.len(), 1);
+
+    app.update(Message::MenuButtonClicked(MenuId::Edit));
+    app.update(Message::MenuAction(MenuAction::Undo));
+
+    assert_eq!(app.project.timeline.tracks[0].clips.len(), 0);
+    assert!(app.open_menu.is_none());
+}
+
+#[test]
+fn test_menu_redo_action() {
+    let mut app = App::new();
+
+    let asset = make_test_asset("clip1", 5.0);
+    let asset_id = asset.id;
+    app.update(Message::MediaImported(Ok(asset)));
+    app.update(Message::AddClipToTimeline {
+        asset_id,
+        track_index: 0,
+        position: TimelinePosition::zero(),
+    });
+    app.update(Message::Undo);
+    assert_eq!(app.project.timeline.tracks[0].clips.len(), 0);
+
+    app.update(Message::MenuButtonClicked(MenuId::Edit));
+    app.update(Message::MenuAction(MenuAction::Redo));
+
+    assert_eq!(app.project.timeline.tracks[0].clips.len(), 1);
+    assert!(app.open_menu.is_none());
+}
+
+#[test]
+fn test_menu_unimplemented_actions() {
+    let mut app = App::new();
+
+    app.update(Message::MenuAction(MenuAction::NewProject));
+    assert!(app.status_message.contains("not yet implemented"));
+
+    app.update(Message::MenuAction(MenuAction::LoadProject));
+    assert!(app.status_message.contains("not yet implemented"));
+
+    app.update(Message::MenuAction(MenuAction::Save));
+    assert!(app.status_message.contains("not yet implemented"));
+}
+
+#[test]
+fn test_escape_closes_menu() {
+    let mut app = App::new();
+    app.update(Message::MenuButtonClicked(MenuId::File));
+    assert!(app.open_menu.is_some());
+
+    app.update(Message::KeyboardEvent(iced::keyboard::Event::KeyPressed {
+        key: iced::keyboard::Key::Named(iced::keyboard::key::Named::Escape),
+        modified_key: iced::keyboard::Key::Named(iced::keyboard::key::Named::Escape),
+        physical_key: iced::keyboard::key::Physical::Unidentified(
+            iced::keyboard::key::NativeCode::Unidentified,
+        ),
+        location: iced::keyboard::Location::Standard,
+        modifiers: iced::keyboard::Modifiers::empty(),
+        text: None,
+        repeat: false,
+    }));
+    assert!(app.open_menu.is_none());
+}
+
+#[test]
+fn test_keyboard_swallowed_when_menu_open() {
+    let mut app = App::new();
+    assert_eq!(app.tool_mode, ToolMode::Arrow);
+
+    app.update(Message::MenuButtonClicked(MenuId::File));
+    assert!(app.open_menu.is_some());
+
+    // Press 'b' while menu is open — should NOT switch to Blade
+    app.update(Message::KeyboardEvent(iced::keyboard::Event::KeyPressed {
+        key: iced::keyboard::Key::Character("b".into()),
+        modified_key: iced::keyboard::Key::Character("b".into()),
+        physical_key: iced::keyboard::key::Physical::Unidentified(
+            iced::keyboard::key::NativeCode::Unidentified,
+        ),
+        location: iced::keyboard::Location::Standard,
+        modifiers: iced::keyboard::Modifiers::empty(),
+        text: None,
+        repeat: false,
+    }));
+    assert_eq!(app.tool_mode, ToolMode::Arrow, "key should be swallowed when menu is open");
+    assert!(app.open_menu.is_some(), "menu should remain open");
 }

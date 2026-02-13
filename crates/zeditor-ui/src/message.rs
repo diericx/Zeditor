@@ -10,6 +10,22 @@ pub enum ToolMode {
     Blade,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MenuId {
+    File,
+    Edit,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MenuAction {
+    NewProject,
+    LoadProject,
+    Save,
+    Exit,
+    Undo,
+    Redo,
+}
+
 #[derive(Debug, Clone)]
 pub enum Message {
     // Source library
@@ -67,4 +83,11 @@ pub enum Message {
     Redo,
     SaveProject,
     LoadProject(PathBuf),
+
+    // Menu
+    MenuButtonClicked(MenuId),
+    MenuButtonHovered(MenuId),
+    CloseMenu,
+    MenuAction(MenuAction),
+    Exit,
 }
