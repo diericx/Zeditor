@@ -29,12 +29,12 @@ enum DecodeRequest {
 }
 
 /// Decoded frame sent from the decode thread to the UI.
-struct DecodedFrame {
-    rgba: Vec<u8>,
-    width: u32,
-    height: u32,
+pub(crate) struct DecodedFrame {
+    pub(crate) rgba: Vec<u8>,
+    pub(crate) width: u32,
+    pub(crate) height: u32,
     /// Source-file PTS in seconds.
-    pts_secs: f64,
+    pub(crate) pts_secs: f64,
 }
 
 pub struct App {
@@ -49,10 +49,10 @@ pub struct App {
     pub timeline_zoom: f32,
     pub timeline_scroll: f32,
     decode_tx: Option<mpsc::Sender<DecodeRequest>>,
-    decode_rx: Option<mpsc::Receiver<DecodedFrame>>,
-    decode_clip_id: Option<Uuid>,
+    pub(crate) decode_rx: Option<mpsc::Receiver<DecodedFrame>>,
+    pub(crate) decode_clip_id: Option<Uuid>,
     /// Offset to convert source PTS → timeline time: timeline_time = pts + offset.
-    decode_time_offset: f64,
+    pub(crate) decode_time_offset: f64,
     /// Frame received from decode thread but not yet displayed (PTS ahead of playback).
     pending_frame: Option<DecodedFrame>,
 }

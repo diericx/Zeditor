@@ -5429,6 +5429,7 @@ dependencies = [
  "zeditor-core",
  "zeditor-media",
  "zeditor-test-harness",
+ "zeditor-ui",
 ]
 
 [[package]]

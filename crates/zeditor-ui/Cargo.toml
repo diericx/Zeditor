@@ -14,7 +14,11 @@ iced = { version = "0.14", features = ["canvas", "image", "tokio"] }
 uuid = { workspace = true }
 rfd = "0.15"
 
+[features]
+test-helpers = []
+
 [dev-dependencies]
 zeditor-test-harness = { path = "../zeditor-test-harness" }
+zeditor-ui = { path = ".", features = ["test-helpers"] }
 iced_test = "0.14"
 uuid = { workspace = true }
