@@ -17,7 +17,7 @@ Maintain these principles at all times:
 - Code scalability
   - The goals for this project are long term and ambitious. Develop in such a way that we can iterate on features and get initial versions working with smaller scopes, but will be able to scale up the scope progressively over time.
 - Codified changes
-  - When executing a specific brief, keep a log at the bottom of the file of what was done so we can come back to it if we need to. We are doing this so we don't have to constantly keep every decision in our context/memory. We can write it down and reference when necessary.
+  - When executing a specific brief, keep a log at the bottom of the file of what was done so we can come back to it if we need to. We are doing this so we don't have to constantly keep every decision in our context/memory. We can write it down and reference when necessary. Do not alter what was originally in thee files, append your logs to the bottom.
 
 ## The project
 
