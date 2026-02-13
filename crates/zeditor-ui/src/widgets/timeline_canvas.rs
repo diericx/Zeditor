@@ -1,11 +1,11 @@
 use iced::mouse;
 use iced::widget::canvas;
-use iced::{Color, Point, Rectangle, Renderer, Size, Theme};
+use iced::{border, Color, Point, Rectangle, Renderer, Size, Theme};
 use uuid::Uuid;
 
 use zeditor_core::timeline::{Timeline, TimelinePosition};
 
-use crate::message::Message;
+use crate::message::{Message, ToolMode};
 
 const RULER_HEIGHT: f32 = 20.0;
 const TRACK_HEIGHT: f32 = 50.0;
@@ -38,6 +38,7 @@ pub enum TimelineInteraction {
 pub struct TimelineCanvasState {
     pub interaction: TimelineInteraction,
     pub modifiers: iced::keyboard::Modifiers,
+    pub cursor_position: Option<Point>,
 }
 
 impl Default for TimelineCanvasState {
@@ -45,6 +46,7 @@ impl Default for TimelineCanvasState {
         Self {
             interaction: TimelineInteraction::None,
             modifiers: iced::keyboard::Modifiers::empty(),
+            cursor_position: None,
         }
     }
 }
@@ -55,6 +57,7 @@ pub struct TimelineCanvas<'a> {
     pub selected_asset_id: Option<Uuid>,
     pub zoom: f32,
     pub scroll_offset: f32,
+    pub tool_mode: ToolMode,
 }
 
 impl<'a> TimelineCanvas<'a> {
@@ -95,6 +98,49 @@ impl<'a> TimelineCanvas<'a> {
         let track_y = (y - RULER_HEIGHT).max(0.0);
         let idx = (track_y / TRACK_HEIGHT) as usize;
         idx.min(self.timeline.tracks.len().saturating_sub(1))
+    }
+}
+
+fn draw_clip_shape(
+    frame: &mut canvas::Frame,
+    draw_x: f32,
+    draw_width: f32,
+    track_top: f32,
+    color: Color,
+    duration_secs: f64,
+) {
+    let clip_pos = Point::new(draw_x, track_top + 2.0);
+    let clip_size = Size::new(draw_width, TRACK_HEIGHT - 4.0);
+    let clip_path = canvas::Path::new(|b| {
+        b.rounded_rectangle(clip_pos, clip_size, border::Radius::from(4.0));
+    });
+    frame.fill(&clip_path, color);
+    frame.stroke(
+        &clip_path,
+        canvas::Stroke::default()
+            .with_color(Color::from_rgb(0.25, 0.25, 0.25))
+            .with_width(1.0),
+    );
+
+    // Right resize edge indicator
+    frame.fill_rectangle(
+        Point::new(draw_x + draw_width - CLIP_RESIZE_EDGE_WIDTH, track_top + 2.0),
+        Size::new(CLIP_RESIZE_EDGE_WIDTH, TRACK_HEIGHT - 4.0),
+        Color {
+            a: 0.3,
+            ..Color::WHITE
+        },
+    );
+
+    // Clip duration label
+    if draw_width > 30.0 {
+        frame.fill_text(canvas::Text {
+            content: format!("{:.1}s", duration_secs),
+            position: Point::new(draw_x + 4.0, track_top + 18.0),
+            color: Color::WHITE,
+            size: iced::Pixels(11.0),
+            ..canvas::Text::default()
+        });
     }
 }
 
@@ -161,6 +207,17 @@ impl<'a> canvas::Program<Message> for TimelineCanvas<'a> {
                 {
                     match zone {
                         HitZone::Body => {
+                            if self.tool_mode == ToolMode::Blade {
+                                // Blade mode: cut at cursor position
+                                let secs = self.px_to_secs(cursor_pos.x).max(0.0);
+                                return Some(
+                                    canvas::Action::publish(Message::CutClip {
+                                        track_index,
+                                        position: TimelinePosition::from_secs_f64(secs),
+                                    })
+                                    .and_capture(),
+                                );
+                            }
                             if let Ok(track) = self.timeline.track(track_index) {
                                 if let Some(clip) = track.get_clip(clip_id) {
                                     let clip_start_px = self
@@ -208,16 +265,29 @@ impl<'a> canvas::Program<Message> for TimelineCanvas<'a> {
                 )
             }
             canvas::Event::Mouse(mouse::Event::CursorMoved { .. }) => {
+                state.cursor_position = Some(cursor_pos);
                 match &mut state.interaction {
-                    TimelineInteraction::Dragging { current_x, .. } => {
-                        *current_x = cursor_pos.x;
+                    TimelineInteraction::Dragging {
+                        offset_px,
+                        current_x,
+                        ..
+                    } => {
+                        // Clamp so clip left edge can't go before time 0
+                        let min_current_x = *offset_px - self.scroll_offset;
+                        *current_x = cursor_pos.x.max(min_current_x);
                         Some(canvas::Action::request_redraw().and_capture())
                     }
                     TimelineInteraction::Resizing { current_x, .. } => {
                         *current_x = cursor_pos.x;
                         Some(canvas::Action::request_redraw().and_capture())
                     }
-                    TimelineInteraction::None => None,
+                    TimelineInteraction::None => {
+                        if self.tool_mode == ToolMode::Blade {
+                            Some(canvas::Action::request_redraw())
+                        } else {
+                            None
+                        }
+                    }
                 }
             }
             canvas::Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)) => {
@@ -276,7 +346,7 @@ impl<'a> canvas::Program<Message> for TimelineCanvas<'a> {
         renderer: &Renderer,
         _theme: &Theme,
         bounds: Rectangle,
-        _cursor: mouse::Cursor,
+        cursor: mouse::Cursor,
     ) -> Vec<canvas::Geometry> {
         let mut frame = canvas::Frame::new(renderer, bounds.size());
 
@@ -289,6 +359,52 @@ impl<'a> canvas::Program<Message> for TimelineCanvas<'a> {
 
         // Time ruler
         self.draw_ruler(&mut frame, bounds.width);
+
+        // Pre-compute drag preview: which clips on the dest track get trimmed/split/removed
+        let drag_preview: Option<(
+            usize,
+            std::collections::HashMap<Uuid, Vec<zeditor_core::timeline::TrimPreview>>,
+        )> = if let TimelineInteraction::Dragging {
+            clip_id: drag_clip_id,
+            offset_px,
+            current_x,
+            ..
+        } = &state.interaction
+        {
+            let drag_left_px = current_x - offset_px;
+            let drag_start_secs = self.px_to_secs(drag_left_px).max(0.0);
+            let drag_duration = self
+                .timeline
+                .tracks
+                .iter()
+                .flat_map(|t| &t.clips)
+                .find(|c| c.id == *drag_clip_id)
+                .map(|c| c.duration().as_secs_f64())
+                .unwrap_or(0.0);
+            let drag_end_secs = drag_start_secs + drag_duration;
+            let dest_track = cursor
+                .position_in(bounds)
+                .map(|p| self.track_at_y(p.y))
+                .unwrap_or(0);
+
+            if let Ok(track) = self.timeline.track(dest_track) {
+                let previews = track.preview_trim_overlaps(
+                    drag_start_secs,
+                    drag_end_secs,
+                    Some(*drag_clip_id),
+                );
+                let mut map: std::collections::HashMap<Uuid, Vec<_>> =
+                    std::collections::HashMap::new();
+                for p in previews {
+                    map.entry(p.clip_id).or_default().push(p);
+                }
+                Some((dest_track, map))
+            } else {
+                None
+            }
+        } else {
+            None
+        };
 
         // Track lanes
         for (i, track) in self.timeline.tracks.iter().enumerate() {
@@ -333,6 +449,36 @@ impl<'a> canvas::Program<Message> for TimelineCanvas<'a> {
                     continue;
                 }
 
+                let is_dragged_clip = matches!(
+                    &state.interaction,
+                    TimelineInteraction::Dragging { clip_id: drag_id, .. } if *drag_id == clip.id
+                );
+
+                // If this clip is on the dest track and has preview data, draw the
+                // preview pieces (trimmed/split) instead of the original clip shape.
+                if !is_dragged_clip {
+                    if let Some((dest_track_idx, ref preview_map)) = drag_preview {
+                        if i == dest_track_idx {
+                            if let Some(previews) = preview_map.get(&clip.id) {
+                                let color = color_from_uuid(clip.asset_id);
+                                for preview in previews {
+                                    if let (Some(ts), Some(te)) =
+                                        (preview.trimmed_start, preview.trimmed_end)
+                                    {
+                                        let px = self.secs_to_px(ts);
+                                        let pw = (self.secs_to_px(te) - px).max(4.0);
+                                        draw_clip_shape(
+                                            &mut frame, px, pw, track_top, color, te - ts,
+                                        );
+                                    }
+                                    // trimmed_start == None means fully removed → skip
+                                }
+                                continue; // skip normal drawing for this clip
+                            }
+                        }
+                    }
+                }
+
                 let (draw_x, draw_width) = match &state.interaction {
                     TimelineInteraction::Dragging {
                         clip_id: drag_id,
@@ -349,36 +495,8 @@ impl<'a> canvas::Program<Message> for TimelineCanvas<'a> {
                 };
 
                 let color = color_from_uuid(clip.asset_id);
-                frame.fill_rectangle(
-                    Point::new(draw_x, track_top + 2.0),
-                    Size::new(draw_width.max(4.0), TRACK_HEIGHT - 4.0),
-                    color,
-                );
-
-                // Right resize edge indicator
-                frame.fill_rectangle(
-                    Point::new(
-                        draw_x + draw_width.max(4.0) - CLIP_RESIZE_EDGE_WIDTH,
-                        track_top + 2.0,
-                    ),
-                    Size::new(CLIP_RESIZE_EDGE_WIDTH, TRACK_HEIGHT - 4.0),
-                    Color {
-                        a: 0.3,
-                        ..Color::WHITE
-                    },
-                );
-
-                // Clip duration label
                 let dur = clip.duration().as_secs_f64();
-                if clip_width > 30.0 {
-                    frame.fill_text(canvas::Text {
-                        content: format!("{:.1}s", dur),
-                        position: Point::new(draw_x + 4.0, track_top + 18.0),
-                        color: Color::WHITE,
-                        size: iced::Pixels(11.0),
-                        ..canvas::Text::default()
-                    });
-                }
+                draw_clip_shape(&mut frame, draw_x, draw_width.max(4.0), track_top, color, dur);
             }
         }
 
@@ -410,6 +528,23 @@ impl<'a> canvas::Program<Message> for TimelineCanvas<'a> {
             });
         }
 
+        // Blade mode: draw vertical orange line at cursor position over clips
+        if self.tool_mode == ToolMode::Blade {
+            if let TimelineInteraction::None = &state.interaction {
+                if let Some(cursor_pos) = state.cursor_position {
+                    if self.hit_test_clip(cursor_pos.x, cursor_pos.y).is_some() {
+                        let total_track_height =
+                            RULER_HEIGHT + self.timeline.tracks.len() as f32 * TRACK_HEIGHT;
+                        frame.fill_rectangle(
+                            Point::new(cursor_pos.x, RULER_HEIGHT),
+                            Size::new(1.0, total_track_height - RULER_HEIGHT),
+                            Color::from_rgb(1.0, 0.6, 0.0),
+                        );
+                    }
+                }
+            }
+        }
+
         vec![frame.into_geometry()]
     }
 
@@ -434,7 +569,13 @@ impl<'a> canvas::Program<Message> for TimelineCanvas<'a> {
         if let Some(cursor_pos) = cursor.position_in(bounds) {
             if let Some((_, _, zone)) = self.hit_test_clip(cursor_pos.x, cursor_pos.y) {
                 return match zone {
-                    HitZone::Body => mouse::Interaction::Grab,
+                    HitZone::Body => {
+                        if self.tool_mode == ToolMode::Blade {
+                            mouse::Interaction::Crosshair
+                        } else {
+                            mouse::Interaction::Grab
+                        }
+                    }
                     HitZone::RightEdge => mouse::Interaction::ResizingHorizontally,
                 };
             }
@@ -505,6 +646,7 @@ impl<'a> TimelineCanvas<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use iced::widget::canvas::Program;
     use zeditor_core::timeline::{Clip, TimeRange, Timeline};
 
     fn make_test_timeline() -> Timeline {
@@ -531,6 +673,7 @@ mod tests {
             selected_asset_id: None,
             zoom: 100.0,
             scroll_offset: 0.0,
+            tool_mode: ToolMode::Arrow,
         };
         let secs = canvas.px_to_secs(200.0);
         assert!((secs - 2.0).abs() < 0.001);
@@ -545,6 +688,7 @@ mod tests {
             selected_asset_id: None,
             zoom: 100.0,
             scroll_offset: 50.0,
+            tool_mode: ToolMode::Arrow,
         };
         let px = canvas.secs_to_px(2.0);
         assert!((px - 150.0).abs() < 0.001);
@@ -559,6 +703,7 @@ mod tests {
             selected_asset_id: None,
             zoom: 100.0,
             scroll_offset: 0.0,
+            tool_mode: ToolMode::Arrow,
         };
         let result = canvas.hit_test_clip(300.0, RULER_HEIGHT + 25.0);
         assert!(result.is_some());
@@ -576,6 +721,7 @@ mod tests {
             selected_asset_id: None,
             zoom: 100.0,
             scroll_offset: 0.0,
+            tool_mode: ToolMode::Arrow,
         };
         let result = canvas.hit_test_clip(597.0, RULER_HEIGHT + 25.0);
         assert!(result.is_some());
@@ -592,6 +738,7 @@ mod tests {
             selected_asset_id: None,
             zoom: 100.0,
             scroll_offset: 0.0,
+            tool_mode: ToolMode::Arrow,
         };
         let result = canvas.hit_test_clip(50.0, RULER_HEIGHT + 25.0);
         assert!(result.is_none());
@@ -613,6 +760,7 @@ mod tests {
             selected_asset_id: None,
             zoom: 100.0,
             scroll_offset: 200.0, // scrolled right, so negative px → negative secs
+            tool_mode: ToolMode::Arrow,
         };
         // px_to_secs(-100) with scroll 200 = (-100 + 200)/100 = 1.0 (positive)
         // But with px=0 and large scroll offset, raw can go negative
@@ -622,5 +770,77 @@ mod tests {
         assert!(raw < 0.0, "px_to_secs should return negative for far-left positions");
         let clamped = raw.max(0.0);
         assert_eq!(clamped, 0.0, "drag position should clamp to zero");
+    }
+
+    #[test]
+    fn test_blade_mode_click_emits_cut() {
+        let tl = make_test_timeline();
+        // Clip is at [1.0, 6.0) in timeline, which is [100px, 600px) at zoom=100
+        let canvas = TimelineCanvas {
+            timeline: &tl,
+            playback_position: TimelinePosition::zero(),
+            selected_asset_id: None,
+            zoom: 100.0,
+            scroll_offset: 0.0,
+            tool_mode: ToolMode::Blade,
+        };
+        let mut state = TimelineCanvasState::default();
+        let bounds = Rectangle::new(Point::ORIGIN, Size::new(800.0, 200.0));
+
+        // Click at x=300 (3.0s), which is inside the clip [1.0, 6.0)
+        let cursor = mouse::Cursor::Available(Point::new(300.0, RULER_HEIGHT + 25.0));
+        let event =
+            canvas::Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left));
+
+        let result = canvas.update(&mut state, &event, bounds, cursor);
+        assert!(result.is_some(), "blade click on clip should return an action");
+        // Verify interaction is still None (no drag started)
+        assert!(
+            matches!(state.interaction, TimelineInteraction::None),
+            "blade mode should not start dragging"
+        );
+    }
+
+    #[test]
+    fn test_drag_clamp_visual_at_zero() {
+        let tl = make_test_timeline();
+        let canvas = TimelineCanvas {
+            timeline: &tl,
+            playback_position: TimelinePosition::zero(),
+            selected_asset_id: None,
+            zoom: 100.0,
+            scroll_offset: 0.0,
+            tool_mode: ToolMode::Arrow,
+        };
+
+        // Simulate a drag state where the user tries to drag left of 0
+        let mut state = TimelineCanvasState::default();
+        let clip_id = tl.tracks[0].clips[0].id;
+        state.interaction = TimelineInteraction::Dragging {
+            track_index: 0,
+            clip_id,
+            offset_px: 50.0, // clicked 50px from clip's left edge
+            current_x: 100.0,
+        };
+
+        let bounds = Rectangle::new(Point::ORIGIN, Size::new(800.0, 200.0));
+        // Try to move cursor to x=-100, which would put clip at x=-150
+        let cursor = mouse::Cursor::Available(Point::new(-100.0, RULER_HEIGHT + 25.0));
+        let event = canvas::Event::Mouse(mouse::Event::CursorMoved { position: Point::new(-100.0, RULER_HEIGHT + 25.0) });
+
+        canvas.update(&mut state, &event, bounds, cursor);
+
+        // current_x should be clamped: min_current_x = offset_px - scroll_offset = 50.0 - 0.0 = 50.0
+        if let TimelineInteraction::Dragging { current_x, .. } = &state.interaction {
+            assert!(
+                *current_x >= 50.0,
+                "current_x should be clamped to at least offset_px, got {current_x}"
+            );
+            // Verify resulting position is >= 0
+            let secs = canvas.px_to_secs(*current_x - 50.0);
+            assert!(secs >= 0.0, "clip position should be >= 0, got {secs}");
+        } else {
+            panic!("expected Dragging interaction");
+        }
     }
 }

@@ -6,7 +6,7 @@ use std::time::Duration;
 use zeditor_core::media::MediaAsset;
 use zeditor_core::timeline::TimelinePosition;
 use zeditor_ui::app::App;
-use zeditor_ui::message::Message;
+use zeditor_ui::message::{Message, ToolMode};
 
 fn make_test_asset(name: &str, duration_secs: f64) -> MediaAsset {
     MediaAsset::new(
@@ -554,4 +554,61 @@ fn test_full_editing_workflow() {
     // Redo the cut.
     app.update(Message::Redo);
     assert_eq!(app.project.timeline.tracks[0].clips.len(), 3);
+}
+
+#[test]
+fn test_tool_mode_defaults_to_arrow() {
+    let app = App::new();
+    assert_eq!(app.tool_mode, ToolMode::Arrow);
+}
+
+#[test]
+fn test_a_key_sets_arrow_mode() {
+    let mut app = App::new();
+    // First switch to blade
+    app.update(Message::KeyboardEvent(iced::keyboard::Event::KeyPressed {
+        key: iced::keyboard::Key::Character("b".into()),
+        modified_key: iced::keyboard::Key::Character("b".into()),
+        physical_key: iced::keyboard::key::Physical::Unidentified(
+            iced::keyboard::key::NativeCode::Unidentified,
+        ),
+        location: iced::keyboard::Location::Standard,
+        modifiers: iced::keyboard::Modifiers::empty(),
+        text: None,
+        repeat: false,
+    }));
+    assert_eq!(app.tool_mode, ToolMode::Blade);
+
+    // Now press A to go back to arrow
+    app.update(Message::KeyboardEvent(iced::keyboard::Event::KeyPressed {
+        key: iced::keyboard::Key::Character("a".into()),
+        modified_key: iced::keyboard::Key::Character("a".into()),
+        physical_key: iced::keyboard::key::Physical::Unidentified(
+            iced::keyboard::key::NativeCode::Unidentified,
+        ),
+        location: iced::keyboard::Location::Standard,
+        modifiers: iced::keyboard::Modifiers::empty(),
+        text: None,
+        repeat: false,
+    }));
+    assert_eq!(app.tool_mode, ToolMode::Arrow);
+}
+
+#[test]
+fn test_b_key_sets_blade_mode() {
+    let mut app = App::new();
+    assert_eq!(app.tool_mode, ToolMode::Arrow);
+
+    app.update(Message::KeyboardEvent(iced::keyboard::Event::KeyPressed {
+        key: iced::keyboard::Key::Character("b".into()),
+        modified_key: iced::keyboard::Key::Character("b".into()),
+        physical_key: iced::keyboard::key::Physical::Unidentified(
+            iced::keyboard::key::NativeCode::Unidentified,
+        ),
+        location: iced::keyboard::Location::Standard,
+        modifiers: iced::keyboard::Modifiers::empty(),
+        text: None,
+        repeat: false,
+    }));
+    assert_eq!(app.tool_mode, ToolMode::Blade);
 }

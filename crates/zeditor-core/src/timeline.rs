@@ -110,6 +110,18 @@ impl Clip {
     }
 }
 
+/// Preview of what trimming would happen to a clip during a drag operation.
+#[derive(Debug, Clone)]
+pub struct TrimPreview {
+    pub clip_id: Uuid,
+    pub original_start: f64,
+    pub original_end: f64,
+    /// None means the clip (or this piece) would be fully removed.
+    pub trimmed_start: Option<f64>,
+    /// None means the clip (or this piece) would be fully removed.
+    pub trimmed_end: Option<f64>,
+}
+
 /// A track containing an ordered sequence of non-overlapping clips.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct Track {
@@ -245,6 +257,79 @@ impl Track {
         self.clips.push(new_clip);
         self.clips
             .sort_by_key(|c| c.timeline_range.start.as_duration());
+    }
+
+    /// Preview what trimming would happen if a new clip [new_start, new_end) were placed.
+    /// Returns a list of TrimPreview entries for each affected clip.
+    /// `exclude_id` skips the clip being dragged (so it doesn't preview trimming itself).
+    pub fn preview_trim_overlaps(
+        &self,
+        new_start: f64,
+        new_end: f64,
+        exclude_id: Option<Uuid>,
+    ) -> Vec<TrimPreview> {
+        let mut previews = Vec::new();
+
+        for clip in &self.clips {
+            if Some(clip.id) == exclude_id {
+                continue;
+            }
+
+            let ex_start = clip.timeline_range.start.as_secs_f64();
+            let ex_end = clip.timeline_range.end.as_secs_f64();
+
+            // Check overlap
+            if ex_start >= new_end || ex_end <= new_start {
+                continue;
+            }
+
+            if ex_start < new_start && ex_end > new_end {
+                // Clip spans entire new range → split into two pieces
+                previews.push(TrimPreview {
+                    clip_id: clip.id,
+                    original_start: ex_start,
+                    original_end: ex_end,
+                    trimmed_start: Some(ex_start),
+                    trimmed_end: Some(new_start),
+                });
+                previews.push(TrimPreview {
+                    clip_id: clip.id,
+                    original_start: ex_start,
+                    original_end: ex_end,
+                    trimmed_start: Some(new_end),
+                    trimmed_end: Some(ex_end),
+                });
+            } else if ex_start >= new_start && ex_end <= new_end {
+                // Fully covered → removed
+                previews.push(TrimPreview {
+                    clip_id: clip.id,
+                    original_start: ex_start,
+                    original_end: ex_end,
+                    trimmed_start: None,
+                    trimmed_end: None,
+                });
+            } else if ex_start < new_start {
+                // Trim right side
+                previews.push(TrimPreview {
+                    clip_id: clip.id,
+                    original_start: ex_start,
+                    original_end: ex_end,
+                    trimmed_start: Some(ex_start),
+                    trimmed_end: Some(new_start),
+                });
+            } else {
+                // Trim left side
+                previews.push(TrimPreview {
+                    clip_id: clip.id,
+                    original_start: ex_start,
+                    original_end: ex_end,
+                    trimmed_start: Some(new_end),
+                    trimmed_end: Some(ex_end),
+                });
+            }
+        }
+
+        previews
     }
 
     /// Get the end position of the last clip on this track.

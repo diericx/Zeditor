@@ -9,7 +9,7 @@ use uuid::Uuid;
 use zeditor_core::project::Project;
 use zeditor_core::timeline::{Clip, TimeRange, TimelinePosition};
 
-use crate::message::Message;
+use crate::message::{Message, ToolMode};
 use crate::widgets::timeline_canvas::TimelineCanvas;
 
 /// Preview resolution cap. 4K frames are scaled down to this for display.
@@ -48,6 +48,7 @@ pub struct App {
     pub playback_start_pos: TimelinePosition,
     pub timeline_zoom: f32,
     pub timeline_scroll: f32,
+    pub tool_mode: ToolMode,
     decode_tx: Option<mpsc::Sender<DecodeRequest>>,
     pub(crate) decode_rx: Option<mpsc::Receiver<DecodedFrame>>,
     pub(crate) decode_clip_id: Option<Uuid>,
@@ -72,6 +73,7 @@ impl Default for App {
             playback_start_pos: TimelinePosition::zero(),
             timeline_zoom: 100.0,
             timeline_scroll: 0.0,
+            tool_mode: ToolMode::default(),
             decode_tx: None,
             decode_rx: None,
             decode_clip_id: None,
@@ -391,8 +393,17 @@ impl App {
             }
             Message::KeyboardEvent(event) => {
                 if let keyboard::Event::KeyPressed { key, .. } = event {
-                    if key == keyboard::Key::Named(keyboard::key::Named::Space) {
-                        return self.update(Message::TogglePlayback);
+                    match key.as_ref() {
+                        keyboard::Key::Named(keyboard::key::Named::Space) => {
+                            return self.update(Message::TogglePlayback);
+                        }
+                        keyboard::Key::Character("a") => {
+                            self.tool_mode = ToolMode::Arrow;
+                        }
+                        keyboard::Key::Character("b") => {
+                            self.tool_mode = ToolMode::Blade;
+                        }
+                        _ => {}
                     }
                 }
                 Task::none()
@@ -563,6 +574,7 @@ impl App {
             selected_asset_id: self.selected_asset_id,
             zoom: self.timeline_zoom,
             scroll_offset: self.timeline_scroll,
+            tool_mode: self.tool_mode,
         })
         .width(Length::Fill)
         .height(200);

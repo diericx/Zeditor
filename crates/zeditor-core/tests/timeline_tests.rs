@@ -484,3 +484,102 @@ fn test_time_range_overlaps() {
     assert!(a.overlaps(&b)); // overlapping
     assert!(!a.overlaps(&c)); // adjacent, not overlapping
 }
+
+#[test]
+fn test_preview_trim_left() {
+    let mut timeline = Timeline::new();
+    timeline.add_track("Video 1");
+
+    let asset_id = Uuid::new_v4();
+    // Existing clip [0, 10)
+    timeline
+        .add_clip(0, make_clip(asset_id, 0.0, 10.0))
+        .unwrap();
+
+    // Preview drop [5, 15) → should trim existing to [0, 5)
+    let previews = timeline.tracks[0].preview_trim_overlaps(5.0, 15.0, None);
+    assert_eq!(previews.len(), 1);
+    let p = &previews[0];
+    assert!((p.original_start - 0.0).abs() < 0.001);
+    assert!((p.original_end - 10.0).abs() < 0.001);
+    assert!((p.trimmed_start.unwrap() - 0.0).abs() < 0.001);
+    assert!((p.trimmed_end.unwrap() - 5.0).abs() < 0.001);
+}
+
+#[test]
+fn test_preview_trim_right() {
+    let mut timeline = Timeline::new();
+    timeline.add_track("Video 1");
+
+    let asset_id = Uuid::new_v4();
+    // Existing clip [5, 15)
+    timeline
+        .add_clip(0, make_clip(asset_id, 5.0, 10.0))
+        .unwrap();
+
+    // Preview drop [0, 8) → should trim existing to [8, 15)
+    let previews = timeline.tracks[0].preview_trim_overlaps(0.0, 8.0, None);
+    assert_eq!(previews.len(), 1);
+    let p = &previews[0];
+    assert!((p.trimmed_start.unwrap() - 8.0).abs() < 0.001);
+    assert!((p.trimmed_end.unwrap() - 15.0).abs() < 0.001);
+}
+
+#[test]
+fn test_preview_full_cover() {
+    let mut timeline = Timeline::new();
+    timeline.add_track("Video 1");
+
+    let asset_id = Uuid::new_v4();
+    // Existing clip [3, 7)
+    timeline
+        .add_clip(0, make_clip(asset_id, 3.0, 4.0))
+        .unwrap();
+
+    // Preview drop [0, 10) → fully covers, should be removed
+    let previews = timeline.tracks[0].preview_trim_overlaps(0.0, 10.0, None);
+    assert_eq!(previews.len(), 1);
+    let p = &previews[0];
+    assert!(p.trimmed_start.is_none());
+    assert!(p.trimmed_end.is_none());
+}
+
+#[test]
+fn test_preview_split() {
+    let mut timeline = Timeline::new();
+    timeline.add_track("Video 1");
+
+    let asset_id = Uuid::new_v4();
+    // Existing clip [0, 20)
+    timeline
+        .add_clip(0, make_clip(asset_id, 0.0, 20.0))
+        .unwrap();
+
+    // Preview drop [5, 10) → split into [0,5) and [10,20)
+    let previews = timeline.tracks[0].preview_trim_overlaps(5.0, 10.0, None);
+    assert_eq!(previews.len(), 2);
+
+    let left = &previews[0];
+    assert!((left.trimmed_start.unwrap() - 0.0).abs() < 0.001);
+    assert!((left.trimmed_end.unwrap() - 5.0).abs() < 0.001);
+
+    let right = &previews[1];
+    assert!((right.trimmed_start.unwrap() - 10.0).abs() < 0.001);
+    assert!((right.trimmed_end.unwrap() - 20.0).abs() < 0.001);
+}
+
+#[test]
+fn test_preview_no_overlap() {
+    let mut timeline = Timeline::new();
+    timeline.add_track("Video 1");
+
+    let asset_id = Uuid::new_v4();
+    // Existing clip [0, 5)
+    timeline
+        .add_clip(0, make_clip(asset_id, 0.0, 5.0))
+        .unwrap();
+
+    // Preview drop [10, 15) → no overlap
+    let previews = timeline.tracks[0].preview_trim_overlaps(10.0, 15.0, None);
+    assert!(previews.is_empty());
+}

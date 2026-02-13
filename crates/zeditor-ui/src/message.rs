@@ -3,6 +3,13 @@ use std::path::PathBuf;
 use uuid::Uuid;
 use zeditor_core::timeline::TimelinePosition;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ToolMode {
+    #[default]
+    Arrow,
+    Blade,
+}
+
 #[derive(Debug, Clone)]
 pub enum Message {
     // Source library
