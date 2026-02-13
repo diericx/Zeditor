@@ -1,5 +1,7 @@
 # Add Audio Support
 
+Remember to write unit tests and end to end tests for as much of this as possible.
+
 - Add concept of grouped tracks
   - Tracks can be grouped vertically. So if there are 3 video tracks and 3 audio tracks, 6 tracks can all be grouped
   - Grouped tracks all move at the same time when dragged
