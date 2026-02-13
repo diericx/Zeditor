@@ -1,0 +1,282 @@
+use std::time::Duration;
+
+use uuid::Uuid;
+use zeditor_core::timeline::*;
+
+fn make_clip(asset_id: Uuid, start_secs: f64, duration_secs: f64) -> Clip {
+    let source_range = TimeRange::new(
+        TimelinePosition::zero(),
+        TimelinePosition::from_secs_f64(duration_secs),
+    )
+    .unwrap();
+    Clip::new(asset_id, TimelinePosition::from_secs_f64(start_secs), source_range)
+}
+
+#[test]
+fn test_add_clip_to_track() {
+    let mut timeline = Timeline::new();
+    timeline.add_track("Video 1");
+
+    let asset_id = Uuid::new_v4();
+    let clip = make_clip(asset_id, 0.0, 5.0);
+
+    timeline.add_clip(0, clip).unwrap();
+    assert_eq!(timeline.tracks[0].clips.len(), 1);
+}
+
+#[test]
+fn test_add_multiple_clips_no_overlap() {
+    let mut timeline = Timeline::new();
+    timeline.add_track("Video 1");
+
+    let asset_id = Uuid::new_v4();
+    timeline
+        .add_clip(0, make_clip(asset_id, 0.0, 5.0))
+        .unwrap();
+    timeline
+        .add_clip(0, make_clip(asset_id, 5.0, 3.0))
+        .unwrap();
+    timeline
+        .add_clip(0, make_clip(asset_id, 10.0, 2.0))
+        .unwrap();
+
+    assert_eq!(timeline.tracks[0].clips.len(), 3);
+}
+
+#[test]
+fn test_add_clip_overlap_fails() {
+    let mut timeline = Timeline::new();
+    timeline.add_track("Video 1");
+
+    let asset_id = Uuid::new_v4();
+    timeline
+        .add_clip(0, make_clip(asset_id, 0.0, 5.0))
+        .unwrap();
+
+    let result = timeline.add_clip(0, make_clip(asset_id, 3.0, 5.0));
+    assert!(result.is_err());
+}
+
+#[test]
+fn test_cut_clip() {
+    let mut timeline = Timeline::new();
+    timeline.add_track("Video 1");
+
+    let asset_id = Uuid::new_v4();
+    let clip = make_clip(asset_id, 0.0, 10.0);
+    timeline.add_clip(0, clip).unwrap();
+
+    let (left_id, right_id) =
+        timeline.cut_at(0, TimelinePosition::from_secs_f64(4.0)).unwrap();
+
+    assert_eq!(timeline.tracks[0].clips.len(), 2);
+
+    let left = timeline.tracks[0].get_clip(left_id).unwrap();
+    let right = timeline.tracks[0].get_clip(right_id).unwrap();
+
+    // Left clip: 0..4
+    assert_eq!(left.timeline_range.start, TimelinePosition::from_secs_f64(0.0));
+    assert_eq!(left.timeline_range.end, TimelinePosition::from_secs_f64(4.0));
+
+    // Right clip: 4..10
+    assert_eq!(right.timeline_range.start, TimelinePosition::from_secs_f64(4.0));
+    assert_eq!(right.timeline_range.end, TimelinePosition::from_secs_f64(10.0));
+}
+
+#[test]
+fn test_cut_at_clip_boundary_fails() {
+    let mut timeline = Timeline::new();
+    timeline.add_track("Video 1");
+
+    let asset_id = Uuid::new_v4();
+    timeline
+        .add_clip(0, make_clip(asset_id, 0.0, 5.0))
+        .unwrap();
+
+    // Cut at the start of the clip should fail.
+    let result = timeline.cut_at(0, TimelinePosition::from_secs_f64(0.0));
+    assert!(result.is_err());
+
+    // Cut at the end of the clip should fail.
+    let result = timeline.cut_at(0, TimelinePosition::from_secs_f64(5.0));
+    assert!(result.is_err());
+}
+
+#[test]
+fn test_move_clip_same_track() {
+    let mut timeline = Timeline::new();
+    timeline.add_track("Video 1");
+
+    let asset_id = Uuid::new_v4();
+    let clip = make_clip(asset_id, 0.0, 5.0);
+    let clip_id = clip.id;
+    timeline.add_clip(0, clip).unwrap();
+
+    timeline
+        .move_clip(0, clip_id, 0, TimelinePosition::from_secs_f64(10.0))
+        .unwrap();
+
+    let moved = timeline.tracks[0].get_clip(clip_id).unwrap();
+    assert_eq!(
+        moved.timeline_range.start,
+        TimelinePosition::from_secs_f64(10.0)
+    );
+    assert_eq!(
+        moved.timeline_range.end,
+        TimelinePosition::from_secs_f64(15.0)
+    );
+}
+
+#[test]
+fn test_move_clip_between_tracks() {
+    let mut timeline = Timeline::new();
+    timeline.add_track("Video 1");
+    timeline.add_track("Video 2");
+
+    let asset_id = Uuid::new_v4();
+    let clip = make_clip(asset_id, 0.0, 5.0);
+    let clip_id = clip.id;
+    timeline.add_clip(0, clip).unwrap();
+
+    timeline
+        .move_clip(0, clip_id, 1, TimelinePosition::from_secs_f64(2.0))
+        .unwrap();
+
+    assert_eq!(timeline.tracks[0].clips.len(), 0);
+    assert_eq!(timeline.tracks[1].clips.len(), 1);
+    assert_eq!(timeline.tracks[1].clips[0].id, clip_id);
+}
+
+#[test]
+fn test_resize_clip() {
+    let mut timeline = Timeline::new();
+    timeline.add_track("Video 1");
+
+    let asset_id = Uuid::new_v4();
+    let clip = make_clip(asset_id, 0.0, 5.0);
+    let clip_id = clip.id;
+    timeline.add_clip(0, clip).unwrap();
+
+    timeline
+        .resize_clip(0, clip_id, TimelinePosition::from_secs_f64(8.0))
+        .unwrap();
+
+    let resized = timeline.tracks[0].get_clip(clip_id).unwrap();
+    assert_eq!(
+        resized.timeline_range.end,
+        TimelinePosition::from_secs_f64(8.0)
+    );
+}
+
+#[test]
+fn test_snap_to_adjacent() {
+    let mut timeline = Timeline::new();
+    timeline.add_track("Video 1");
+
+    let asset_id = Uuid::new_v4();
+    // Clip A at 0..5s
+    timeline
+        .add_clip(0, make_clip(asset_id, 0.0, 5.0))
+        .unwrap();
+
+    // Clip B at 5.05..10.05s (50ms gap from A)
+    let clip_b = make_clip(asset_id, 5.05, 5.0);
+    let clip_b_id = clip_b.id;
+    timeline.add_clip(0, clip_b).unwrap();
+
+    // Snap with 100ms threshold should close the gap.
+    let result = timeline
+        .snap_to_adjacent(0, clip_b_id, Duration::from_millis(100))
+        .unwrap();
+
+    assert!(result.is_some());
+    let snapped = timeline.tracks[0].get_clip(clip_b_id).unwrap();
+    assert_eq!(
+        snapped.timeline_range.start,
+        TimelinePosition::from_secs_f64(5.0)
+    );
+}
+
+#[test]
+fn test_snap_no_adjacent_within_threshold() {
+    let mut timeline = Timeline::new();
+    timeline.add_track("Video 1");
+
+    let asset_id = Uuid::new_v4();
+    timeline
+        .add_clip(0, make_clip(asset_id, 0.0, 5.0))
+        .unwrap();
+
+    // Clip B at 10..15s (5s gap from A, way beyond threshold)
+    let clip_b = make_clip(asset_id, 10.0, 5.0);
+    let clip_b_id = clip_b.id;
+    timeline.add_clip(0, clip_b).unwrap();
+
+    let result = timeline
+        .snap_to_adjacent(0, clip_b_id, Duration::from_millis(100))
+        .unwrap();
+
+    assert!(result.is_none());
+}
+
+#[test]
+fn test_timeline_duration() {
+    let mut timeline = Timeline::new();
+    timeline.add_track("Video 1");
+    timeline.add_track("Video 2");
+
+    let asset_id = Uuid::new_v4();
+    // Track 0: clips up to 8s
+    timeline
+        .add_clip(0, make_clip(asset_id, 0.0, 5.0))
+        .unwrap();
+    timeline
+        .add_clip(0, make_clip(asset_id, 5.0, 3.0))
+        .unwrap();
+
+    // Track 1: clips up to 12s
+    timeline
+        .add_clip(1, make_clip(asset_id, 0.0, 12.0))
+        .unwrap();
+
+    let dur = timeline.duration().as_secs_f64();
+    assert!((dur - 12.0).abs() < 0.001);
+}
+
+#[test]
+fn test_time_range_contains() {
+    let range = TimeRange::new(
+        TimelinePosition::from_secs_f64(2.0),
+        TimelinePosition::from_secs_f64(5.0),
+    )
+    .unwrap();
+
+    assert!(range.contains(TimelinePosition::from_secs_f64(2.0)));
+    assert!(range.contains(TimelinePosition::from_secs_f64(3.0)));
+    assert!(!range.contains(TimelinePosition::from_secs_f64(5.0))); // exclusive end
+    assert!(!range.contains(TimelinePosition::from_secs_f64(1.0)));
+}
+
+#[test]
+fn test_time_range_overlaps() {
+    let a = TimeRange::new(
+        TimelinePosition::from_secs_f64(0.0),
+        TimelinePosition::from_secs_f64(5.0),
+    )
+    .unwrap();
+
+    let b = TimeRange::new(
+        TimelinePosition::from_secs_f64(3.0),
+        TimelinePosition::from_secs_f64(8.0),
+    )
+    .unwrap();
+
+    let c = TimeRange::new(
+        TimelinePosition::from_secs_f64(5.0),
+        TimelinePosition::from_secs_f64(8.0),
+    )
+    .unwrap();
+
+    assert!(a.overlaps(&b)); // overlapping
+    assert!(!a.overlaps(&c)); // adjacent, not overlapping
+}

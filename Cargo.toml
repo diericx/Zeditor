@@ -1,0 +1,15 @@
+[workspace]
+members = [
+    "crates/zeditor-core",
+    "crates/zeditor-media",
+    "crates/zeditor-ui",
+    "crates/zeditor-test-harness",
+]
+resolver = "2"
+
+[workspace.dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+uuid = { version = "1", features = ["v4", "serde"] }
+tempfile = "3"

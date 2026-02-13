@@ -1,0 +1,10 @@
+[package]
+name = "zeditor-test-harness"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+zeditor-core = { path = "../zeditor-core" }
+tempfile = { workspace = true }
+uuid = { workspace = true }
+serde_json = { workspace = true }
