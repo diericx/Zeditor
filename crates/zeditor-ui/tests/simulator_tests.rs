@@ -405,3 +405,30 @@ fn test_view_renders_onion_skin_during_drag() {
     // Should render both ghost overlay and timeline preview without panic
     let _ui = simulator(app.view());
 }
+
+// ===== Brief 9: Save / Load / New Project simulator tests =====
+
+#[test]
+fn test_file_menu_shows_load_project() {
+    let mut app = App::new();
+    app.open_menu = Some(MenuId::File);
+
+    let mut ui = simulator(app.view());
+    assert!(
+        ui.find("Load Project").is_ok(),
+        "File menu should show 'Load Project'"
+    );
+}
+
+#[test]
+fn test_window_title_reflects_project_name() {
+    let app = App::new();
+    assert_eq!(app.title(), "Untitled - Zeditor");
+}
+
+#[test]
+fn test_window_title_updates_after_name_change() {
+    let mut app = App::new();
+    app.project.name = "Custom Project".into();
+    assert_eq!(app.title(), "Custom Project - Zeditor");
+}

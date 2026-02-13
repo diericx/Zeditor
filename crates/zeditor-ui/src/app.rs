@@ -60,6 +60,7 @@ pub(crate) struct DecodedFrame {
 
 pub struct App {
     pub project: Project,
+    pub project_path: Option<PathBuf>,
     pub playback_position: TimelinePosition,
     pub is_playing: bool,
     pub status_message: String,
@@ -95,6 +96,7 @@ impl Default for App {
     fn default() -> Self {
         Self {
             project: Project::new("Untitled"),
+            project_path: None,
             playback_position: TimelinePosition::zero(),
             is_playing: false,
             status_message: String::new(),
@@ -127,6 +129,66 @@ impl Default for App {
 impl App {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    pub fn title(&self) -> String {
+        format!("{} - Zeditor", self.project.name)
+    }
+
+    /// Reset all transient UI state (playback, decode, drag, thumbnails, etc.)
+    /// Called after loading a project or creating a new one.
+    fn reset_ui_state(&mut self) {
+        self.playback_position = TimelinePosition::zero();
+        self.is_playing = false;
+        self.playback_start_wall = None;
+        self.playback_start_pos = TimelinePosition::zero();
+        self.current_frame = None;
+        self.selected_asset_id = None;
+        self.hovered_asset_id = None;
+        self.thumbnails.clear();
+        self.drag_state = None;
+        self.timeline_zoom = 100.0;
+        self.timeline_scroll = 0.0;
+        self.tool_mode = ToolMode::default();
+        self.open_menu = None;
+        self.decode_clip_id = None;
+        self.decode_time_offset = 0.0;
+        self.pending_frame = None;
+        self.drain_stale = false;
+        self.audio_decode_clip_id = None;
+        self.audio_decode_time_offset = 0.0;
+        self.send_decode_stop();
+        self.send_audio_decode_stop();
+        if let Some(player) = &self.audio_player {
+            player.stop();
+        }
+    }
+
+    /// Generate thumbnail tasks for all assets in the source library.
+    fn regenerate_all_thumbnails(&self) -> Task<Message> {
+        let tasks: Vec<Task<Message>> = self
+            .project
+            .source_library
+            .assets()
+            .iter()
+            .map(|asset| {
+                let asset_id = asset.id;
+                let path = asset.path.clone();
+                Task::perform(
+                    async move {
+                        let result =
+                            zeditor_media::thumbnail::generate_thumbnail_rgba_scaled(
+                                &path, 160, 90,
+                            )
+                            .map(|frame| (frame.data, frame.width, frame.height))
+                            .map_err(|e| format!("{e}"));
+                        (asset_id, result)
+                    },
+                    |(asset_id, result)| Message::ThumbnailGenerated { asset_id, result },
+                )
+            })
+            .collect();
+        Task::batch(tasks)
     }
 
     pub fn boot() -> (Self, Task<Message>) {
@@ -723,7 +785,94 @@ impl App {
                 }
                 Task::none()
             }
-            Message::SaveProject | Message::LoadProject(_) => Task::none(),
+            Message::SaveProject => {
+                if let Some(path) = &self.project_path {
+                    // Save directly to the known path
+                    match self.project.save(path) {
+                        Ok(()) => {
+                            self.status_message = format!("Saved to {}", path.display());
+                        }
+                        Err(e) => {
+                            self.status_message = format!("Save failed: {e}");
+                        }
+                    }
+                    Task::none()
+                } else {
+                    // No path yet — open save dialog
+                    self.status_message = "Opening save dialog...".into();
+                    Task::perform(
+                        async {
+                            let handle = rfd::AsyncFileDialog::new()
+                                .add_filter("Zeditor Project", &["zpf"])
+                                .set_title("Save Project")
+                                .save_file()
+                                .await;
+                            handle.map(|f| f.path().to_path_buf())
+                        },
+                        Message::SaveFileDialogResult,
+                    )
+                }
+            }
+            Message::SaveFileDialogResult(path) => {
+                match path {
+                    Some(mut path) => {
+                        // Ensure .zpf extension
+                        if path.extension().is_none_or(|e| e != "zpf") {
+                            path.set_extension("zpf");
+                        }
+                        // Derive project name from filename stem
+                        if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
+                            self.project.name = stem.to_string();
+                        }
+                        match self.project.save(&path) {
+                            Ok(()) => {
+                                self.status_message = format!("Saved to {}", path.display());
+                                self.project_path = Some(path);
+                            }
+                            Err(e) => {
+                                self.status_message = format!("Save failed: {e}");
+                            }
+                        }
+                    }
+                    None => {
+                        self.status_message = "Save cancelled".into();
+                    }
+                }
+                Task::none()
+            }
+            Message::LoadProject(path) => {
+                match zeditor_core::project::Project::load(&path) {
+                    Ok(project) => {
+                        self.reset_ui_state();
+                        self.project = project;
+                        self.project_path = Some(path.clone());
+                        self.status_message = format!("Loaded {}", path.display());
+                        self.regenerate_all_thumbnails()
+                    }
+                    Err(e) => {
+                        self.status_message = format!("Load failed: {e}");
+                        Task::none()
+                    }
+                }
+            }
+            Message::LoadFileDialogResult(path) => {
+                match path {
+                    Some(path) => {
+                        return self.update(Message::LoadProject(path));
+                    }
+                    None => {
+                        self.status_message = "Load cancelled".into();
+                    }
+                }
+                Task::none()
+            }
+            Message::NewProject => {
+                self.reset_ui_state();
+                self.project = Project::default();
+                self.project_path = None;
+                self.status_message = "New project created".into();
+                Task::none()
+            }
             Message::MenuButtonClicked(id) => {
                 if self.open_menu == Some(id) {
                     self.open_menu = None;
@@ -745,20 +894,26 @@ impl App {
             Message::MenuAction(action) => {
                 self.open_menu = None;
                 match action {
-                    MenuAction::Undo => return self.update(Message::Undo),
-                    MenuAction::Redo => return self.update(Message::Redo),
-                    MenuAction::Exit => return self.update(Message::Exit),
-                    MenuAction::NewProject => {
-                        self.status_message = "New Project: not yet implemented".into();
-                    }
+                    MenuAction::Undo => self.update(Message::Undo),
+                    MenuAction::Redo => self.update(Message::Redo),
+                    MenuAction::Exit => self.update(Message::Exit),
+                    MenuAction::NewProject => self.update(Message::NewProject),
                     MenuAction::LoadProject => {
-                        self.status_message = "Load Project: not yet implemented".into();
+                        self.status_message = "Opening load dialog...".into();
+                        Task::perform(
+                            async {
+                                let handle = rfd::AsyncFileDialog::new()
+                                    .add_filter("Zeditor Project", &["zpf"])
+                                    .set_title("Load Project")
+                                    .pick_file()
+                                    .await;
+                                handle.map(|f| f.path().to_path_buf())
+                            },
+                            Message::LoadFileDialogResult,
+                        )
                     }
-                    MenuAction::Save => {
-                        self.status_message = "Save: not yet implemented".into();
-                    }
+                    MenuAction::Save => self.update(Message::SaveProject),
                 }
-                Task::none()
             }
             Message::Exit => iced::exit(),
         }

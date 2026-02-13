@@ -41,7 +41,7 @@ impl MediaAsset {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
 pub struct SourceLibrary {
     assets: Vec<MediaAsset>,
 }

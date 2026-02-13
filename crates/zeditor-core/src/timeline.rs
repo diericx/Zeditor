@@ -136,7 +136,7 @@ pub enum TrackType {
 }
 
 /// A track containing an ordered sequence of non-overlapping clips.
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
 pub struct Track {
     pub name: String,
     pub clips: Vec<Clip>,
@@ -439,7 +439,7 @@ impl Track {
 }
 
 /// The timeline containing all tracks.
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
 pub struct Timeline {
     pub tracks: Vec<Track>,
 }

@@ -130,6 +130,9 @@ pub enum Message {
     Redo,
     SaveProject,
     LoadProject(PathBuf),
+    SaveFileDialogResult(Option<PathBuf>),
+    LoadFileDialogResult(Option<PathBuf>),
+    NewProject,
 
     // Menu
     MenuButtonClicked(MenuId),

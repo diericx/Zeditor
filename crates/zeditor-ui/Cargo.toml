@@ -23,3 +23,5 @@ zeditor-test-harness = { path = "../zeditor-test-harness" }
 zeditor-ui = { path = ".", features = ["test-helpers"] }
 iced_test = "0.14"
 uuid = { workspace = true }
+tempfile = { workspace = true }
+serde_json = { workspace = true }

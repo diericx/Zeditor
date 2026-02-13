@@ -32,6 +32,15 @@ pub enum CoreError {
     #[error("nothing to redo")]
     NothingToRedo,
 
+    #[error("project file version {got} is newer than this app supports (max {max})")]
+    VersionTooNew { got: String, max: String },
+
+    #[error("project file version {got} is too old (minimum supported: {min})")]
+    VersionTooOld { got: String, min: String },
+
+    #[error("invalid project file: {0}")]
+    InvalidProjectFile(String),
+
     #[error("serialization error: {0}")]
     Serialization(#[from] serde_json::Error),
 

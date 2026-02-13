@@ -958,17 +958,20 @@ fn test_menu_redo_action() {
 }
 
 #[test]
-fn test_menu_unimplemented_actions() {
+fn test_menu_new_project_dispatches() {
     let mut app = App::new();
 
     app.update(Message::MenuAction(MenuAction::NewProject));
-    assert!(app.status_message.contains("not yet implemented"));
+    assert_eq!(app.status_message, "New project created");
+}
 
-    app.update(Message::MenuAction(MenuAction::LoadProject));
-    assert!(app.status_message.contains("not yet implemented"));
+#[test]
+fn test_menu_save_dispatches() {
+    let mut app = App::new();
 
+    // Without a project_path, Save opens a dialog (sets status)
     app.update(Message::MenuAction(MenuAction::Save));
-    assert!(app.status_message.contains("not yet implemented"));
+    assert_eq!(app.status_message, "Opening save dialog...");
 }
 
 #[test]
@@ -1227,4 +1230,247 @@ fn test_drag_released_clears_state() {
 
     // After release, drag state is cleared
     assert!(app.drag_state.is_none());
+}
+
+// ===== Brief 9: Save / Load / New Project tests =====
+
+#[test]
+fn test_save_project_no_path_sets_status() {
+    let mut app = App::new();
+    assert!(app.project_path.is_none());
+
+    app.update(Message::SaveProject);
+    assert_eq!(app.status_message, "Opening save dialog...");
+}
+
+#[test]
+fn test_save_project_with_path_saves_file() {
+    let mut app = App::new();
+
+    let asset = make_test_asset("clip1", 5.0);
+    let asset_id = asset.id;
+    app.update(Message::MediaImported(Ok(asset)));
+    app.update(Message::AddClipToTimeline {
+        asset_id,
+        track_index: 0,
+        position: TimelinePosition::zero(),
+    });
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("test.zpf");
+    app.project_path = Some(path.clone());
+
+    app.update(Message::SaveProject);
+    assert!(path.exists(), "file should be created");
+    assert!(app.status_message.contains("Saved"));
+}
+
+#[test]
+fn test_save_file_dialog_result_some() {
+    let mut app = App::new();
+    app.project.name = "OldName".into();
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("MyProject.zpf");
+
+    app.update(Message::SaveFileDialogResult(Some(path.clone())));
+
+    assert_eq!(app.project_path, Some(path));
+    assert_eq!(app.project.name, "MyProject");
+    assert!(app.status_message.contains("Saved"));
+}
+
+#[test]
+fn test_save_file_dialog_result_ensures_extension() {
+    let mut app = App::new();
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("NoExtension");
+
+    app.update(Message::SaveFileDialogResult(Some(path)));
+
+    // Should have added .zpf extension
+    let saved_path = app.project_path.as_ref().unwrap();
+    assert_eq!(saved_path.extension().unwrap(), "zpf");
+}
+
+#[test]
+fn test_save_file_dialog_result_none() {
+    let mut app = App::new();
+
+    app.update(Message::SaveFileDialogResult(None));
+    assert_eq!(app.status_message, "Save cancelled");
+    assert!(app.project_path.is_none());
+}
+
+#[test]
+fn test_load_project_replaces_state() {
+    // Save a project first
+    let mut original = App::new();
+    let asset = make_test_asset("clip1", 5.0);
+    let asset_id = asset.id;
+    original.update(Message::MediaImported(Ok(asset)));
+    original.update(Message::AddClipToTimeline {
+        asset_id,
+        track_index: 0,
+        position: TimelinePosition::zero(),
+    });
+    original.project.name = "Saved Project".into();
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("load_test.zpf");
+    original.project.save(&path).unwrap();
+
+    // Load into a fresh app
+    let mut app = App::new();
+    app.update(Message::LoadProject(path));
+
+    assert_eq!(app.project.name, "Saved Project");
+    assert_eq!(app.project.source_library.len(), 1);
+    assert_eq!(app.project.timeline.tracks[0].clips.len(), 1);
+}
+
+#[test]
+fn test_load_project_sets_path() {
+    let project = zeditor_core::project::Project::new("PathTest");
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("path_test.zpf");
+    project.save(&path).unwrap();
+
+    let mut app = App::new();
+    app.update(Message::LoadProject(path.clone()));
+
+    assert_eq!(app.project_path, Some(path));
+}
+
+#[test]
+fn test_load_project_invalid_file_error() {
+    let mut app = App::new();
+    let path = PathBuf::from("/tmp/nonexistent_12345.zpf");
+
+    app.update(Message::LoadProject(path));
+
+    assert!(app.status_message.contains("Load failed"));
+}
+
+#[test]
+fn test_load_project_version_too_new() {
+    // Create a valid project file, then patch version to "99.0.0"
+    let project = zeditor_core::project::Project::new("Future");
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("future.zpf");
+    project.save(&path).unwrap();
+
+    let json = std::fs::read_to_string(&path).unwrap();
+    let mut raw: serde_json::Value = serde_json::from_str(&json).unwrap();
+    raw["version"] = serde_json::Value::String("99.0.0".into());
+    std::fs::write(&path, serde_json::to_string(&raw).unwrap()).unwrap();
+
+    let mut app = App::new();
+    app.update(Message::LoadProject(path));
+
+    assert!(
+        app.status_message.contains("Load failed"),
+        "status: {}",
+        app.status_message
+    );
+    assert!(
+        app.status_message.contains("newer"),
+        "status should mention version: {}",
+        app.status_message
+    );
+}
+
+#[test]
+fn test_new_project_resets_state() {
+    let mut app = App::new();
+
+    // Set up some state
+    let asset = make_test_asset("clip1", 5.0);
+    let asset_id = asset.id;
+    app.update(Message::MediaImported(Ok(asset)));
+    app.update(Message::AddClipToTimeline {
+        asset_id,
+        track_index: 0,
+        position: TimelinePosition::zero(),
+    });
+    app.project.name = "Modified".into();
+    app.project_path = Some(PathBuf::from("/test/project.zpf"));
+
+    app.update(Message::NewProject);
+
+    assert_eq!(app.project.name, "Untitled");
+    assert!(app.project_path.is_none());
+    assert_eq!(app.project.timeline.tracks[0].clips.len(), 0);
+    assert_eq!(app.project.source_library.len(), 0);
+    assert_eq!(app.status_message, "New project created");
+}
+
+#[test]
+fn test_load_clears_playback_state() {
+    let project = zeditor_core::project::Project::new("PlaybackTest");
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("playback.zpf");
+    project.save(&path).unwrap();
+
+    let mut app = App::new();
+    app.is_playing = true;
+    app.playback_position = TimelinePosition::from_secs_f64(5.0);
+
+    app.update(Message::LoadProject(path));
+
+    assert!(!app.is_playing);
+    assert_eq!(app.playback_position, TimelinePosition::zero());
+}
+
+#[test]
+fn test_load_file_dialog_result_none() {
+    let mut app = App::new();
+
+    app.update(Message::LoadFileDialogResult(None));
+    assert_eq!(app.status_message, "Load cancelled");
+}
+
+#[test]
+fn test_load_file_dialog_result_some() {
+    let project = zeditor_core::project::Project::new("DialogTest");
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("dialog.zpf");
+    project.save(&path).unwrap();
+
+    let mut app = App::new();
+    app.update(Message::LoadFileDialogResult(Some(path.clone())));
+
+    assert_eq!(app.project.name, "DialogTest");
+    assert_eq!(app.project_path, Some(path));
+}
+
+#[test]
+fn test_title_reflects_project_name() {
+    let mut app = App::new();
+    assert_eq!(app.title(), "Untitled - Zeditor");
+
+    app.project.name = "MyProject".into();
+    assert_eq!(app.title(), "MyProject - Zeditor");
+}
+
+#[test]
+fn test_save_then_save_again_no_dialog() {
+    let mut app = App::new();
+
+    // First save: dialog (no path)
+    app.update(Message::SaveProject);
+    assert_eq!(app.status_message, "Opening save dialog...");
+
+    // Simulate dialog result
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("Project.zpf");
+    app.update(Message::SaveFileDialogResult(Some(path.clone())));
+    assert!(app.project_path.is_some());
+
+    // Second save: direct (has path)
+    app.update(Message::SaveProject);
+    assert!(app.status_message.contains("Saved"));
+    // Should NOT say "Opening save dialog..."
+    assert!(!app.status_message.contains("dialog"));
 }
