@@ -15,17 +15,20 @@ We now want the ability to save and load projects.
 - Add the ability to click the load proj button and find a .zpf file
   - Load all this info back up when we load a project, and continue as normal editing the file we selected
   - With a file selected/loaded save no longer prompts a menu we can just save directly to the file
+- Harden this by ensuring that anything that exists in the timeline or project library (source clips) inherently ends up in the save files. We want to make sure it is very difficult for us to accidentally add a new object or attribute to the timeline or project library that doesn't end up in the save file
 
 ---
 
 ## Execution Log
 
 ### Phase 0: Serialization Safety — Round-Trip Guarantee
+
 - Added `PartialEq` derive to `Track`, `Timeline`, `SourceLibrary`
 - Implemented manual `PartialEq` for `Project` (skips `command_history` which is intentionally transient/`#[serde(skip)]`)
 - Added `test_project_file_roundtrip_full_data` test that catches any future `#[serde(skip)]` regressions
 
 ### Phase 1: Core — .zpf File Format with Semver Versioning
+
 - Added `semver` to workspace and `zeditor-core` dependencies
 - Created `ProjectFile` envelope struct with `version: String` + `project: Project`
 - Added `CURRENT_PROJECT_VERSION = "1.0.0"` and `MIN_PROJECT_VERSION = "1.0.0"` constants
@@ -35,6 +38,7 @@ We now want the ability to save and load projects.
 - Future migration hook: can match on `file_version.major` to transform raw JSON before final deserialization
 
 ### Phase 2: Core Tests
+
 - Updated existing `test_project_save_load` to use `.zpf` extension
 - Added `test_project_file_contains_version` — verifies version field in saved JSON
 - Added `test_project_file_version_too_new` — version "99.0.0" → `VersionTooNew` error
@@ -43,6 +47,7 @@ We now want the ability to save and load projects.
 - Added `test_project_file_roundtrip_full_data` — full save/load with clips, assets, multiple tracks
 
 ### Phase 3: UI State + Messages
+
 - Added `project_path: Option<PathBuf>` field to `App` (None = unsaved, Some = saved/loaded)
 - Added `App::title()` method: `"{name} - Zeditor"`
 - Added `App::reset_ui_state()` helper: clears playback, decode, drag, thumbnails, zoom/scroll/tool
@@ -51,6 +56,7 @@ We now want the ability to save and load projects.
 - Updated `main.rs` to use `.title(App::title)` for dynamic window title
 
 ### Phase 4: Handler Wiring
+
 - **SaveProject**: If `project_path.is_some()` → save directly. If None → open save dialog via `rfd::AsyncFileDialog`
 - **SaveFileDialogResult(Some)**: Ensures `.zpf` extension, derives project name from filename stem, saves
 - **SaveFileDialogResult(None)**: "Save cancelled" status
@@ -61,11 +67,13 @@ We now want the ability to save and load projects.
 - Added `tempfile` and `serde_json` to zeditor-ui dev-dependencies
 
 ### Phase 5: UI Tests
+
 - **Message tests** (15 new): save with/without path, dialog result some/none, extension enforcement, load replaces state, load sets path, load invalid file error, load version too new, new project resets, load clears playback, dialog result forwarding, title reflects name, save-then-save-again no dialog
 - **Simulator tests** (3 new): file menu shows load project, window title reflects name, title updates after name change
 - Updated `test_menu_unimplemented_actions` → split into `test_menu_new_project_dispatches` and `test_menu_save_dispatches`
 
 ### Test Summary
+
 - Total workspace tests: **204** (was ~188 before)
 - All passing on `cargo test --workspace`
 - New tests cover: versioned file format, version validation errors, round-trip data integrity, save/load/new UI workflows, title updates
