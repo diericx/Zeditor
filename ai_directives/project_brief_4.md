@@ -2,6 +2,8 @@
 
 The timeline is now playing back video well and clips can be moved around. Lets refine it a bit.
 
+REMEMBER: Write tests for as much of this as you can, even the playback bugs.
+
 - Scrolling alone in the timeline should move left and right
 - Scrolling while holding left-alt should zoom in and out
 - Do not let me drag a clip to the left of the 0 time mark
@@ -11,3 +13,5 @@ The timeline is now playing back video well and clips can be moved around. Lets 
   - IT should continue playback but show black
 - BUG: When the playback cursor reaches the end of a clip and there IS a clip after it, it simply stop on the last frame of the ended clip
   - It should transition into playing the next clip
+- BUG: clicking to move the playback cursor WHILE playing freezes video on the current frame, but playback cursor and timer keep moving where they were without moving the cursor to where I just clicked
+  - It should pause playback, move the cursor to the clicked location and show that frame on screen and stay paused allowing me to play from there if I want.
