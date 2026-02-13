@@ -335,6 +335,133 @@ fn test_add_clip_trims_right_overlap() {
 }
 
 #[test]
+fn test_add_clip_splits_spanning_clip() {
+    let mut timeline = Timeline::new();
+    timeline.add_track("Video 1");
+
+    let asset_id = Uuid::new_v4();
+    // Existing clip [0, 20) with source [0, 20)
+    timeline
+        .add_clip(0, make_clip(asset_id, 0.0, 20.0))
+        .unwrap();
+
+    // New clip [5, 10) — should split existing into [0,5) and [10,20)
+    timeline
+        .add_clip_trimming_overlaps(0, make_clip(asset_id, 5.0, 5.0))
+        .unwrap();
+
+    assert_eq!(timeline.tracks[0].clips.len(), 3);
+
+    let left = &timeline.tracks[0].clips[0];
+    assert_eq!(left.timeline_range.start, TimelinePosition::from_secs_f64(0.0));
+    assert_eq!(left.timeline_range.end, TimelinePosition::from_secs_f64(5.0));
+    let left_src_dur = left.source_range.end.as_secs_f64() - left.source_range.start.as_secs_f64();
+    assert!((left_src_dur - 5.0).abs() < 0.001);
+
+    let middle = &timeline.tracks[0].clips[1];
+    assert_eq!(middle.timeline_range.start, TimelinePosition::from_secs_f64(5.0));
+    assert_eq!(middle.timeline_range.end, TimelinePosition::from_secs_f64(10.0));
+
+    let right = &timeline.tracks[0].clips[2];
+    assert_eq!(right.timeline_range.start, TimelinePosition::from_secs_f64(10.0));
+    assert_eq!(right.timeline_range.end, TimelinePosition::from_secs_f64(20.0));
+    // Right piece source should start at 10s into the original
+    let right_src_start = right.source_range.start.as_secs_f64();
+    assert!((right_src_start - 10.0).abs() < 0.001);
+    let right_src_end = right.source_range.end.as_secs_f64();
+    assert!((right_src_end - 20.0).abs() < 0.001);
+}
+
+#[test]
+fn test_move_clip_trims_overlap() {
+    let mut timeline = Timeline::new();
+    timeline.add_track("Video 1");
+
+    let asset_id = Uuid::new_v4();
+    // Clip A [0, 5), Clip B [5, 15)
+    let clip_a = make_clip(asset_id, 0.0, 5.0);
+    let clip_a_id = clip_a.id;
+    timeline.add_clip(0, clip_a).unwrap();
+    timeline
+        .add_clip(0, make_clip(asset_id, 5.0, 10.0))
+        .unwrap();
+
+    // Move A to [3, 8) — overlaps B → should trim B's left side
+    timeline
+        .move_clip(0, clip_a_id, 0, TimelinePosition::from_secs_f64(3.0))
+        .unwrap();
+
+    assert_eq!(timeline.tracks[0].clips.len(), 2);
+    let moved = timeline.tracks[0].get_clip(clip_a_id).unwrap();
+    assert_eq!(moved.timeline_range.start, TimelinePosition::from_secs_f64(3.0));
+    assert_eq!(moved.timeline_range.end, TimelinePosition::from_secs_f64(8.0));
+
+    // B should be trimmed to [8, 15)
+    let b = &timeline.tracks[0].clips[1];
+    assert_eq!(b.timeline_range.start, TimelinePosition::from_secs_f64(8.0));
+    assert_eq!(b.timeline_range.end, TimelinePosition::from_secs_f64(15.0));
+}
+
+#[test]
+fn test_move_clip_splits_target() {
+    let mut timeline = Timeline::new();
+    timeline.add_track("Video 1");
+
+    let asset_id = Uuid::new_v4();
+    // Clip A [0, 3) (small), Clip B [5, 20) (big)
+    let clip_a = make_clip(asset_id, 0.0, 3.0);
+    let clip_a_id = clip_a.id;
+    timeline.add_clip(0, clip_a).unwrap();
+    timeline
+        .add_clip(0, make_clip(asset_id, 5.0, 15.0))
+        .unwrap();
+
+    // Move A into the middle of B → [10, 13). Should split B into [5,10) and [13,20)
+    timeline
+        .move_clip(0, clip_a_id, 0, TimelinePosition::from_secs_f64(10.0))
+        .unwrap();
+
+    assert_eq!(timeline.tracks[0].clips.len(), 3);
+
+    let b_left = &timeline.tracks[0].clips[0];
+    assert_eq!(b_left.timeline_range.start, TimelinePosition::from_secs_f64(5.0));
+    assert_eq!(b_left.timeline_range.end, TimelinePosition::from_secs_f64(10.0));
+
+    let moved = timeline.tracks[0].get_clip(clip_a_id).unwrap();
+    assert_eq!(moved.timeline_range.start, TimelinePosition::from_secs_f64(10.0));
+    assert_eq!(moved.timeline_range.end, TimelinePosition::from_secs_f64(13.0));
+
+    let b_right = &timeline.tracks[0].clips[2];
+    assert_eq!(b_right.timeline_range.start, TimelinePosition::from_secs_f64(13.0));
+    assert_eq!(b_right.timeline_range.end, TimelinePosition::from_secs_f64(20.0));
+}
+
+#[test]
+fn test_move_clip_engulfs_smaller() {
+    let mut timeline = Timeline::new();
+    timeline.add_track("Video 1");
+
+    let asset_id = Uuid::new_v4();
+    // Clip A [0, 10) (big), Clip B [15, 18) (small)
+    let clip_a = make_clip(asset_id, 0.0, 10.0);
+    let clip_a_id = clip_a.id;
+    timeline.add_clip(0, clip_a).unwrap();
+    timeline
+        .add_clip(0, make_clip(asset_id, 15.0, 3.0))
+        .unwrap();
+
+    // Move A to [14, 24) — fully covers B → B should be removed
+    timeline
+        .move_clip(0, clip_a_id, 0, TimelinePosition::from_secs_f64(14.0))
+        .unwrap();
+
+    assert_eq!(timeline.tracks[0].clips.len(), 1);
+    let moved = timeline.tracks[0].get_clip(clip_a_id).unwrap();
+    assert_eq!(moved.timeline_range.start, TimelinePosition::from_secs_f64(14.0));
+    assert_eq!(moved.timeline_range.end, TimelinePosition::from_secs_f64(24.0));
+}
+
+#[test]
 fn test_time_range_overlaps() {
     let a = TimeRange::new(
         TimelinePosition::from_secs_f64(0.0),
