@@ -53,6 +53,30 @@ fn test_decode_fixture_frames() {
     assert_eq!(frame.data.len(), (320 * 240 * 3) as usize);
 }
 
+/// Test the full decode pipeline: generate video → decode frame → convert to RGBA.
+#[test]
+fn test_decode_frame_from_fixture_video() {
+    let dir = fixtures::fixture_dir();
+    let video_path = fixtures::generate_test_video(dir.path(), "decode_rgba_test", 1.0);
+
+    let mut decoder =
+        zeditor_media::decoder::FfmpegDecoder::open(&video_path).unwrap();
+    let frame = decoder.decode_next_frame().unwrap().unwrap();
+
+    // Convert RGB24 to RGBA32
+    let rgba = zeditor_ui::app::rgb24_to_rgba32(&frame.data, frame.width, frame.height);
+    assert_eq!(
+        rgba.len(),
+        (frame.width * frame.height * 4) as usize,
+        "RGBA should be 4 bytes per pixel"
+    );
+
+    // Every 4th byte should be 255 (alpha)
+    for i in (3..rgba.len()).step_by(4) {
+        assert_eq!(rgba[i], 255, "Alpha channel should be 255");
+    }
+}
+
 /// Test that builder-created assets work with the UI.
 #[test]
 fn test_builder_to_ui() {

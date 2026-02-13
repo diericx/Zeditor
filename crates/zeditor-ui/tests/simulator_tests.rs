@@ -26,10 +26,10 @@ fn test_view_renders_source_library() {
     let app = App::new();
     let mut ui = simulator(app.view());
 
-    // The view should contain these text elements.
-    assert!(ui.find("Source Library").is_ok(), "Should show 'Source Library'");
-    assert!(ui.find("Timeline").is_ok(), "Should show 'Timeline'");
-    assert!(ui.find("Playback").is_ok(), "Should show 'Playback'");
+    assert!(
+        ui.find("Source Library").is_ok(),
+        "Should show 'Source Library'"
+    );
 }
 
 #[test]
@@ -53,7 +53,6 @@ fn test_click_play_produces_message() {
     let messages: Vec<Message> = ui.into_messages().collect();
     assert_eq!(messages.len(), 1);
 
-    // Apply the message and check state.
     for msg in messages {
         app.update(msg);
     }
@@ -68,7 +67,6 @@ fn test_click_pause_when_playing() {
 
     let mut ui = simulator(app.view());
 
-    // When playing, should show "Pause" button.
     assert!(
         ui.find("Pause").is_ok(),
         "Should show 'Pause' button when playing"
@@ -85,7 +83,6 @@ fn test_click_pause_when_playing() {
 fn test_click_undo_redo_buttons() {
     let mut app = App::new();
 
-    // Add an asset and a clip so there's something to undo.
     let asset = make_test_asset("clip1", 5.0);
     let asset_id = asset.id;
     app.update(Message::MediaImported(Ok(asset)));
@@ -122,33 +119,9 @@ fn test_view_shows_imported_assets() {
 
     let mut ui = simulator(app.view());
 
-    // The view should display the asset name.
     assert!(
         ui.find("my_video").is_ok(),
         "Should display imported asset name"
-    );
-}
-
-#[test]
-fn test_view_shows_track_clip_count() {
-    let mut app = App::new();
-
-    let asset = make_test_asset("clip1", 5.0);
-    let asset_id = asset.id;
-    app.update(Message::MediaImported(Ok(asset)));
-
-    app.update(Message::AddClipToTimeline {
-        asset_id,
-        track_index: 0,
-        position: TimelinePosition::zero(),
-    });
-
-    let mut ui = simulator(app.view());
-
-    // Track display should show "1 clips".
-    assert!(
-        ui.find("Track 0: 1 clips").is_ok(),
-        "Should show track with 1 clip"
     );
 }
 
@@ -159,7 +132,6 @@ fn test_click_add_to_timeline_button() {
     let asset = make_test_asset("intro", 5.0);
     app.update(Message::MediaImported(Ok(asset)));
 
-    // Click "Add to Timeline" button via simulator.
     let mut ui = simulator(app.view());
     let _ = ui.click("Add to Timeline");
 
@@ -177,10 +149,91 @@ fn test_view_shows_status_message() {
     app.status_message = "Test status".into();
 
     let mut ui = simulator(app.view());
+    // Status bar now contains combined info: "Test status | 00:00:00.000 | Zoom: 100% | Stopped"
     assert!(
-        ui.find("Test status").is_ok(),
-        "Should display status message"
+        ui.find("Test status | 00:00:00.000 | Zoom: 100% | Stopped")
+            .is_ok(),
+        "Should display status bar with message"
     );
+}
+
+#[test]
+fn test_view_renders_with_canvas() {
+    // Just verify the view doesn't panic when rendering with canvas timeline
+    let mut app = App::new();
+    let asset = make_test_asset("clip1", 5.0);
+    let asset_id = asset.id;
+    app.update(Message::MediaImported(Ok(asset)));
+    app.update(Message::AddClipToTimeline {
+        asset_id,
+        track_index: 0,
+        position: TimelinePosition::zero(),
+    });
+
+    let _ui = simulator(app.view());
+}
+
+#[test]
+fn test_view_shows_no_video_placeholder() {
+    let app = App::new();
+    let mut ui = simulator(app.view());
+
+    assert!(
+        ui.find("No video").is_ok(),
+        "Should show 'No video' placeholder"
+    );
+}
+
+#[test]
+fn test_three_panel_layout_renders() {
+    let app = App::new();
+    let mut ui = simulator(app.view());
+
+    // Source panel
+    assert!(ui.find("Source Library").is_ok());
+    // Video viewport
+    assert!(ui.find("No video").is_ok());
+    // Controls (Undo/Redo visible)
+    assert!(ui.find("Undo").is_ok());
+    assert!(ui.find("Redo").is_ok());
+}
+
+#[test]
+fn test_click_import_button() {
+    let mut app = App::new();
+    let mut ui = simulator(app.view());
+
+    let _ = ui.click("Import");
+
+    let messages: Vec<Message> = ui.into_messages().collect();
+    assert_eq!(messages.len(), 1);
+
+    for msg in messages {
+        app.update(msg);
+    }
+    assert_eq!(app.status_message, "Opening file dialog...");
+}
+
+#[test]
+fn test_select_asset_shows_highlight() {
+    let mut app = App::new();
+    let asset = make_test_asset("my_clip", 5.0);
+    let asset_id = asset.id;
+    app.update(Message::MediaImported(Ok(asset)));
+
+    // Before selection: "Select" button visible
+    {
+        let mut ui = simulator(app.view());
+        assert!(ui.find("Select").is_ok());
+    }
+
+    // Select the asset
+    app.update(Message::SelectSourceAsset(Some(asset_id)));
+
+    // After selection: "Selected" button visible + placement hint
+    let mut ui = simulator(app.view());
+    assert!(ui.find("Selected").is_ok());
+    assert!(ui.find("Click timeline to place clip").is_ok());
 }
 
 #[test]
@@ -198,7 +251,6 @@ fn test_full_simulator_workflow() {
         app.update(msg);
     }
 
-    // Verify clip was added.
     assert_eq!(app.project.timeline.tracks[0].clips.len(), 1);
 
     // Click "Play" via simulator.

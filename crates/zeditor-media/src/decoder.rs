@@ -38,6 +38,7 @@ pub struct FfmpegDecoder {
     input_ctx: rsmpeg::avformat::AVFormatContextInput,
     decode_ctx: rsmpeg::avcodec::AVCodecContext,
     sws_ctx: Option<rsmpeg::swscale::SwsContext>,
+    sws_dst_dims: (i32, i32),
     video_stream_index: usize,
     stream_info: StreamInfo,
 }
@@ -116,6 +117,7 @@ impl VideoDecoder for FfmpegDecoder {
             input_ctx,
             decode_ctx,
             sws_ctx: None,
+            sws_dst_dims: (0, 0),
             video_stream_index,
             stream_info,
         })
@@ -178,37 +180,115 @@ impl VideoDecoder for FfmpegDecoder {
 }
 
 impl FfmpegDecoder {
-    fn frame_to_rgb(&mut self, frame: &rsmpeg::avutil::AVFrame) -> Result<VideoFrame> {
-        let width = frame.width as u32;
-        let height = frame.height as u32;
+    /// Decode the next frame, scaling to the given max dimensions for preview.
+    /// Maintains aspect ratio. If max_width/max_height are 0, uses original size.
+    pub fn decode_next_frame_scaled(
+        &mut self,
+        max_width: u32,
+        max_height: u32,
+    ) -> Result<Option<VideoFrame>> {
+        loop {
+            match self.input_ctx.read_packet() {
+                Ok(Some(packet)) => {
+                    if packet.stream_index as usize != self.video_stream_index {
+                        continue;
+                    }
+                    self.decode_ctx.send_packet(Some(&packet)).map_err(|e| {
+                        crate::error::MediaError::DecoderError(format!("send_packet: {e}"))
+                    })?;
 
-        let sws = self.sws_ctx.get_or_insert_with(|| {
-            rsmpeg::swscale::SwsContext::get_context(
-                frame.width,
-                frame.height,
-                frame.format,
-                frame.width,
-                frame.height,
-                rsmpeg::ffi::AV_PIX_FMT_RGB24,
-                rsmpeg::ffi::SWS_FAST_BILINEAR,
-                None,
-                None,
-                None,
-            )
-            .expect("failed to create sws context")
-        });
+                    match self.decode_ctx.receive_frame() {
+                        Ok(frame) => {
+                            return Ok(Some(self.frame_to_rgb_scaled(&frame, max_width, max_height)?));
+                        }
+                        Err(_) => continue,
+                    }
+                }
+                Ok(None) => {
+                    self.decode_ctx.send_packet(None).ok();
+                    match self.decode_ctx.receive_frame() {
+                        Ok(frame) => {
+                            return Ok(Some(self.frame_to_rgb_scaled(&frame, max_width, max_height)?))
+                        }
+                        Err(_) => return Ok(None),
+                    }
+                }
+                Err(e) => {
+                    return Err(crate::error::MediaError::DecoderError(format!(
+                        "read_packet: {e}"
+                    )));
+                }
+            }
+        }
+    }
+
+    fn frame_to_rgb(&mut self, frame: &rsmpeg::avutil::AVFrame) -> Result<VideoFrame> {
+        self.frame_to_rgb_scaled(frame, 0, 0)
+    }
+
+    fn frame_to_rgb_scaled(
+        &mut self,
+        frame: &rsmpeg::avutil::AVFrame,
+        max_width: u32,
+        max_height: u32,
+    ) -> Result<VideoFrame> {
+        let src_w = frame.width;
+        let src_h = frame.height;
+
+        // Calculate output dimensions
+        let (dst_w, dst_h) = if max_width > 0 && max_height > 0
+            && (src_w as u32 > max_width || src_h as u32 > max_height)
+        {
+            let scale_w = max_width as f64 / src_w as f64;
+            let scale_h = max_height as f64 / src_h as f64;
+            let scale = scale_w.min(scale_h);
+            let w = ((src_w as f64 * scale) as i32).max(2) & !1; // ensure even
+            let h = ((src_h as f64 * scale) as i32).max(2) & !1;
+            (w, h)
+        } else {
+            (src_w, src_h)
+        };
+
+        // Recreate SWS context if output dimensions changed
+        let need_new_sws = self.sws_ctx.is_none()
+            || self.sws_dst_dims != (dst_w, dst_h);
+
+        if need_new_sws {
+            self.sws_ctx = Some(
+                rsmpeg::swscale::SwsContext::get_context(
+                    src_w,
+                    src_h,
+                    frame.format,
+                    dst_w,
+                    dst_h,
+                    rsmpeg::ffi::AV_PIX_FMT_RGB24,
+                    rsmpeg::ffi::SWS_FAST_BILINEAR,
+                    None,
+                    None,
+                    None,
+                )
+                .ok_or_else(|| {
+                    crate::error::MediaError::DecoderError("failed to create sws context".into())
+                })?,
+            );
+            self.sws_dst_dims = (dst_w, dst_h);
+        }
+
+        let sws = self.sws_ctx.as_mut().unwrap();
 
         let mut dst_frame = rsmpeg::avutil::AVFrame::new();
-        dst_frame.set_width(frame.width);
-        dst_frame.set_height(frame.height);
+        dst_frame.set_width(dst_w);
+        dst_frame.set_height(dst_h);
         dst_frame.set_format(rsmpeg::ffi::AV_PIX_FMT_RGB24);
         dst_frame
             .alloc_buffer()
             .map_err(|e| crate::error::MediaError::DecoderError(format!("alloc_buffer: {e}")))?;
 
-        sws.scale_frame(frame, 0, frame.height, &mut dst_frame)
+        sws.scale_frame(frame, 0, src_h, &mut dst_frame)
             .map_err(|e| crate::error::MediaError::DecoderError(format!("scale_frame: {e}")))?;
 
+        let width = dst_w as u32;
+        let height = dst_h as u32;
         let data_size = (width * height * 3) as usize;
         let data = unsafe {
             std::slice::from_raw_parts(dst_frame.data[0] as *const u8, data_size).to_vec()

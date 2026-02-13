@@ -9,6 +9,9 @@ pub enum Message {
     ImportMedia(PathBuf),
     MediaImported(Result<zeditor_core::media::MediaAsset, String>),
     RemoveAsset(Uuid),
+    OpenFileDialog,
+    FileDialogResult(Vec<PathBuf>),
+    SelectSourceAsset(Option<Uuid>),
 
     // Timeline
     AddClipToTimeline {
@@ -31,11 +34,27 @@ pub enum Message {
         clip_id: Uuid,
         new_end: TimelinePosition,
     },
+    TimelineClickEmpty(TimelinePosition),
+    PlaceSelectedClip {
+        asset_id: Uuid,
+        track_index: usize,
+        position: TimelinePosition,
+    },
+
+    // Timeline view
+    TimelineZoom { delta: f32, cursor_secs: f64 },
+    TimelineScroll(f32),
 
     // Playback
     Play,
     Pause,
     SeekTo(TimelinePosition),
+    TogglePlayback,
+    PlaybackTick,
+    FrameDecoded(Result<(Vec<u8>, u32, u32), String>),
+
+    // Keyboard
+    KeyboardEvent(iced::keyboard::Event),
 
     // Project
     Undo,
