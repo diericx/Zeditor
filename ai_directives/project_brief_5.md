@@ -12,6 +12,7 @@
 ## Implementation Log
 
 ### Completed
+
 1. **ToolMode enum** — Added `ToolMode` (Arrow/Blade) to `message.rs` with Default derive
 2. **App tool_mode field** — Added `tool_mode` to `App` struct, A/B keyboard handling, passed to canvas
 3. **Blade mode behavior** — Click on clip body in Blade mode emits `CutClip`; cursor tracking in state; orange vertical line drawn over clips; crosshair cursor in blade mode
