@@ -184,7 +184,7 @@ impl App {
                     async move {
                         let result =
                             zeditor_media::thumbnail::generate_thumbnail_rgba_scaled(
-                                &path, 160, 90,
+                                &path, 160, 160,
                             )
                             .map(|frame| (frame.data, frame.width, frame.height))
                             .map_err(|e| format!("{e}"));
@@ -298,7 +298,7 @@ impl App {
                         return Task::perform(
                             async move {
                                 let result = zeditor_media::thumbnail::generate_thumbnail_rgba_scaled(
-                                    &path, 160, 90,
+                                    &path, 160, 160,
                                 )
                                 .map(|frame| (frame.data, frame.width, frame.height))
                                 .map_err(|e| format!("{e}"));
@@ -1195,7 +1195,7 @@ impl App {
             image(handle.clone())
                 .width(120)
                 .height(68)
-                .content_fit(iced::ContentFit::Cover)
+                .content_fit(iced::ContentFit::Contain)
                 .into()
         } else {
             container(center(text("...").size(14).color(Color::from_rgb(0.5, 0.5, 0.5))))
@@ -1503,7 +1503,7 @@ impl App {
             image(handle)
                 .width(120)
                 .height(68)
-                .content_fit(iced::ContentFit::Cover)
+                .content_fit(iced::ContentFit::Contain)
                 .opacity(ghost_alpha)
                 .into()
         } else {
