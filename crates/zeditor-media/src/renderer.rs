@@ -312,23 +312,31 @@ fn encode_video_frames(
         let timeline_time = frame_idx as f64 / config.fps;
         let pos = TimelinePosition::from_secs_f64(timeline_time);
 
-        let clip_info = find_video_clip_at(timeline, source_library, pos);
+        let all_clips = find_all_video_clips_at(timeline, source_library, pos);
 
-        let yuv_frame = if let Some((source_path, source_time, clip_effects)) = clip_info {
-            let transform = effects::resolve_transform(&clip_effects);
-            decode_and_convert_video_frame(
-                &source_path,
-                source_time,
-                width,
-                height,
-                canvas_w,
-                canvas_h,
-                video_decoders,
-                config.scaling.to_sws_flags(),
-                &transform,
-            )?
-        } else {
+        let yuv_frame = if all_clips.is_empty() {
             create_black_yuv_frame(width, height)?
+        } else {
+            // Create a black canvas, then composite each clip bottom-to-top
+            let mut canvas = create_black_yuv_frame(width, height)?;
+            for (source_path, source_time, clip_effects) in &all_clips {
+                let transform = effects::resolve_transform(clip_effects);
+                let clip_frame = decode_and_scale_clip(
+                    source_path,
+                    *source_time,
+                    width,
+                    height,
+                    canvas_w,
+                    canvas_h,
+                    video_decoders,
+                    config.scaling.to_sws_flags(),
+                    &transform,
+                )?;
+                if let Some((scaled_frame, layout)) = clip_frame {
+                    blit_yuv_frame(&scaled_frame, &mut canvas, layout.clip_x, layout.clip_y);
+                }
+            }
+            canvas
         };
 
         let mut frame = yuv_frame;
@@ -349,6 +357,7 @@ fn encode_video_frames(
 ///
 /// The source is scaled to fit within the project canvas (preserving aspect ratio),
 /// centered, then the canvas is mapped onto the render output.
+#[allow(dead_code)]
 fn decode_and_convert_video_frame(
     source_path: &Path,
     source_time: f64,
@@ -360,6 +369,33 @@ fn decode_and_convert_video_frame(
     sws_flags: ffi::SwsFlags,
     transform: &ResolvedTransform,
 ) -> Result<AVFrame> {
+    let clip_frame = decode_and_scale_clip(
+        source_path, source_time, render_w, render_h, canvas_w, canvas_h,
+        decoders, sws_flags, transform,
+    )?;
+    match clip_frame {
+        Some((scaled_frame, layout)) => {
+            let mut canvas = create_black_yuv_frame(render_w, render_h)?;
+            blit_yuv_frame(&scaled_frame, &mut canvas, layout.clip_x, layout.clip_y);
+            Ok(canvas)
+        }
+        None => create_black_yuv_frame(render_w, render_h),
+    }
+}
+
+/// Decode and scale a video frame from source, returning the scaled/rotated frame
+/// and its canvas layout. Returns None if no frame is available (EOF).
+fn decode_and_scale_clip(
+    source_path: &Path,
+    source_time: f64,
+    render_w: i32,
+    render_h: i32,
+    canvas_w: u32,
+    canvas_h: u32,
+    decoders: &mut HashMap<PathBuf, CachedVideoDecoder>,
+    sws_flags: ffi::SwsFlags,
+    transform: &ResolvedTransform,
+) -> Result<Option<(AVFrame, CanvasLayout)>> {
     let path_key = source_path.to_path_buf();
 
     // Open or reuse decoder
@@ -459,22 +495,20 @@ fn decode_and_convert_video_frame(
 
                     let sws = cached.sws_ctx.as_mut().unwrap();
 
-                    return compose_clip_onto_canvas_rotated(
+                    let scaled_frame = scale_and_rotate_clip(
                         &raw_frame,
-                        &layout,
-                        render_w,
-                        render_h,
                         sws,
                         src_h,
                         scale_target_w,
                         scale_target_h,
                         rotation,
-                    );
+                    )?;
+                    return Ok(Some((scaled_frame, layout)));
                 }
                 // Otherwise skip (seeking landed before target)
             }
             None => {
-                return create_black_yuv_frame(render_w, render_h);
+                return Ok(None);
             }
         }
     }
@@ -810,7 +844,7 @@ fn convert_audio_frame(
 
 /// Write decoded samples into the output buffer at the correct position.
 /// Returns the number of f32 values written.
-fn write_samples_to_buffer(
+pub fn write_samples_to_buffer(
     samples: &[f32],
     output_buffer: &mut [f32],
     clip_start_sample: usize,
@@ -823,13 +857,15 @@ fn write_samples_to_buffer(
     let to_write = samples.len().min(remaining);
 
     if buf_offset + to_write <= output_buffer.len() {
-        output_buffer[buf_offset..buf_offset + to_write]
-            .copy_from_slice(&samples[..to_write]);
+        for i in 0..to_write {
+            output_buffer[buf_offset + i] = (output_buffer[buf_offset + i] + samples[i]).clamp(-1.0, 1.0);
+        }
     } else if buf_offset < output_buffer.len() {
         let avail = output_buffer.len() - buf_offset;
         let actual = to_write.min(avail);
-        output_buffer[buf_offset..buf_offset + actual]
-            .copy_from_slice(&samples[..actual]);
+        for i in 0..actual {
+            output_buffer[buf_offset + i] = (output_buffer[buf_offset + i] + samples[i]).clamp(-1.0, 1.0);
+        }
         return actual;
     }
 
@@ -906,12 +942,46 @@ pub fn compute_canvas_layout(
     }
 }
 
+/// Scale and rotate a decoded source frame, returning the final YUV420P frame.
+///
+/// 1. SWS-scale source to `(scale_w, scale_h)` in YUV420P (pre-rotation dimensions)
+/// 2. If rotation != 0, rotate Y/U/V planes
+fn scale_and_rotate_clip(
+    raw_frame: &AVFrame,
+    sws_ctx: &mut SwsContext,
+    src_h: i32,
+    scale_w: i32,
+    scale_h: i32,
+    rotation: u32,
+) -> Result<AVFrame> {
+    // Scale source to pre-rotation dimensions
+    let mut scaled = AVFrame::new();
+    scaled.set_width(scale_w);
+    scaled.set_height(scale_h);
+    scaled.set_format(ffi::AV_PIX_FMT_YUV420P);
+    scaled.alloc_buffer().map_err(|e| {
+        MediaError::EncoderError(format!("alloc scaled frame: {e}"))
+    })?;
+
+    sws_ctx
+        .scale_frame(raw_frame, 0, src_h, &mut scaled)
+        .map_err(|e| MediaError::EncoderError(format!("scale_frame: {e}")))?;
+
+    // Apply rotation to the scaled frame
+    if rotation != 0 {
+        rotate_yuv420p_frame(&scaled, rotation)
+    } else {
+        Ok(scaled)
+    }
+}
+
 /// Compose a decoded source frame onto a black canvas, with optional rotation.
 ///
 /// 1. SWS-scale source to `(scale_w, scale_h)` in YUV420P (pre-rotation dimensions)
 /// 2. If rotation != 0, rotate Y/U/V planes
 /// 3. Create a black frame at `(render_w, render_h)`
 /// 4. Blit the rotated clip onto the canvas at `(layout.clip_x, layout.clip_y)`
+#[allow(dead_code)]
 fn compose_clip_onto_canvas_rotated(
     raw_frame: &AVFrame,
     layout: &CanvasLayout,
@@ -1107,6 +1177,7 @@ fn blit_yuv_frame(src: &AVFrame, dst: &mut AVFrame, offset_x: i32, offset_y: i32
 }
 
 /// Find the video clip at a timeline position and return (source_path, source_time, effects).
+#[allow(dead_code)]
 fn find_video_clip_at(
     timeline: &Timeline,
     source_library: &SourceLibrary,
@@ -1124,6 +1195,34 @@ fn find_video_clip_at(
         }
     }
     None
+}
+
+/// Find ALL video clips at a timeline position, ordered bottom-to-top (V1 first, VN last).
+///
+/// Video tracks are stored top-to-bottom in the vec (VN...V1), so we collect
+/// in reverse order to get V1 (bottom) first and VN (top) last.
+fn find_all_video_clips_at(
+    timeline: &Timeline,
+    source_library: &SourceLibrary,
+    pos: TimelinePosition,
+) -> Vec<(PathBuf, f64, Vec<EffectInstance>)> {
+    let mut clips: Vec<(PathBuf, f64, Vec<EffectInstance>)> = Vec::new();
+    // Iterate video tracks: in the vec, index 0 is the topmost video track
+    // We want bottom-to-top ordering, so collect in reverse
+    let video_tracks: Vec<_> = timeline.tracks.iter()
+        .filter(|t| t.track_type == TrackType::Video)
+        .collect();
+
+    for track in video_tracks.iter().rev() {
+        if let Some(clip) = track.clip_at(pos) {
+            if let Some(asset) = source_library.get(clip.asset_id) {
+                let source_time = clip.source_range.start.as_secs_f64()
+                    + (pos.as_secs_f64() - clip.timeline_range.start.as_secs_f64());
+                clips.push((asset.path.clone(), source_time, clip.effects.clone()));
+            }
+        }
+    }
+    clips
 }
 
 /// Find the audio clip at a timeline position and return (source_path, source_time).

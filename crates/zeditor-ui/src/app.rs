@@ -20,23 +20,38 @@ use crate::widgets::timeline_canvas::TimelineCanvas;
 const PREVIEW_MAX_WIDTH: u32 = 960;
 const PREVIEW_MAX_HEIGHT: u32 = 540;
 
+/// Info about a single clip to decode for multi-clip compositing.
+#[derive(Clone, Debug)]
+struct ClipDecodeInfo {
+    path: PathBuf,
+    time: f64,
+    transform: zeditor_core::effects::ResolvedTransform,
+}
+
 /// Request sent from UI to the decode thread.
 enum DecodeRequest {
-    /// Seek to time. If `continuous` is true, keep decoding (playback).
-    /// If false, decode one target frame and stop (scrub).
-    Seek {
-        path: PathBuf,
-        time: f64,
+    /// Seek multiple clips for compositing. Clips are ordered bottom-to-top (V1 first).
+    SeekMulti {
+        clips: Vec<ClipDecodeInfo>,
         continuous: bool,
+        canvas_w: u32,
+        canvas_h: u32,
     },
     Stop,
 }
 
+/// Info about a single audio clip to decode for multi-clip mixing.
+#[derive(Clone, Debug)]
+struct AudioClipInfo {
+    path: PathBuf,
+    time: f64,
+}
+
 /// Request sent from UI to the audio decode thread.
 enum AudioDecodeRequest {
-    Seek {
-        path: PathBuf,
-        time: f64,
+    /// Decode and mix multiple audio clips simultaneously.
+    SeekMulti {
+        clips: Vec<AudioClipInfo>,
         continuous: bool,
     },
     Stop,
@@ -84,6 +99,8 @@ pub struct App {
     decode_tx: Option<mpsc::Sender<DecodeRequest>>,
     pub(crate) decode_rx: Option<mpsc::Receiver<DecodedFrame>>,
     pub(crate) decode_clip_id: Option<Uuid>,
+    /// IDs of all video clips currently being decoded (for multi-track change detection).
+    decode_clip_ids: Vec<Uuid>,
     /// Offset to convert source PTS → timeline time: timeline_time = pts + offset.
     pub(crate) decode_time_offset: f64,
     /// Frame received from decode thread but not yet displayed (PTS ahead of playback).
@@ -125,6 +142,7 @@ impl Default for App {
             decode_tx: None,
             decode_rx: None,
             decode_clip_id: None,
+            decode_clip_ids: Vec::new(),
             decode_time_offset: 0.0,
             pending_frame: None,
             drain_stale: false,
@@ -168,6 +186,7 @@ impl App {
         self.tool_mode = ToolMode::default();
         self.open_menu = None;
         self.decode_clip_id = None;
+        self.decode_clip_ids.clear();
         self.decode_time_offset = 0.0;
         self.pending_frame = None;
         self.drain_stale = false;
@@ -727,10 +746,11 @@ impl App {
                             new_pos as f32 * self.timeline_zoom - visible_width * 0.5;
                     }
 
-                    // Check if we've crossed into a different video clip
-                    let current_clip_id =
-                        self.clip_at_position(self.playback_position).map(|(_, c)| c.id);
-                    if current_clip_id != self.decode_clip_id {
+                    // Check if we've crossed into a different set of video clips
+                    let current_clip_ids: Vec<Uuid> =
+                        self.all_video_clips_at_position(self.playback_position)
+                            .iter().map(|(_, c)| c.id).collect();
+                    if current_clip_ids != self.decode_clip_ids {
                         self.send_decode_seek(true);
                         self.drain_stale = true;
                     }
@@ -2108,6 +2128,34 @@ impl App {
         None
     }
 
+    /// Find ALL video clips at the given playback position, ordered bottom-to-top (V1 first, VN last).
+    /// Video tracks are stored top-to-bottom in the vec (VN...V1), so we iterate in reverse.
+    pub fn all_video_clips_at_position(&self, pos: TimelinePosition) -> Vec<(usize, &Clip)> {
+        let mut clips = Vec::new();
+        let video_tracks: Vec<_> = self.project.timeline.tracks.iter().enumerate()
+            .filter(|(_, t)| t.track_type == TrackType::Video)
+            .collect();
+        for (i, track) in video_tracks.iter().rev() {
+            if let Some(clip) = track.clip_at(pos) {
+                clips.push((*i, clip));
+            }
+        }
+        clips
+    }
+
+    /// Find ALL audio clips at the given playback position, from all audio tracks.
+    pub fn all_audio_clips_at_position(&self, pos: TimelinePosition) -> Vec<(usize, &Clip)> {
+        let mut clips = Vec::new();
+        for (i, track) in self.project.timeline.tracks.iter().enumerate() {
+            if track.track_type == TrackType::Audio {
+                if let Some(clip) = track.clip_at(pos) {
+                    clips.push((i, clip));
+                }
+            }
+        }
+        clips
+    }
+
     /// Find the audio clip at the given playback position (searches only audio tracks).
     pub fn audio_clip_at_position(&self, pos: TimelinePosition) -> Option<(usize, &Clip)> {
         for (i, track) in self.project.timeline.tracks.iter().enumerate() {
@@ -2130,48 +2178,66 @@ impl App {
             while rx.try_recv().is_ok() {}
         }
 
-        let clip_info =
-            self.clip_at_position(self.playback_position)
-                .map(|(_, clip)| {
-                    (
-                        clip.id,
-                        clip.asset_id,
-                        clip.timeline_range.start.as_secs_f64(),
-                        clip.source_range.start.as_secs_f64(),
-                        effects::resolve_transform(&clip.effects),
-                    )
-                });
+        // Collect clip info upfront to avoid borrow conflicts with self.
+        // Video tracks are stored top-to-bottom (VN...V1), iterate in reverse for bottom-to-top.
+        let playback_pos = self.playback_position.as_secs_f64();
+        let mut clip_infos = Vec::new();
+        let mut clip_ids = Vec::new();
+        let mut first_clip_id = None;
+        let mut first_time_offset = 0.0;
 
-        if let Some((clip_id, asset_id, clip_tl_start, clip_src_start, transform)) = clip_info {
-            let playback_pos = self.playback_position.as_secs_f64();
-            let source_time = clip_src_start + (playback_pos - clip_tl_start);
-            let path = self
-                .project
-                .source_library
-                .get(asset_id)
-                .map(|a| a.path.clone());
+        let video_track_indices: Vec<usize> = self.project.timeline.tracks.iter()
+            .enumerate()
+            .filter(|(_, t)| t.track_type == TrackType::Video)
+            .map(|(i, _)| i)
+            .collect();
 
-            if let Some(path) = path {
-                self.decode_clip_id = Some(clip_id);
-                self.current_frame_transform = transform;
-                // Store offset so we can convert source PTS → timeline time:
-                // timeline_time = pts_secs + (clip_tl_start - clip_src_start)
-                self.decode_time_offset = clip_tl_start - clip_src_start;
-                if let Some(tx) = &self.decode_tx {
-                    let _ = tx.send(DecodeRequest::Seek {
-                        path,
+        for &idx in video_track_indices.iter().rev() {
+            let track = &self.project.timeline.tracks[idx];
+            if let Some(clip) = track.clip_at(self.playback_position) {
+                let clip_tl_start = clip.timeline_range.start.as_secs_f64();
+                let clip_src_start = clip.source_range.start.as_secs_f64();
+                let source_time = clip_src_start + (playback_pos - clip_tl_start);
+                let transform = effects::resolve_transform(&clip.effects);
+
+                if let Some(asset) = self.project.source_library.get(clip.asset_id) {
+                    if first_clip_id.is_none() {
+                        first_clip_id = Some(clip.id);
+                        first_time_offset = clip_tl_start - clip_src_start;
+                    }
+                    clip_ids.push(clip.id);
+                    clip_infos.push(ClipDecodeInfo {
+                        path: asset.path.clone(),
                         time: source_time,
-                        continuous,
+                        transform,
                     });
                 }
-                return;
             }
         }
-        self.decode_clip_id = None;
-        self.current_frame = None;
-        self.current_frame_transform = ResolvedTransform::default();
-        self.pending_frame = None;
-        self.send_decode_stop();
+
+        if clip_infos.is_empty() {
+            self.decode_clip_id = None;
+            self.decode_clip_ids.clear();
+            self.current_frame = None;
+            self.current_frame_transform = ResolvedTransform::default();
+            self.pending_frame = None;
+            self.send_decode_stop();
+            return;
+        }
+
+        self.decode_clip_id = first_clip_id;
+        self.decode_clip_ids = clip_ids;
+        self.current_frame_transform = ResolvedTransform::default(); // compositing done in worker
+        self.decode_time_offset = first_time_offset;
+
+        if let Some(tx) = &self.decode_tx {
+            let _ = tx.send(DecodeRequest::SeekMulti {
+                clips: clip_infos,
+                continuous,
+                canvas_w: self.project.settings.canvas_width,
+                canvas_h: self.project.settings.canvas_height,
+            });
+        }
     }
 
     /// Tell the decode thread to stop decoding.
@@ -2217,24 +2283,10 @@ impl App {
             // When paused (scrubbing), always display immediately.
             // When playing, only display if the frame's time has arrived.
             if !self.is_playing || frame_timeline_time <= playback_secs + 0.02 {
-                let tx = &self.current_frame_transform;
-                if tx.x_offset != 0.0 || tx.y_offset != 0.0 {
-                    let (composited, cw, ch) = composite_frame_for_preview(
-                        &frame.rgba,
-                        frame.width,
-                        frame.height,
-                        self.project.settings.canvas_width,
-                        self.project.settings.canvas_height,
-                        tx,
-                    );
-                    self.current_frame = Some(iced::widget::image::Handle::from_rgba(
-                        cw, ch, composited,
-                    ));
-                } else {
-                    self.current_frame = Some(iced::widget::image::Handle::from_rgba(
-                        frame.width, frame.height, frame.rgba,
-                    ));
-                }
+                // Frame is already composited by the decode worker (multi-clip + transforms)
+                self.current_frame = Some(iced::widget::image::Handle::from_rgba(
+                    frame.width, frame.height, frame.rgba,
+                ));
                 self.drain_stale = false;
                 // Loop to check if there's an even more recent frame also due
             } else if self.drain_stale {
@@ -2256,50 +2308,56 @@ impl App {
             while rx.try_recv().is_ok() {}
         }
 
-        let clip_info =
-            self.audio_clip_at_position(self.playback_position)
-                .map(|(_, clip)| {
-                    (
-                        clip.id,
-                        clip.asset_id,
-                        clip.timeline_range.start.as_secs_f64(),
-                        clip.source_range.start.as_secs_f64(),
-                    )
-                });
+        // Collect clip info upfront to avoid borrow conflicts with self
+        let playback_pos = self.playback_position.as_secs_f64();
+        let mut audio_infos = Vec::new();
+        let mut first_clip_id = None;
+        let mut first_time_offset = 0.0;
 
-        if let Some((clip_id, asset_id, clip_tl_start, clip_src_start)) = clip_info {
-            let playback_pos = self.playback_position.as_secs_f64();
-            let source_time = clip_src_start + (playback_pos - clip_tl_start);
-            let path = self
-                .project
-                .source_library
-                .get(asset_id)
-                .map(|a| a.path.clone());
+        for (_, track) in self.project.timeline.tracks.iter().enumerate() {
+            if track.track_type != TrackType::Audio {
+                continue;
+            }
+            if let Some(clip) = track.clip_at(self.playback_position) {
+                let clip_tl_start = clip.timeline_range.start.as_secs_f64();
+                let clip_src_start = clip.source_range.start.as_secs_f64();
+                let source_time = clip_src_start + (playback_pos - clip_tl_start);
 
-            if let Some(path) = path {
-                // Clear buffered audio from previous clip before starting new one.
-                // Without this, adjacent clips (no gap) would keep playing clip1's
-                // buffered audio instead of transitioning to clip2.
-                if let Some(player) = &self.audio_player {
-                    player.clear();
-                    player.play();
-                }
-                self.audio_decode_clip_id = Some(clip_id);
-                self.audio_decode_time_offset = clip_tl_start - clip_src_start;
-                if let Some(tx) = &self.audio_decode_tx {
-                    let _ = tx.send(AudioDecodeRequest::Seek {
-                        path,
+                if let Some(asset) = self.project.source_library.get(clip.asset_id) {
+                    if first_clip_id.is_none() {
+                        first_clip_id = Some(clip.id);
+                        first_time_offset = clip_tl_start - clip_src_start;
+                    }
+                    audio_infos.push(AudioClipInfo {
+                        path: asset.path.clone(),
                         time: source_time,
-                        continuous,
                     });
                 }
-                return;
             }
         }
-        self.audio_decode_clip_id = None;
-        self.send_audio_decode_stop();
+
+        if audio_infos.is_empty() {
+            self.audio_decode_clip_id = None;
+            self.send_audio_decode_stop();
+            if let Some(player) = &self.audio_player {
+                player.stop();
+            }
+            return;
+        }
+
+        // Clear buffered audio from previous clips before starting new ones.
         if let Some(player) = &self.audio_player {
-            player.stop();
+            player.clear();
+            player.play();
+        }
+        self.audio_decode_clip_id = first_clip_id;
+        self.audio_decode_time_offset = first_time_offset;
+
+        if let Some(tx) = &self.audio_decode_tx {
+            let _ = tx.send(AudioDecodeRequest::SeekMulti {
+                clips: audio_infos,
+                continuous,
+            });
         }
     }
 
@@ -2344,6 +2402,7 @@ pub fn rgb24_to_rgba32(rgb: &[u8], width: u32, height: u32) -> Vec<u8> {
 
 /// Composite a decoded RGBA frame onto a canvas-proportioned black buffer with transform offset.
 /// Returns (rgba_buffer, width, height) sized to fit within PREVIEW_MAX dimensions.
+#[allow(dead_code)]
 fn composite_frame_for_preview(
     frame_rgba: &[u8],
     frame_w: u32,
@@ -2387,7 +2446,7 @@ fn composite_frame_for_preview(
 
 /// Nearest-neighbor scale + blit RGBA pixels onto a destination buffer.
 /// Handles negative offsets and out-of-bounds clipping.
-fn blit_rgba_scaled(
+pub fn blit_rgba_scaled(
     src: &[u8],
     src_w: u32,
     src_h: u32,
@@ -2444,27 +2503,28 @@ fn drag_event_filter(event: Event, _status: event::Status, _window: window::Id) 
 
 /// Cached decoder state for the decode worker thread.
 struct CachedDecoder {
-    path: PathBuf,
     decoder: zeditor_media::decoder::FfmpegDecoder,
     last_pts: f64,
 }
 
 /// Background decode worker thread. Owns the FFmpeg decoder and runs ahead of playback.
+/// Supports both single-clip (legacy Seek) and multi-clip (SeekMulti) decode modes.
 fn decode_worker(
     request_rx: mpsc::Receiver<DecodeRequest>,
     frame_tx: mpsc::SyncSender<DecodedFrame>,
 ) {
     use zeditor_media::decoder::{FfmpegDecoder, VideoDecoder};
 
-    let mut decoder_state: Option<CachedDecoder> = None;
+    let mut decoders: HashMap<PathBuf, CachedDecoder> = HashMap::new();
     let mut running = false;
     let mut is_continuous = false;
     let mut target_time: f64 = 0.0;
     let mut seeking_to_target = false;
+    let mut multi_clips: Vec<ClipDecodeInfo> = Vec::new();
+    let mut multi_canvas_w: u32 = 1920;
+    let mut multi_canvas_h: u32 = 1080;
 
     loop {
-        // If not actively decoding, block until we get a request
-        // If actively decoding, check for new requests non-blocking
         let request = if running {
             match request_rx.try_recv() {
                 Ok(req) => Some(req),
@@ -2480,48 +2540,48 @@ fn decode_worker(
 
         if let Some(request) = request {
             match request {
-                DecodeRequest::Seek {
-                    path,
-                    time,
+                DecodeRequest::SeekMulti {
+                    clips,
                     continuous,
+                    canvas_w,
+                    canvas_h,
                 } => {
-                    let needs_open = match &decoder_state {
-                        Some(cached) => cached.path != path,
-                        None => true,
-                    };
-                    if needs_open {
-                        match FfmpegDecoder::open(&path) {
-                            Ok(decoder) => {
-                                decoder_state = Some(CachedDecoder {
-                                    path,
-                                    decoder,
-                                    last_pts: -1.0,
-                                });
-                            }
-                            Err(_) => {
-                                running = false;
-                                continue;
+                    multi_canvas_w = canvas_w;
+                    multi_canvas_h = canvas_h;
+
+                    // Open/seek all decoders
+                    let mut ok = true;
+                    for clip in &clips {
+                        if !decoders.contains_key(&clip.path) {
+                            match FfmpegDecoder::open(&clip.path) {
+                                Ok(decoder) => {
+                                    decoders.insert(clip.path.clone(), CachedDecoder {
+                                        decoder,
+                                        last_pts: -1.0,
+                                    });
+                                }
+                                Err(_) => { ok = false; break; }
                             }
                         }
-                    }
-                    let cached = decoder_state.as_mut().unwrap();
-
-                    // Decide whether to seek or decode forward
-                    let needs_seek = time < cached.last_pts
-                        || (time - cached.last_pts) > 2.0
-                        || cached.last_pts < 0.0;
-
-                    if needs_seek {
-                        if cached.decoder.seek_to(time).is_err() {
-                            running = false;
-                            continue;
+                        let cached = decoders.get_mut(&clip.path).unwrap();
+                        let needs_seek = clip.time < cached.last_pts
+                            || (clip.time - cached.last_pts) > 2.0
+                            || cached.last_pts < 0.0;
+                        if needs_seek {
+                            if cached.decoder.seek_to(clip.time).is_err() {
+                                ok = false;
+                                break;
+                            }
+                            cached.last_pts = -1.0;
                         }
-                        cached.last_pts = -1.0;
-                        seeking_to_target = true;
-                    } else {
-                        seeking_to_target = false;
                     }
-                    target_time = time;
+                    if !ok {
+                        running = false;
+                        continue;
+                    }
+                    multi_clips = clips;
+                    target_time = multi_clips.first().map(|c| c.time).unwrap_or(0.0);
+                    seeking_to_target = true;
                     is_continuous = continuous;
                     running = true;
                 }
@@ -2532,68 +2592,149 @@ fn decode_worker(
             }
         }
 
-        if running {
-            let cached = decoder_state.as_mut().unwrap();
-            match cached
-                .decoder
-                .decode_next_frame_rgba_scaled(PREVIEW_MAX_WIDTH, PREVIEW_MAX_HEIGHT)
-            {
-                Ok(Some(frame)) => {
-                    cached.last_pts = frame.pts_secs;
+        if !running {
+            continue;
+        }
 
-                    // After a seek, skip pre-target frames (between keyframe and target)
-                    if seeking_to_target && frame.pts_secs < target_time - 0.05 {
-                        continue;
-                    }
-                    seeking_to_target = false;
-
-                    let decoded = DecodedFrame {
-                        rgba: frame.data,
-                        width: frame.width,
-                        height: frame.height,
-                        pts_secs: frame.pts_secs,
-                    };
-                    // Send to UI; blocks if buffer is full (backpressure)
-                    if frame_tx.send(decoded).is_err() {
-                        return; // UI dropped the receiver
-                    }
-
-                    // In scrub mode, stop after sending one target frame
-                    if !is_continuous {
-                        running = false;
-                    }
+        // Decode one frame from each clip, composite, and send
+        let result = decode_and_composite_multi(
+            &multi_clips,
+            &mut decoders,
+            multi_canvas_w,
+            multi_canvas_h,
+            target_time,
+            seeking_to_target,
+        );
+        match result {
+            Ok(Some(frame)) => {
+                seeking_to_target = false;
+                if frame_tx.send(frame).is_err() {
+                    return;
                 }
-                Ok(None) => {
-                    // EOF
+                if !is_continuous {
                     running = false;
+                } else {
+                    // Advance target time slightly for next frame
+                    target_time += 1.0 / 30.0; // approximate frame step
                 }
-                Err(_) => {
-                    running = false;
+            }
+            Ok(None) => {
+                if seeking_to_target {
+                    // Still seeking, try again
+                    continue;
                 }
+                running = false;
+            }
+            Err(_) => {
+                running = false;
             }
         }
     }
 }
 
+/// Decode one frame from each clip and composite them into a single RGBA frame.
+/// Clips are ordered bottom-to-top (V1 first, VN last).
+/// Returns Ok(None) if all clips are at EOF.
+fn decode_and_composite_multi(
+    clips: &[ClipDecodeInfo],
+    decoders: &mut HashMap<PathBuf, CachedDecoder>,
+    canvas_w: u32,
+    canvas_h: u32,
+    _target_time: f64,
+    seeking: bool,
+) -> std::result::Result<Option<DecodedFrame>, ()> {
+    // Determine preview canvas size (fit canvas aspect ratio within PREVIEW_MAX).
+    let scale_x = PREVIEW_MAX_WIDTH as f64 / canvas_w as f64;
+    let scale_y = PREVIEW_MAX_HEIGHT as f64 / canvas_h as f64;
+    let preview_scale = scale_x.min(scale_y).min(1.0);
+    let pw = (canvas_w as f64 * preview_scale).round() as u32;
+    let ph = (canvas_h as f64 * preview_scale).round() as u32;
+
+    // Black canvas
+    let mut canvas = vec![0u8; (pw * ph * 4) as usize];
+    let mut any_decoded = false;
+    let mut first_pts = 0.0_f64;
+
+    for (i, clip) in clips.iter().enumerate() {
+        let cached = match decoders.get_mut(&clip.path) {
+            Some(c) => c,
+            None => continue,
+        };
+
+        // Decode frames until we get one at or past target
+        let frame = loop {
+            match cached.decoder.decode_next_frame_rgba_scaled(PREVIEW_MAX_WIDTH, PREVIEW_MAX_HEIGHT) {
+                Ok(Some(f)) => {
+                    cached.last_pts = f.pts_secs;
+                    if seeking && f.pts_secs < clip.time - 0.05 {
+                        continue; // skip pre-target frames
+                    }
+                    break Some(f);
+                }
+                Ok(None) => break None,
+                Err(_) => break None,
+            }
+        };
+
+        if let Some(frame) = frame {
+            if i == 0 {
+                first_pts = frame.pts_secs;
+            }
+
+            // Compute where this clip goes on the preview canvas
+            let fit_scale_x = canvas_w as f64 / frame.width as f64;
+            let fit_scale_y = canvas_h as f64 / frame.height as f64;
+            let fit_scale = fit_scale_x.min(fit_scale_y);
+            let clip_w_canvas = (frame.width as f64 * fit_scale).round();
+            let clip_h_canvas = (frame.height as f64 * fit_scale).round();
+            let center_x_canvas = (canvas_w as f64 - clip_w_canvas) / 2.0;
+            let center_y_canvas = (canvas_h as f64 - clip_h_canvas) / 2.0;
+
+            let offset_x = ((center_x_canvas + clip.transform.x_offset) * preview_scale).round() as i32;
+            let offset_y = ((center_y_canvas + clip.transform.y_offset) * preview_scale).round() as i32;
+            let clip_w = (clip_w_canvas * preview_scale).round() as u32;
+            let clip_h = (clip_h_canvas * preview_scale).round() as u32;
+
+            blit_rgba_scaled(
+                &frame.data, frame.width, frame.height,
+                &mut canvas, pw, ph,
+                offset_x, offset_y, clip_w, clip_h,
+            );
+            any_decoded = true;
+        }
+    }
+
+    if any_decoded {
+        Ok(Some(DecodedFrame {
+            rgba: canvas,
+            width: pw,
+            height: ph,
+            pts_secs: first_pts,
+        }))
+    } else {
+        Ok(None)
+    }
+}
+
 /// Cached audio decoder state for the audio decode worker thread.
 struct CachedAudioDecoder {
-    path: PathBuf,
     decoder: zeditor_media::audio_decoder::FfmpegAudioDecoder,
     last_pts: f64,
 }
 
-/// Background audio decode worker thread. Mirrors the video decode worker pattern.
+/// Background audio decode worker thread. Supports multi-clip mixing.
 fn audio_decode_worker(
     request_rx: mpsc::Receiver<AudioDecodeRequest>,
     audio_tx: mpsc::SyncSender<DecodedAudio>,
 ) {
     use zeditor_media::audio_decoder::FfmpegAudioDecoder;
 
-    let mut decoder_state: Option<CachedAudioDecoder> = None;
+    let mut audio_decoders: HashMap<PathBuf, CachedAudioDecoder> = HashMap::new();
     let mut running = false;
     let mut is_continuous = false;
     let mut target_time: f64 = 0.0;
     let mut seeking_to_target = false;
+    let mut multi_clips: Vec<AudioClipInfo> = Vec::new();
 
     loop {
         let request = if running {
@@ -2611,47 +2752,43 @@ fn audio_decode_worker(
 
         if let Some(request) = request {
             match request {
-                AudioDecodeRequest::Seek {
-                    path,
-                    time,
+                AudioDecodeRequest::SeekMulti {
+                    clips,
                     continuous,
                 } => {
-                    let needs_open = match &decoder_state {
-                        Some(cached) => cached.path != path,
-                        None => true,
-                    };
-                    if needs_open {
-                        match FfmpegAudioDecoder::open(&path) {
-                            Ok(decoder) => {
-                                decoder_state = Some(CachedAudioDecoder {
-                                    path,
-                                    decoder,
-                                    last_pts: -1.0,
-                                });
-                            }
-                            Err(_) => {
-                                running = false;
-                                continue;
+                    // Open/seek all decoders
+                    let mut ok = true;
+                    for clip in &clips {
+                        if !audio_decoders.contains_key(&clip.path) {
+                            match FfmpegAudioDecoder::open(&clip.path) {
+                                Ok(decoder) => {
+                                    audio_decoders.insert(clip.path.clone(), CachedAudioDecoder {
+                                        decoder,
+                                        last_pts: -1.0,
+                                    });
+                                }
+                                Err(_) => { ok = false; break; }
                             }
                         }
-                    }
-                    let cached = decoder_state.as_mut().unwrap();
-
-                    let needs_seek = time < cached.last_pts
-                        || (time - cached.last_pts) > 2.0
-                        || cached.last_pts < 0.0;
-
-                    if needs_seek {
-                        if cached.decoder.seek_to(time).is_err() {
-                            running = false;
-                            continue;
+                        let cached = audio_decoders.get_mut(&clip.path).unwrap();
+                        let needs_seek = clip.time < cached.last_pts
+                            || (clip.time - cached.last_pts) > 2.0
+                            || cached.last_pts < 0.0;
+                        if needs_seek {
+                            if cached.decoder.seek_to(clip.time).is_err() {
+                                ok = false;
+                                break;
+                            }
+                            cached.last_pts = -1.0;
                         }
-                        cached.last_pts = -1.0;
-                        seeking_to_target = true;
-                    } else {
-                        seeking_to_target = false;
                     }
-                    target_time = time;
+                    if !ok {
+                        running = false;
+                        continue;
+                    }
+                    multi_clips = clips;
+                    target_time = multi_clips.first().map(|c| c.time).unwrap_or(0.0);
+                    seeking_to_target = true;
                     is_continuous = continuous;
                     running = true;
                 }
@@ -2662,39 +2799,81 @@ fn audio_decode_worker(
             }
         }
 
-        if running {
-            let cached = decoder_state.as_mut().unwrap();
-            match cached.decoder.decode_next_audio_frame() {
-                Ok(Some(frame)) => {
-                    cached.last_pts = frame.pts_secs;
+        if !running {
+            continue;
+        }
 
-                    // Skip pre-target frames after seek
-                    if seeking_to_target && frame.pts_secs < target_time - 0.05 {
-                        continue;
-                    }
-                    seeking_to_target = false;
+        // Multi-clip: decode one frame from each, mix, send
+        let mut mixed_samples: Option<Vec<f32>> = None;
+        let mut first_pts = 0.0_f64;
+        let mut sample_rate = 48000u32;
+        let mut channels = 2u16;
+        let mut any_decoded = false;
 
-                    let decoded = DecodedAudio {
-                        samples: frame.samples,
-                        sample_rate: frame.sample_rate,
-                        channels: frame.channels,
-                        pts_secs: frame.pts_secs,
-                    };
-                    if audio_tx.send(decoded).is_err() {
-                        return;
-                    }
+        for (i, clip) in multi_clips.iter().enumerate() {
+            let cached = match audio_decoders.get_mut(&clip.path) {
+                Some(c) => c,
+                None => continue,
+            };
 
-                    if !is_continuous {
-                        running = false;
+            let frame = loop {
+                match cached.decoder.decode_next_audio_frame() {
+                    Ok(Some(f)) => {
+                        cached.last_pts = f.pts_secs;
+                        if seeking_to_target && f.pts_secs < clip.time - 0.05 {
+                            continue;
+                        }
+                        break Some(f);
                     }
+                    Ok(None) => break None,
+                    Err(_) => break None,
                 }
-                Ok(None) => {
-                    running = false;
+            };
+
+            if let Some(frame) = frame {
+                if i == 0 {
+                    first_pts = frame.pts_secs;
+                    sample_rate = frame.sample_rate;
+                    channels = frame.channels;
                 }
-                Err(_) => {
-                    running = false;
+                any_decoded = true;
+
+                match &mut mixed_samples {
+                    None => {
+                        mixed_samples = Some(frame.samples);
+                    }
+                    Some(mixed) => {
+                        // Additive mixing with clamping
+                        let len = mixed.len().min(frame.samples.len());
+                        for j in 0..len {
+                            mixed[j] = (mixed[j] + frame.samples[j]).clamp(-1.0, 1.0);
+                        }
+                        // If this clip has more samples, extend
+                        if frame.samples.len() > mixed.len() {
+                            mixed.extend_from_slice(&frame.samples[mixed.len()..]);
+                        }
+                    }
                 }
             }
+        }
+
+        seeking_to_target = false;
+
+        if any_decoded {
+            let decoded = DecodedAudio {
+                samples: mixed_samples.unwrap_or_default(),
+                sample_rate,
+                channels,
+                pts_secs: first_pts,
+            };
+            if audio_tx.send(decoded).is_err() {
+                return;
+            }
+            if !is_continuous {
+                running = false;
+            }
+        } else {
+            running = false;
         }
     }
 }

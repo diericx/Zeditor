@@ -2270,3 +2270,141 @@ fn test_move_grouped_clip_v1_to_v2() {
     // A1 should be empty
     assert_eq!(app.project.timeline.tracks[2].clips.len(), 0, "A1 should be empty");
 }
+
+// =============================================================================
+// Brief 15: Multi-track clip query tests
+// =============================================================================
+
+#[test]
+fn test_all_video_clips_at_position_multi_track() {
+    use zeditor_core::timeline::TrackType;
+
+    let mut app = App::new();
+    let asset1 = make_test_asset("clip1", 5.0);
+    let asset2 = make_test_asset("clip2", 5.0);
+    let asset1_id = asset1.id;
+    let asset2_id = asset2.id;
+    app.project.source_library.import(asset1);
+    app.project.source_library.import(asset2);
+
+    // Default timeline has V1 (index 0) and A1 (index 1)
+    // Add V2 above V1
+    app.update(Message::AddVideoTrackAbove(0));
+    // Now: V2 (index 0), V1 (index 1), A1 (index 2)
+
+    assert_eq!(app.project.timeline.tracks[0].track_type, TrackType::Video);
+    assert_eq!(app.project.timeline.tracks[1].track_type, TrackType::Video);
+
+    // Add clip to V1 (index 1)
+    app.update(Message::AddClipToTimeline {
+        asset_id: asset1_id,
+        track_index: 1,
+        position: TimelinePosition::zero(),
+    });
+
+    // Add clip to V2 (index 0)
+    app.update(Message::AddClipToTimeline {
+        asset_id: asset2_id,
+        track_index: 0,
+        position: TimelinePosition::zero(),
+    });
+
+    // Query all video clips at t=2.5s
+    let clips = app.all_video_clips_at_position(TimelinePosition::from_secs_f64(2.5));
+    assert_eq!(clips.len(), 2, "Should find 2 video clips");
+
+    // Bottom-to-top order: V1 first (asset1), V2 last (asset2)
+    assert_eq!(clips[0].1.asset_id, asset1_id, "First should be V1 (bottom)");
+    assert_eq!(clips[1].1.asset_id, asset2_id, "Second should be V2 (top)");
+}
+
+#[test]
+fn test_all_audio_clips_at_position_multi_track() {
+    use zeditor_core::timeline::TrackType;
+
+    let mut app = App::new();
+    let asset1 = make_test_asset("audio1", 5.0);
+    let asset2 = make_test_asset("audio2", 5.0);
+    let asset1_id = asset1.id;
+    let asset2_id = asset2.id;
+    app.project.source_library.import(asset1);
+    app.project.source_library.import(asset2);
+
+    // Default: V1 (index 0), A1 (index 1)
+    // Add A2 below A1
+    app.update(Message::AddAudioTrackBelow(1));
+    // Now: V1 (index 0), A1 (index 1), A2 (index 2)
+
+    assert_eq!(app.project.timeline.tracks[1].track_type, TrackType::Audio);
+    assert_eq!(app.project.timeline.tracks[2].track_type, TrackType::Audio);
+
+    // Add audio clip to A1 (index 1)
+    let clip1 = zeditor_core::timeline::Clip::new(
+        asset1_id,
+        TimelinePosition::zero(),
+        zeditor_core::timeline::TimeRange::new(
+            TimelinePosition::zero(),
+            TimelinePosition::from_secs_f64(5.0),
+        ).unwrap(),
+    );
+    app.project.timeline.add_clip_trimming_overlaps(1, clip1).unwrap();
+
+    // Add audio clip to A2 (index 2)
+    let clip2 = zeditor_core::timeline::Clip::new(
+        asset2_id,
+        TimelinePosition::zero(),
+        zeditor_core::timeline::TimeRange::new(
+            TimelinePosition::zero(),
+            TimelinePosition::from_secs_f64(5.0),
+        ).unwrap(),
+    );
+    app.project.timeline.add_clip_trimming_overlaps(2, clip2).unwrap();
+
+    // Query all audio clips at t=2.5s
+    let clips = app.all_audio_clips_at_position(TimelinePosition::from_secs_f64(2.5));
+    assert_eq!(clips.len(), 2, "Should find 2 audio clips");
+}
+
+#[test]
+fn test_composite_rgba_layers() {
+    use zeditor_ui::app::blit_rgba_scaled;
+
+    // Create a small 4x4 black canvas
+    let canvas_w = 4u32;
+    let canvas_h = 4u32;
+    let mut canvas = vec![0u8; (canvas_w * canvas_h * 4) as usize];
+
+    // Create a 2x2 red source
+    let src_w = 2u32;
+    let src_h = 2u32;
+    let red_src = vec![255u8, 0, 0, 255, 255, 0, 0, 255,
+                       255, 0, 0, 255, 255, 0, 0, 255];
+
+    // Blit red at offset (1, 1) with size 2x2
+    blit_rgba_scaled(&red_src, src_w, src_h, &mut canvas, canvas_w, canvas_h, 1, 1, 2, 2);
+
+    // Check that pixel (0,0) is still black
+    assert_eq!(canvas[0], 0);
+    assert_eq!(canvas[1], 0);
+    assert_eq!(canvas[2], 0);
+    assert_eq!(canvas[3], 0);
+
+    // Check that pixel (1,1) is red
+    let idx = ((1 * canvas_w + 1) * 4) as usize;
+    assert_eq!(canvas[idx], 255);
+    assert_eq!(canvas[idx + 1], 0);
+    assert_eq!(canvas[idx + 2], 0);
+    assert_eq!(canvas[idx + 3], 255);
+
+    // Now blit a green 2x2 on top at offset (2, 2) — partially overlapping
+    let green_src = vec![0u8, 255, 0, 255, 0, 255, 0, 255,
+                         0, 255, 0, 255, 0, 255, 0, 255];
+    blit_rgba_scaled(&green_src, src_w, src_h, &mut canvas, canvas_w, canvas_h, 2, 2, 2, 2);
+
+    // Check that pixel (2,2) is now green (overwrites red)
+    let idx = ((2 * canvas_w + 2) * 4) as usize;
+    assert_eq!(canvas[idx], 0);
+    assert_eq!(canvas[idx + 1], 255);
+    assert_eq!(canvas[idx + 2], 0);
+    assert_eq!(canvas[idx + 3], 255);
+}

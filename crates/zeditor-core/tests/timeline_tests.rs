@@ -1342,3 +1342,86 @@ fn test_split_by_overlap_preserves_effects() {
     assert_eq!(right.effects.len(), 1);
     assert_eq!(right.effects[0].get_float("y_offset"), Some(-100.0));
 }
+
+// =============================================================================
+// Brief 15: Multi-track clip query tests
+// =============================================================================
+
+/// Test that clip_at works independently per track when clips overlap across tracks.
+#[test]
+fn test_all_video_clips_at_position() {
+    let mut timeline = Timeline::new();
+    let asset1 = Uuid::new_v4();
+    let asset2 = Uuid::new_v4();
+
+    // V2 (top) at index 0, V1 (bottom) at index 1
+    let v2_idx = timeline.add_track("V2", TrackType::Video);
+    let v1_idx = timeline.add_track("V1", TrackType::Video);
+
+    // Both clips span [0, 5s)
+    let clip1 = make_clip(asset1, 0.0, 5.0);
+    let clip2 = make_clip(asset2, 0.0, 5.0);
+    timeline.add_clip_trimming_overlaps(v1_idx, clip1).unwrap();
+    timeline.add_clip_trimming_overlaps(v2_idx, clip2).unwrap();
+
+    let pos = TimelinePosition::from_secs_f64(2.5);
+
+    // Both tracks should have a clip at position 2.5s
+    let v1_clip = timeline.tracks[v1_idx].clip_at(pos);
+    let v2_clip = timeline.tracks[v2_idx].clip_at(pos);
+    assert!(v1_clip.is_some(), "V1 should have a clip at 2.5s");
+    assert!(v2_clip.is_some(), "V2 should have a clip at 2.5s");
+
+    // The clips should be from different assets
+    assert_eq!(v1_clip.unwrap().asset_id, asset1);
+    assert_eq!(v2_clip.unwrap().asset_id, asset2);
+
+    // Collect all video clips bottom-to-top (V1 first, V2 last)
+    // Video tracks in vec: [V2(idx 0), V1(idx 1)], so iterate in reverse for V1 first
+    let video_tracks: Vec<_> = timeline.tracks.iter()
+        .filter(|t| t.track_type == TrackType::Video)
+        .collect();
+    let mut all_clips = Vec::new();
+    for track in video_tracks.iter().rev() {
+        if let Some(clip) = track.clip_at(pos) {
+            all_clips.push(clip.asset_id);
+        }
+    }
+    assert_eq!(all_clips.len(), 2);
+    assert_eq!(all_clips[0], asset1, "V1 (bottom) should be first");
+    assert_eq!(all_clips[1], asset2, "V2 (top) should be last");
+}
+
+/// Test that only clips at the queried position are found (not clips from other times).
+#[test]
+fn test_video_clips_at_position_partial_overlap() {
+    let mut timeline = Timeline::new();
+    let asset1 = Uuid::new_v4();
+    let asset2 = Uuid::new_v4();
+
+    let v2_idx = timeline.add_track("V2", TrackType::Video);
+    let v1_idx = timeline.add_track("V1", TrackType::Video);
+
+    // V1 clip spans [0, 5s)
+    let clip1 = make_clip(asset1, 0.0, 5.0);
+    timeline.add_clip_trimming_overlaps(v1_idx, clip1).unwrap();
+
+    // V2 clip spans [3, 8s) — only overlaps V1 in [3, 5s)
+    let clip2 = make_clip(asset2, 3.0, 5.0);
+    timeline.add_clip_trimming_overlaps(v2_idx, clip2).unwrap();
+
+    // At t=2s: only V1 clip
+    let pos = TimelinePosition::from_secs_f64(2.0);
+    assert!(timeline.tracks[v1_idx].clip_at(pos).is_some());
+    assert!(timeline.tracks[v2_idx].clip_at(pos).is_none());
+
+    // At t=4s: both clips
+    let pos = TimelinePosition::from_secs_f64(4.0);
+    assert!(timeline.tracks[v1_idx].clip_at(pos).is_some());
+    assert!(timeline.tracks[v2_idx].clip_at(pos).is_some());
+
+    // At t=6s: only V2 clip
+    let pos = TimelinePosition::from_secs_f64(6.0);
+    assert!(timeline.tracks[v1_idx].clip_at(pos).is_none());
+    assert!(timeline.tracks[v2_idx].clip_at(pos).is_some());
+}

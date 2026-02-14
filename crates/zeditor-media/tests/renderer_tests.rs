@@ -554,3 +554,148 @@ fn test_render_source_matches_canvas() {
     assert_eq!(layout.clip_w, 320);
     assert_eq!(layout.clip_h, 240);
 }
+
+// =============================================================================
+// Brief 15: Track layering tests
+// =============================================================================
+
+/// Test rendering with overlapping video clips on two tracks.
+/// V1 (bottom) and V2 (top) both have clips at the same timeline position.
+#[test]
+fn test_render_overlapping_video_two_tracks() {
+    let dir = fixtures::fixture_dir();
+    let video_path1 = fixtures::generate_test_video(dir.path(), "overlap_v1", 2.0);
+    let video_path2 = fixtures::generate_test_video(dir.path(), "overlap_v2", 2.0);
+    let output_path = dir.path().join("output_overlap_video.mkv");
+
+    let asset1 = zeditor_media::probe::probe(&video_path1).unwrap();
+    let asset2 = zeditor_media::probe::probe(&video_path2).unwrap();
+
+    let mut timeline = Timeline::new();
+    // Add two video tracks: V2 (top, index 0) then V1 (bottom, index 1)
+    let v2_idx = timeline.add_track("V2", zeditor_core::timeline::TrackType::Video);
+    let v1_idx = timeline.add_track("V1", zeditor_core::timeline::TrackType::Video);
+
+    let source_range1 = TimeRange {
+        start: TimelinePosition::zero(),
+        end: TimelinePosition::from_secs_f64(asset1.duration.as_secs_f64()),
+    };
+    let source_range2 = TimeRange {
+        start: TimelinePosition::zero(),
+        end: TimelinePosition::from_secs_f64(asset2.duration.as_secs_f64()),
+    };
+
+    // V1 (bottom) clip
+    let clip1 = Clip::new(asset1.id, TimelinePosition::zero(), source_range1);
+    timeline.add_clip_trimming_overlaps(v1_idx, clip1).unwrap();
+
+    // V2 (top) clip — same position, overlapping
+    let clip2 = Clip::new(asset2.id, TimelinePosition::zero(), source_range2);
+    timeline.add_clip_trimming_overlaps(v2_idx, clip2).unwrap();
+
+    let mut source_library = SourceLibrary::new();
+    source_library.import(asset1.clone());
+    source_library.import(asset2.clone());
+
+    let config = RenderConfig {
+        output_path: output_path.clone(),
+        width: 320,
+        height: 240,
+        canvas_width: 320,
+        canvas_height: 240,
+        fps: 30.0,
+        crf: 22,
+        preset: "superfast".to_string(),
+        scaling: ScalingAlgorithm::Lanczos,
+    };
+
+    render_timeline(&timeline, &source_library, &config).unwrap();
+
+    assert!(output_path.exists(), "Output file should exist");
+    let metadata = std::fs::metadata(&output_path).unwrap();
+    assert!(metadata.len() > 0, "Output file should be non-empty");
+
+    let output_asset = zeditor_media::probe::probe(&output_path).unwrap();
+    assert_eq!(output_asset.width, 320);
+    assert_eq!(output_asset.height, 240);
+    let dur = output_asset.duration.as_secs_f64();
+    assert!(
+        dur >= 1.5 && dur <= 3.0,
+        "Expected ~2s duration, got {dur}s"
+    );
+}
+
+/// Test rendering with overlapping audio clips on two tracks.
+/// Both A1 and A2 have clips at the same timeline position — they should mix.
+#[test]
+fn test_render_overlapping_audio_two_tracks() {
+    let dir = fixtures::fixture_dir();
+    let video_path = fixtures::generate_test_video(dir.path(), "overlap_audio", 2.0);
+    let output_path = dir.path().join("output_overlap_audio.mkv");
+
+    let asset = zeditor_media::probe::probe(&video_path).unwrap();
+
+    let mut timeline = Timeline::new();
+    let v1_idx = timeline.add_track("V1", zeditor_core::timeline::TrackType::Video);
+    let a1_idx = timeline.add_track("A1", zeditor_core::timeline::TrackType::Audio);
+    let a2_idx = timeline.add_track("A2", zeditor_core::timeline::TrackType::Audio);
+
+    let source_range = TimeRange {
+        start: TimelinePosition::zero(),
+        end: TimelinePosition::from_secs_f64(asset.duration.as_secs_f64()),
+    };
+
+    // Video on V1
+    let video_clip = Clip::new(asset.id, TimelinePosition::zero(), source_range);
+    timeline.add_clip_trimming_overlaps(v1_idx, video_clip).unwrap();
+
+    // Audio on both A1 and A2 (same asset, same time — should mix)
+    let audio_clip1 = Clip::new(asset.id, TimelinePosition::zero(), source_range);
+    timeline.add_clip_trimming_overlaps(a1_idx, audio_clip1).unwrap();
+
+    let audio_clip2 = Clip::new(asset.id, TimelinePosition::zero(), source_range);
+    timeline.add_clip_trimming_overlaps(a2_idx, audio_clip2).unwrap();
+
+    let mut source_library = SourceLibrary::new();
+    source_library.import(asset.clone());
+
+    let config = RenderConfig {
+        output_path: output_path.clone(),
+        width: 320,
+        height: 240,
+        canvas_width: 320,
+        canvas_height: 240,
+        fps: 30.0,
+        crf: 22,
+        preset: "superfast".to_string(),
+        scaling: ScalingAlgorithm::Lanczos,
+    };
+
+    render_timeline(&timeline, &source_library, &config).unwrap();
+
+    assert!(output_path.exists(), "Output file should exist");
+    let metadata = std::fs::metadata(&output_path).unwrap();
+    assert!(metadata.len() > 0, "Output file should be non-empty");
+}
+
+/// Test that write_samples_to_buffer uses additive mixing with clamping.
+#[test]
+fn test_audio_mixing_additive() {
+    use zeditor_media::renderer::write_samples_to_buffer;
+
+    // Pre-fill buffer with some values
+    let mut buffer = vec![0.5f32, 0.3, -0.5, 0.0, 0.0, 0.0, 0.0, 0.0];
+    let samples = vec![0.3f32, 0.8, -0.6, 0.1];
+
+    let written = write_samples_to_buffer(&samples, &mut buffer, 0, 0, 8);
+    assert_eq!(written, 4);
+
+    // Check additive mixing: 0.5+0.3=0.8, 0.3+0.8=1.0(clamped), -0.5+-0.6=-1.0(clamped), 0.0+0.1=0.1
+    assert!((buffer[0] - 0.8).abs() < 0.001, "Expected 0.8, got {}", buffer[0]);
+    assert!((buffer[1] - 1.0).abs() < 0.001, "Expected 1.0 (clamped), got {}", buffer[1]);
+    assert!((buffer[2] - (-1.0)).abs() < 0.001, "Expected -1.0 (clamped), got {}", buffer[2]);
+    assert!((buffer[3] - 0.1).abs() < 0.001, "Expected 0.1, got {}", buffer[3]);
+
+    // Remaining buffer should be untouched
+    assert_eq!(buffer[4], 0.0);
+}
