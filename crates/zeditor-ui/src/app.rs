@@ -1154,20 +1154,45 @@ impl App {
         ))
         .size(14);
 
+        // Compute inner canvas width from project aspect ratio to show
+        // letterboxing/pillarboxing that approximates the rendered output.
+        let viewport_height: f32 = 300.0;
+        let canvas_aspect = self.project.settings.canvas_width as f32
+            / self.project.settings.canvas_height as f32;
+        let canvas_preview_width = (viewport_height * canvas_aspect).round();
+
         let video_area: Element<'_, Message> = if let Some(handle) = &self.current_frame {
-            container(
+            // Black inner container at canvas aspect ratio with the video inside
+            let inner = container(
                 iced::widget::image(handle.clone())
                     .content_fit(iced::ContentFit::Contain)
                     .width(Length::Fill)
                     .height(Length::Fill),
             )
-            .width(Length::Fill)
-            .height(300)
-            .into()
-        } else {
-            container(center(text("No video").size(16)))
+            .width(canvas_preview_width)
+            .height(viewport_height)
+            .style(|_theme| container::Style {
+                background: Some(Background::Color(Color::BLACK)),
+                ..Default::default()
+            });
+            // Outer dark container centers the inner canvas box
+            container(center(inner))
                 .width(Length::Fill)
-                .height(300)
+                .height(viewport_height)
+                .style(container::dark)
+                .into()
+        } else {
+            // Black canvas box with "No video" text
+            let inner = container(center(text("No video").size(16)))
+                .width(canvas_preview_width)
+                .height(viewport_height)
+                .style(|_theme| container::Style {
+                    background: Some(Background::Color(Color::BLACK)),
+                    ..Default::default()
+                });
+            container(center(inner))
+                .width(Length::Fill)
+                .height(viewport_height)
                 .style(container::dark)
                 .into()
         };
