@@ -9,6 +9,7 @@ use rsmpeg::ffi;
 use rsmpeg::swresample::SwrContext;
 use rsmpeg::swscale::SwsContext;
 
+use zeditor_core::effects::{self, EffectInstance, ResolvedTransform};
 use zeditor_core::media::SourceLibrary;
 use zeditor_core::project::ProjectSettings;
 use zeditor_core::timeline::{Timeline, TimelinePosition, TrackType};
@@ -313,7 +314,8 @@ fn encode_video_frames(
 
         let clip_info = find_video_clip_at(timeline, source_library, pos);
 
-        let yuv_frame = if let Some((source_path, source_time)) = clip_info {
+        let yuv_frame = if let Some((source_path, source_time, clip_effects)) = clip_info {
+            let transform = effects::resolve_transform(&clip_effects);
             decode_and_convert_video_frame(
                 &source_path,
                 source_time,
@@ -323,6 +325,7 @@ fn encode_video_frames(
                 canvas_h,
                 video_decoders,
                 config.scaling.to_sws_flags(),
+                &transform,
             )?
         } else {
             create_black_yuv_frame(width, height)?
@@ -355,6 +358,7 @@ fn decode_and_convert_video_frame(
     canvas_h: u32,
     decoders: &mut HashMap<PathBuf, CachedVideoDecoder>,
     sws_flags: ffi::SwsFlags,
+    transform: &ResolvedTransform,
 ) -> Result<AVFrame> {
     let path_key = source_path.to_path_buf();
 
@@ -406,7 +410,7 @@ fn decode_and_convert_video_frame(
                     };
 
                     // Compute canvas layout for this source using display dimensions
-                    let layout = compute_canvas_layout(
+                    let mut layout = compute_canvas_layout(
                         display_w,
                         display_h,
                         canvas_w,
@@ -414,6 +418,12 @@ fn decode_and_convert_video_frame(
                         render_w as u32,
                         render_h as u32,
                     );
+
+                    // Apply transform offset (in canvas pixels, scaled to render pixels)
+                    let canvas_scale = (render_w as f64 / canvas_w.max(1) as f64)
+                        .min(render_h as f64 / canvas_h.max(1) as f64);
+                    layout.clip_x += (transform.x_offset * canvas_scale) as i32 & !1;
+                    layout.clip_y += (transform.y_offset * canvas_scale) as i32 & !1;
 
                     // For rotated video, we need to scale to pre-rotation
                     // clip dimensions (swapped), then rotate after scaling.
@@ -1101,19 +1111,19 @@ fn blit_yuv_frame(src: &AVFrame, dst: &mut AVFrame, offset_x: i32, offset_y: i32
     }
 }
 
-/// Find the video clip at a timeline position and return (source_path, source_time).
+/// Find the video clip at a timeline position and return (source_path, source_time, effects).
 fn find_video_clip_at(
     timeline: &Timeline,
     source_library: &SourceLibrary,
     pos: TimelinePosition,
-) -> Option<(PathBuf, f64)> {
+) -> Option<(PathBuf, f64, Vec<EffectInstance>)> {
     for track in &timeline.tracks {
         if track.track_type == TrackType::Video {
             if let Some(clip) = track.clip_at(pos) {
                 if let Some(asset) = source_library.get(clip.asset_id) {
                     let source_time = clip.source_range.start.as_secs_f64()
                         + (pos.as_secs_f64() - clip.timeline_range.start.as_secs_f64());
-                    return Some((asset.path.clone(), source_time));
+                    return Some((asset.path.clone(), source_time, clip.effects.clone()));
                 }
             }
         }

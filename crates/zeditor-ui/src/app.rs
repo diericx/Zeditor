@@ -8,11 +8,12 @@ use iced::widget::{button, center, column, container, image, mouse_area, opaque,
 use iced::{event, keyboard, mouse, time, window, Background, Border, Color, Element, Event, Length, Padding, Point, Subscription, Task};
 use uuid::Uuid;
 
+use zeditor_core::effects::{self, EffectInstance, EffectType, ResolvedTransform};
 use zeditor_core::project::Project;
 use zeditor_core::timeline::{Clip, TimeRange, TimelinePosition, TrackType};
 
 use crate::audio_player::AudioPlayer;
-use crate::message::{ConfirmAction, ConfirmDialog, DragPayload, DragState, MenuAction, MenuId, Message, SourceDragPreview, ToolMode};
+use crate::message::{ConfirmAction, ConfirmDialog, DragPayload, DragState, LeftPanelTab, MenuAction, MenuId, Message, SourceDragPreview, ToolMode};
 use crate::widgets::timeline_canvas::TimelineCanvas;
 
 /// Preview resolution cap. 4K frames are scaled down to this for display.
@@ -77,6 +78,8 @@ pub struct App {
     pub hovered_asset_id: Option<Uuid>,
     pub selected_clip: Option<(usize, Uuid)>,
     pub confirm_dialog: Option<ConfirmDialog>,
+    pub left_panel_tab: LeftPanelTab,
+    pub current_frame_transform: ResolvedTransform,
     decode_tx: Option<mpsc::Sender<DecodeRequest>>,
     pub(crate) decode_rx: Option<mpsc::Receiver<DecodedFrame>>,
     pub(crate) decode_clip_id: Option<Uuid>,
@@ -115,6 +118,8 @@ impl Default for App {
             hovered_asset_id: None,
             selected_clip: None,
             confirm_dialog: None,
+            left_panel_tab: LeftPanelTab::default(),
+            current_frame_transform: ResolvedTransform::default(),
             decode_tx: None,
             decode_rx: None,
             decode_clip_id: None,
@@ -151,6 +156,8 @@ impl App {
         self.hovered_asset_id = None;
         self.selected_clip = None;
         self.confirm_dialog = None;
+        self.left_panel_tab = LeftPanelTab::default();
+        self.current_frame_transform = ResolvedTransform::default();
         self.thumbnails.clear();
         self.drag_state = None;
         self.timeline_zoom = 100.0;
@@ -1015,14 +1022,80 @@ impl App {
                 }
             }
             Message::Exit => iced::exit(),
+            Message::SwitchLeftPanelTab(tab) => {
+                self.left_panel_tab = tab;
+                Task::none()
+            }
+            Message::AddEffectToSelectedClip(effect_type) => {
+                if let Some((track_index, clip_id)) = self.selected_clip {
+                    let result = self.project.command_history.execute(
+                        &mut self.project.timeline,
+                        "Add effect",
+                        |tl| {
+                            let clip = tl.track_mut(track_index)?
+                                .get_clip_mut(clip_id)
+                                .ok_or(zeditor_core::error::CoreError::ClipNotFound(clip_id))?;
+                            clip.effects.push(EffectInstance::new(effect_type));
+                            Ok(())
+                        },
+                    );
+                    match result {
+                        Ok(()) => self.status_message = "Effect added".into(),
+                        Err(e) => self.status_message = format!("Add effect failed: {e}"),
+                    }
+                }
+                Task::none()
+            }
+            Message::RemoveEffectFromClip { track_index, clip_id, effect_id } => {
+                let result = self.project.command_history.execute(
+                    &mut self.project.timeline,
+                    "Remove effect",
+                    |tl| {
+                        let clip = tl.track_mut(track_index)?
+                            .get_clip_mut(clip_id)
+                            .ok_or(zeditor_core::error::CoreError::ClipNotFound(clip_id))?;
+                        clip.effects.retain(|e| e.id != effect_id);
+                        Ok(())
+                    },
+                );
+                match result {
+                    Ok(()) => self.status_message = "Effect removed".into(),
+                    Err(e) => self.status_message = format!("Remove effect failed: {e}"),
+                }
+                Task::none()
+            }
+            Message::UpdateEffectParameter { track_index, clip_id, effect_id, param_name, value } => {
+                if let Ok(float_val) = value.parse::<f64>() {
+                    let result = self.project.command_history.execute(
+                        &mut self.project.timeline,
+                        "Update effect parameter",
+                        |tl| {
+                            let clip = tl.track_mut(track_index)?
+                                .get_clip_mut(clip_id)
+                                .ok_or(zeditor_core::error::CoreError::ClipNotFound(clip_id))?;
+                            if let Some(effect) = clip.effects.iter_mut().find(|e| e.id == effect_id) {
+                                effect.set_float(&param_name, float_val);
+                            }
+                            Ok(())
+                        },
+                    );
+                    if let Err(e) = result {
+                        self.status_message = format!("Update effect failed: {e}");
+                    }
+                    // Trigger decode refresh to update preview
+                    self.send_decode_seek(false);
+                }
+                Task::none()
+            }
         }
     }
 
     pub fn view(&self) -> Element<'_, Message> {
         let menu_bar = self.view_menu_bar();
-        let source_panel = self.view_source_library();
+        let source_panel = self.view_left_panel();
         let video_viewport = self.view_video_viewport();
         let timeline_panel = self.view_timeline();
+        let effects_inspector = self.view_clip_effects_inspector();
 
         let pos_secs = self.playback_position.as_secs_f64();
         let total_secs = pos_secs as u64;
@@ -1068,6 +1141,9 @@ impl App {
 
         let top_row = row![source_panel, video_viewport].spacing(4);
 
+        // Timeline row: timeline panel + effects inspector
+        let timeline_row: Element<'_, Message> = row![timeline_panel, effects_inspector].spacing(4).into();
+
         // Main content area (without status bar)
         let main_content: Element<'_, Message> = if self.open_menu.is_some() {
             let click_off: Element<'_, Message> = mouse_area(
@@ -1080,7 +1156,7 @@ impl App {
 
             let dropdown = self.view_dropdown();
 
-            let content_below = column![top_row, timeline_panel, playback_info].spacing(4);
+            let content_below = column![top_row, timeline_row, playback_info].spacing(4);
 
             let stacked_content = stack![content_below, click_off, opaque(dropdown)]
                 .width(Length::Fill)
@@ -1091,7 +1167,7 @@ impl App {
                 .padding(4)
                 .into()
         } else {
-            column![menu_bar, top_row, timeline_panel, playback_info]
+            column![menu_bar, top_row, timeline_row, playback_info]
                 .spacing(4)
                 .padding(4)
                 .into()
@@ -1201,9 +1277,51 @@ impl App {
             .into()
     }
 
-    fn view_source_library(&self) -> Element<'_, Message> {
-        let title = text("Source Library").size(18);
+    fn view_left_panel(&self) -> Element<'_, Message> {
+        let tab_button = |label: &'static str, tab: LeftPanelTab| -> Element<'_, Message> {
+            let is_active = self.left_panel_tab == tab;
+            button(text(label).size(13).color(Color::WHITE))
+                .on_press(Message::SwitchLeftPanelTab(tab))
+                .padding([4, 10])
+                .style(move |_theme, _status| {
+                    let bg = if is_active {
+                        Color::from_rgb(0.35, 0.35, 0.38)
+                    } else {
+                        Color::from_rgb(0.22, 0.22, 0.24)
+                    };
+                    button::Style {
+                        background: Some(Background::Color(bg)),
+                        text_color: Color::WHITE,
+                        border: Border {
+                            radius: 4.0.into(),
+                            color: if is_active { Color::from_rgb(0.5, 0.5, 0.55) } else { Color::TRANSPARENT },
+                            width: if is_active { 1.0 } else { 0.0 },
+                            ..Default::default()
+                        },
+                        ..Default::default()
+                    }
+                })
+                .into()
+        };
 
+        let tabs = row![
+            tab_button("Project Library", LeftPanelTab::ProjectLibrary),
+            tab_button("Effects", LeftPanelTab::Effects),
+        ]
+        .spacing(4);
+
+        let content: Element<'_, Message> = match self.left_panel_tab {
+            LeftPanelTab::ProjectLibrary => self.view_source_library_content(),
+            LeftPanelTab::Effects => self.view_effects_browser(),
+        };
+
+        column![tabs, content]
+            .spacing(8)
+            .width(300)
+            .into()
+    }
+
+    fn view_source_library_content(&self) -> Element<'_, Message> {
         let import_btn =
             button(text("Import").size(14)).on_press(Message::OpenFileDialog);
 
@@ -1229,9 +1347,145 @@ impl App {
 
         let asset_grid = scrollable(column(grid_rows).spacing(6));
 
-        column![title, import_btn, asset_grid]
+        column![import_btn, asset_grid]
             .spacing(8)
-            .width(300)
+            .into()
+    }
+
+    fn view_effects_browser(&self) -> Element<'_, Message> {
+        let has_selection = self.selected_clip.is_some();
+        let mut items: Vec<Element<'_, Message>> = Vec::new();
+
+        for effect_type in EffectType::all_builtin() {
+            let label = text(effect_type.display_name()).size(14).color(Color::WHITE);
+            let mut add_btn = button(text("Add to Clip").size(12))
+                .padding([4, 8]);
+            if has_selection {
+                add_btn = add_btn.on_press(Message::AddEffectToSelectedClip(effect_type));
+            }
+            items.push(
+                row![label, Space::new().width(Length::Fill), add_btn]
+                    .spacing(8)
+                    .align_y(iced::Alignment::Center)
+                    .padding([4, 0])
+                    .into(),
+            );
+        }
+
+        if items.is_empty() {
+            column![text("No effects available").size(14).color(Color::from_rgb(0.5, 0.5, 0.5))]
+                .into()
+        } else {
+            scrollable(column(items).spacing(4)).into()
+        }
+    }
+
+    fn view_clip_effects_inspector(&self) -> Element<'_, Message> {
+        let (track_index, clip_id) = match self.selected_clip {
+            Some(sel) => sel,
+            None => {
+                return container(
+                    text("No clip selected").size(13).color(Color::from_rgb(0.5, 0.5, 0.5))
+                )
+                .width(250)
+                .padding(8)
+                .into();
+            }
+        };
+
+        let clip = self.project.timeline.track(track_index)
+            .ok()
+            .and_then(|t| t.get_clip(clip_id));
+
+        let clip = match clip {
+            Some(c) => c,
+            None => {
+                return container(
+                    text("Clip not found").size(13).color(Color::from_rgb(0.5, 0.5, 0.5))
+                )
+                .width(250)
+                .padding(8)
+                .into();
+            }
+        };
+
+        let title = text("Clip Effects").size(16).color(Color::WHITE);
+        let mut items: Vec<Element<'_, Message>> = vec![title.into()];
+
+        if clip.effects.is_empty() {
+            items.push(
+                text("No effects").size(13).color(Color::from_rgb(0.5, 0.5, 0.5)).into()
+            );
+        } else {
+            for effect in &clip.effects {
+                let effect_name = text(effect.effect_type.display_name())
+                    .size(14)
+                    .color(Color::from_rgb(0.9, 0.9, 0.9));
+
+                let remove_btn = button(text("Remove").size(11))
+                    .on_press(Message::RemoveEffectFromClip {
+                        track_index,
+                        clip_id,
+                        effect_id: effect.id,
+                    })
+                    .padding([2, 6])
+                    .style(|_theme, _status| button::Style {
+                        background: Some(Background::Color(Color::from_rgb(0.6, 0.2, 0.2))),
+                        text_color: Color::WHITE,
+                        border: Border { radius: 3.0.into(), ..Default::default() },
+                        ..Default::default()
+                    });
+
+                items.push(
+                    row![effect_name, Space::new().width(Length::Fill), remove_btn]
+                        .align_y(iced::Alignment::Center)
+                        .into()
+                );
+
+                // Parameter inputs
+                for def in effect.effect_type.parameter_definitions() {
+                    let current_val = effect.get_float(&def.name).unwrap_or(0.0);
+                    let val_str = if current_val == current_val.trunc() {
+                        format!("{:.0}", current_val)
+                    } else {
+                        format!("{}", current_val)
+                    };
+                    let param_label = text(def.label.clone()).size(12).color(Color::from_rgb(0.7, 0.7, 0.7));
+                    let effect_id = effect.id;
+                    let param_name = def.name.clone();
+                    let input = iced::widget::text_input("0", &val_str)
+                        .on_input(move |v| Message::UpdateEffectParameter {
+                            track_index,
+                            clip_id,
+                            effect_id,
+                            param_name: param_name.clone(),
+                            value: v,
+                        })
+                        .size(12)
+                        .width(80);
+                    items.push(
+                        row![param_label, Space::new().width(Length::Fill), input]
+                            .spacing(4)
+                            .align_y(iced::Alignment::Center)
+                            .padding(Padding { top: 0.0, right: 0.0, bottom: 0.0, left: 8.0 })
+                            .into()
+                    );
+                }
+            }
+        }
+
+        container(scrollable(column(items).spacing(6)))
+            .width(250)
+            .padding(8)
+            .style(|_theme| container::Style {
+                background: Some(Background::Color(Color::from_rgb(0.16, 0.16, 0.18))),
+                border: Border {
+                    color: Color::from_rgb(0.25, 0.25, 0.28),
+                    width: 1.0,
+                    radius: 4.0.into(),
+                },
+                ..Default::default()
+            })
             .into()
     }
 
@@ -1315,20 +1569,40 @@ impl App {
             / self.project.settings.canvas_height as f32;
         let canvas_preview_width = (viewport_height * canvas_aspect).round();
 
+        // Compute preview scale: how many preview pixels per canvas pixel
+        let preview_scale = canvas_preview_width / self.project.settings.canvas_width as f32;
+        let tx = self.current_frame_transform;
+        let offset_x = (tx.x_offset as f32 * preview_scale).round();
+        let offset_y = (tx.y_offset as f32 * preview_scale).round();
+
         let video_area: Element<'_, Message> = if let Some(handle) = &self.current_frame {
             // Black inner container at canvas aspect ratio with the video inside
-            let inner = container(
-                iced::widget::image(handle.clone())
-                    .content_fit(iced::ContentFit::Contain)
-                    .width(Length::Fill)
-                    .height(Length::Fill),
-            )
-            .width(canvas_preview_width)
-            .height(viewport_height)
-            .style(|_theme| container::Style {
-                background: Some(Background::Color(Color::BLACK)),
-                ..Default::default()
-            });
+            let img: Element<'_, Message> = iced::widget::image(handle.clone())
+                .content_fit(iced::ContentFit::Contain)
+                .width(Length::Fill)
+                .height(Length::Fill)
+                .into();
+
+            // Apply transform offset using padding
+            let shifted: Element<'_, Message> = container(img)
+                .padding(Padding {
+                    top: offset_y.max(0.0),
+                    left: offset_x.max(0.0),
+                    bottom: (-offset_y).max(0.0),
+                    right: (-offset_x).max(0.0),
+                })
+                .width(Length::Fill)
+                .height(Length::Fill)
+                .into();
+
+            let inner = container(shifted)
+                .width(canvas_preview_width)
+                .height(viewport_height)
+                .clip(true)
+                .style(|_theme| container::Style {
+                    background: Some(Background::Color(Color::BLACK)),
+                    ..Default::default()
+                });
             // Outer dark container centers the inner canvas box
             container(center(inner))
                 .width(Length::Fill)
@@ -1649,10 +1923,11 @@ impl App {
                         clip.asset_id,
                         clip.timeline_range.start.as_secs_f64(),
                         clip.source_range.start.as_secs_f64(),
+                        effects::resolve_transform(&clip.effects),
                     )
                 });
 
-        if let Some((clip_id, asset_id, clip_tl_start, clip_src_start)) = clip_info {
+        if let Some((clip_id, asset_id, clip_tl_start, clip_src_start, transform)) = clip_info {
             let playback_pos = self.playback_position.as_secs_f64();
             let source_time = clip_src_start + (playback_pos - clip_tl_start);
             let path = self
@@ -1663,6 +1938,7 @@ impl App {
 
             if let Some(path) = path {
                 self.decode_clip_id = Some(clip_id);
+                self.current_frame_transform = transform;
                 // Store offset so we can convert source PTS → timeline time:
                 // timeline_time = pts_secs + (clip_tl_start - clip_src_start)
                 self.decode_time_offset = clip_tl_start - clip_src_start;
@@ -1678,6 +1954,7 @@ impl App {
         }
         self.decode_clip_id = None;
         self.current_frame = None;
+        self.current_frame_transform = ResolvedTransform::default();
         self.pending_frame = None;
         self.send_decode_stop();
     }

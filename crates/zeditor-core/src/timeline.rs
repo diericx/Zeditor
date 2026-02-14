@@ -3,6 +3,7 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+use crate::effects::EffectInstance;
 use crate::error::{CoreError, Result};
 
 /// A position on the timeline, represented as a duration from the start.
@@ -87,6 +88,9 @@ pub struct Clip {
     /// Clips with the same link_id move/resize/cut together.
     #[serde(default)]
     pub link_id: Option<Uuid>,
+    /// Effects applied to this clip.
+    #[serde(default)]
+    pub effects: Vec<EffectInstance>,
 }
 
 impl Clip {
@@ -107,6 +111,7 @@ impl Clip {
             timeline_range,
             source_range,
             link_id: None,
+            effects: Vec::new(),
         }
     }
 
@@ -246,6 +251,7 @@ impl Track {
                         end: existing.source_range.end,
                     },
                     link_id: existing.link_id,
+                    effects: existing.effects.clone(),
                 };
                 to_add.push(right_piece);
 
@@ -651,6 +657,7 @@ impl Timeline {
             TimelinePosition(clip.source_range.start.as_duration() + offset_in_clip);
 
         let clip_link_id = clip.link_id;
+        let clip_effects = clip.effects.clone();
 
         // Left clip: original start to cut position.
         let left = Clip {
@@ -665,6 +672,7 @@ impl Timeline {
                 end: source_split,
             },
             link_id: clip_link_id,
+            effects: clip_effects.clone(),
         };
 
         // Right clip: cut position to original end.
@@ -680,6 +688,7 @@ impl Timeline {
                 end: clip.source_range.end,
             },
             link_id: clip_link_id,
+            effects: clip_effects,
         };
 
         let left_id = left.id;

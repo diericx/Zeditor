@@ -1,6 +1,7 @@
 use std::path::PathBuf;
 
 use uuid::Uuid;
+use zeditor_core::effects::EffectType;
 use zeditor_core::timeline::TimelinePosition;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -8,6 +9,13 @@ pub enum ToolMode {
     #[default]
     Arrow,
     Blade,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum LeftPanelTab {
+    #[default]
+    ProjectLibrary,
+    Effects,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -166,4 +174,22 @@ pub enum Message {
     CloseMenu,
     MenuAction(MenuAction),
     Exit,
+
+    // Left panel tabs
+    SwitchLeftPanelTab(LeftPanelTab),
+
+    // Effects
+    AddEffectToSelectedClip(EffectType),
+    RemoveEffectFromClip {
+        track_index: usize,
+        clip_id: Uuid,
+        effect_id: Uuid,
+    },
+    UpdateEffectParameter {
+        track_index: usize,
+        clip_id: Uuid,
+        effect_id: Uuid,
+        param_name: String,
+        value: String,
+    },
 }

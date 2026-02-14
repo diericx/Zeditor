@@ -1759,3 +1759,283 @@ fn test_delete_key_no_selection_noop() {
 
     assert_eq!(app.project.timeline.tracks[0].clips.len(), 1);
 }
+
+// =============================================================================
+// Effects tests
+// =============================================================================
+
+fn setup_app_with_clip() -> (App, uuid::Uuid, uuid::Uuid) {
+    let mut app = App::new();
+    let asset = make_test_asset("clip1", 5.0);
+    let asset_id = asset.id;
+    app.update(Message::MediaImported(Ok(asset)));
+    app.update(Message::AddClipToTimeline {
+        asset_id,
+        track_index: 0,
+        position: TimelinePosition::zero(),
+    });
+    let clip_id = app.project.timeline.tracks[0].clips[0].id;
+    app.update(Message::SelectTimelineClip(Some((0, clip_id))));
+    (app, asset_id, clip_id)
+}
+
+#[test]
+fn test_add_effect_to_selected_clip() {
+    let (mut app, _, clip_id) = setup_app_with_clip();
+
+    app.update(Message::AddEffectToSelectedClip(
+        zeditor_core::effects::EffectType::Transform,
+    ));
+
+    let clip = app.project.timeline.tracks[0].get_clip(clip_id).unwrap();
+    assert_eq!(clip.effects.len(), 1);
+    assert_eq!(
+        clip.effects[0].effect_type,
+        zeditor_core::effects::EffectType::Transform
+    );
+    assert_eq!(clip.effects[0].get_float("x_offset"), Some(0.0));
+    assert_eq!(clip.effects[0].get_float("y_offset"), Some(0.0));
+}
+
+#[test]
+fn test_add_effect_no_selection() {
+    let mut app = App::new();
+    let asset = make_test_asset("clip1", 5.0);
+    let asset_id = asset.id;
+    app.update(Message::MediaImported(Ok(asset)));
+    app.update(Message::AddClipToTimeline {
+        asset_id,
+        track_index: 0,
+        position: TimelinePosition::zero(),
+    });
+
+    app.update(Message::AddEffectToSelectedClip(
+        zeditor_core::effects::EffectType::Transform,
+    ));
+
+    let clip = &app.project.timeline.tracks[0].clips[0];
+    assert_eq!(clip.effects.len(), 0);
+}
+
+#[test]
+fn test_remove_effect_from_clip() {
+    let (mut app, _, clip_id) = setup_app_with_clip();
+
+    app.update(Message::AddEffectToSelectedClip(
+        zeditor_core::effects::EffectType::Transform,
+    ));
+    let effect_id = app.project.timeline.tracks[0]
+        .get_clip(clip_id)
+        .unwrap()
+        .effects[0]
+        .id;
+
+    app.update(Message::RemoveEffectFromClip {
+        track_index: 0,
+        clip_id,
+        effect_id,
+    });
+
+    let clip = app.project.timeline.tracks[0].get_clip(clip_id).unwrap();
+    assert_eq!(clip.effects.len(), 0);
+}
+
+#[test]
+fn test_update_effect_parameter() {
+    let (mut app, _, clip_id) = setup_app_with_clip();
+
+    app.update(Message::AddEffectToSelectedClip(
+        zeditor_core::effects::EffectType::Transform,
+    ));
+    let effect_id = app.project.timeline.tracks[0]
+        .get_clip(clip_id)
+        .unwrap()
+        .effects[0]
+        .id;
+
+    app.update(Message::UpdateEffectParameter {
+        track_index: 0,
+        clip_id,
+        effect_id,
+        param_name: "x_offset".into(),
+        value: "150.5".into(),
+    });
+
+    let clip = app.project.timeline.tracks[0].get_clip(clip_id).unwrap();
+    assert_eq!(clip.effects[0].get_float("x_offset"), Some(150.5));
+}
+
+#[test]
+fn test_update_effect_parameter_invalid_value() {
+    let (mut app, _, clip_id) = setup_app_with_clip();
+
+    app.update(Message::AddEffectToSelectedClip(
+        zeditor_core::effects::EffectType::Transform,
+    ));
+    let effect_id = app.project.timeline.tracks[0]
+        .get_clip(clip_id)
+        .unwrap()
+        .effects[0]
+        .id;
+
+    app.update(Message::UpdateEffectParameter {
+        track_index: 0,
+        clip_id,
+        effect_id,
+        param_name: "x_offset".into(),
+        value: "not_a_number".into(),
+    });
+
+    let clip = app.project.timeline.tracks[0].get_clip(clip_id).unwrap();
+    assert_eq!(clip.effects[0].get_float("x_offset"), Some(0.0));
+}
+
+#[test]
+fn test_undo_redo_add_effect() {
+    let (mut app, _, clip_id) = setup_app_with_clip();
+
+    app.update(Message::AddEffectToSelectedClip(
+        zeditor_core::effects::EffectType::Transform,
+    ));
+    assert_eq!(
+        app.project.timeline.tracks[0]
+            .get_clip(clip_id)
+            .unwrap()
+            .effects
+            .len(),
+        1
+    );
+
+    app.update(Message::Undo);
+    assert_eq!(
+        app.project.timeline.tracks[0]
+            .get_clip(clip_id)
+            .unwrap()
+            .effects
+            .len(),
+        0
+    );
+
+    app.update(Message::Redo);
+    assert_eq!(
+        app.project.timeline.tracks[0]
+            .get_clip(clip_id)
+            .unwrap()
+            .effects
+            .len(),
+        1
+    );
+}
+
+#[test]
+fn test_undo_redo_remove_effect() {
+    let (mut app, _, clip_id) = setup_app_with_clip();
+
+    app.update(Message::AddEffectToSelectedClip(
+        zeditor_core::effects::EffectType::Transform,
+    ));
+    let effect_id = app.project.timeline.tracks[0]
+        .get_clip(clip_id)
+        .unwrap()
+        .effects[0]
+        .id;
+
+    app.update(Message::RemoveEffectFromClip {
+        track_index: 0,
+        clip_id,
+        effect_id,
+    });
+    assert_eq!(
+        app.project.timeline.tracks[0]
+            .get_clip(clip_id)
+            .unwrap()
+            .effects
+            .len(),
+        0
+    );
+
+    app.update(Message::Undo);
+    assert_eq!(
+        app.project.timeline.tracks[0]
+            .get_clip(clip_id)
+            .unwrap()
+            .effects
+            .len(),
+        1
+    );
+}
+
+#[test]
+fn test_undo_redo_update_effect_parameter() {
+    let (mut app, _, clip_id) = setup_app_with_clip();
+
+    app.update(Message::AddEffectToSelectedClip(
+        zeditor_core::effects::EffectType::Transform,
+    ));
+    let effect_id = app.project.timeline.tracks[0]
+        .get_clip(clip_id)
+        .unwrap()
+        .effects[0]
+        .id;
+
+    app.update(Message::UpdateEffectParameter {
+        track_index: 0,
+        clip_id,
+        effect_id,
+        param_name: "x_offset".into(),
+        value: "200".into(),
+    });
+    assert_eq!(
+        app.project.timeline.tracks[0]
+            .get_clip(clip_id)
+            .unwrap()
+            .effects[0]
+            .get_float("x_offset"),
+        Some(200.0)
+    );
+
+    app.update(Message::Undo);
+    assert_eq!(
+        app.project.timeline.tracks[0]
+            .get_clip(clip_id)
+            .unwrap()
+            .effects[0]
+            .get_float("x_offset"),
+        Some(0.0)
+    );
+
+    app.update(Message::Redo);
+    assert_eq!(
+        app.project.timeline.tracks[0]
+            .get_clip(clip_id)
+            .unwrap()
+            .effects[0]
+            .get_float("x_offset"),
+        Some(200.0)
+    );
+}
+
+#[test]
+fn test_switch_left_panel_tab() {
+    let mut app = App::new();
+    assert_eq!(
+        app.left_panel_tab,
+        zeditor_ui::message::LeftPanelTab::ProjectLibrary
+    );
+
+    app.update(Message::SwitchLeftPanelTab(
+        zeditor_ui::message::LeftPanelTab::Effects,
+    ));
+    assert_eq!(
+        app.left_panel_tab,
+        zeditor_ui::message::LeftPanelTab::Effects
+    );
+
+    app.update(Message::SwitchLeftPanelTab(
+        zeditor_ui::message::LeftPanelTab::ProjectLibrary,
+    ));
+    assert_eq!(
+        app.left_panel_tab,
+        zeditor_ui::message::LeftPanelTab::ProjectLibrary
+    );
+}

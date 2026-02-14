@@ -1,6 +1,7 @@
 use std::time::Duration;
 
 use uuid::Uuid;
+use zeditor_core::effects::{EffectInstance, EffectType};
 use zeditor_core::timeline::*;
 
 fn make_clip(asset_id: Uuid, start_secs: f64, duration_secs: f64) -> Clip {
@@ -1056,4 +1057,55 @@ fn test_split_by_overlap_mirrors_on_linked_track() {
     assert_eq!(left_linked.len(), 2, "left group should have exactly 2 clips");
     let right_linked = timeline.find_linked_clips(right_v.link_id.unwrap());
     assert_eq!(right_linked.len(), 2, "right group should have exactly 2 clips");
+}
+
+#[test]
+fn test_cut_preserves_effects() {
+    let mut timeline = Timeline::new();
+    timeline.add_track("Video 1", TrackType::Video);
+
+    let asset_id = Uuid::new_v4();
+    let mut clip = make_clip(asset_id, 0.0, 10.0);
+    let mut effect = EffectInstance::new(EffectType::Transform);
+    effect.set_float("x_offset", 42.0);
+    clip.effects.push(effect);
+
+    timeline.add_clip(0, clip).unwrap();
+    let (left_id, right_id) = timeline.cut_at(0, TimelinePosition::from_secs_f64(5.0)).unwrap();
+
+    let left = timeline.track(0).unwrap().get_clip(left_id).unwrap();
+    let right = timeline.track(0).unwrap().get_clip(right_id).unwrap();
+
+    assert_eq!(left.effects.len(), 1);
+    assert_eq!(right.effects.len(), 1);
+    assert_eq!(left.effects[0].get_float("x_offset"), Some(42.0));
+    assert_eq!(right.effects[0].get_float("x_offset"), Some(42.0));
+}
+
+#[test]
+fn test_split_by_overlap_preserves_effects() {
+    let mut timeline = Timeline::new();
+    timeline.add_track("Video 1", TrackType::Video);
+
+    let asset_id = Uuid::new_v4();
+    let mut clip = make_clip(asset_id, 0.0, 10.0);
+    let mut effect = EffectInstance::new(EffectType::Transform);
+    effect.set_float("y_offset", -100.0);
+    clip.effects.push(effect);
+
+    timeline.track_mut(0).unwrap().add_clip_trimming_overlaps(clip);
+
+    // Place a new clip in the middle [3, 7) to split the original
+    let new_clip = make_clip(asset_id, 3.0, 4.0);
+    timeline.track_mut(0).unwrap().add_clip_trimming_overlaps(new_clip);
+
+    // Should have 3 clips: left [0,3), new [3,7), right [7,10)
+    assert_eq!(timeline.tracks[0].clips.len(), 3);
+
+    let left = &timeline.tracks[0].clips[0];
+    let right = &timeline.tracks[0].clips[2];
+    assert_eq!(left.effects.len(), 1);
+    assert_eq!(left.effects[0].get_float("y_offset"), Some(-100.0));
+    assert_eq!(right.effects.len(), 1);
+    assert_eq!(right.effects[0].get_float("y_offset"), Some(-100.0));
 }

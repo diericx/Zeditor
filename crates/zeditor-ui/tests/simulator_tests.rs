@@ -27,8 +27,8 @@ fn test_view_renders_source_library() {
     let mut ui = simulator(app.view());
 
     assert!(
-        ui.find("Source Library").is_ok(),
-        "Should show 'Source Library'"
+        ui.find("Project Library").is_ok(),
+        "Should show 'Project Library' tab"
     );
 }
 
@@ -189,7 +189,7 @@ fn test_three_panel_layout_renders() {
     let mut ui = simulator(app.view());
 
     // Source panel
-    assert!(ui.find("Source Library").is_ok());
+    assert!(ui.find("Project Library").is_ok());
     // Video viewport
     assert!(ui.find("No video").is_ok());
     // Controls (Undo/Redo visible)
