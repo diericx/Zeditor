@@ -34,6 +34,44 @@ pub fn generate_test_video(output_dir: &Path, name: &str, duration_secs: f64) ->
     output_path
 }
 
+/// Generate a test video with a specific resolution.
+pub fn generate_test_video_with_size(
+    output_dir: &Path,
+    name: &str,
+    duration_secs: f64,
+    width: u32,
+    height: u32,
+) -> PathBuf {
+    let output_path = output_dir.join(format!("{name}.mp4"));
+
+    let status = Command::new("ffmpeg")
+        .args([
+            "-y",
+            "-f",
+            "lavfi",
+            "-i",
+            &format!("testsrc=duration={duration_secs}:size={width}x{height}:rate=30"),
+            "-c:v",
+            "libx264",
+            "-pix_fmt",
+            "yuv420p",
+            "-preset",
+            "ultrafast",
+        ])
+        .arg(&output_path)
+        .stderr(std::process::Stdio::null())
+        .status()
+        .expect("ffmpeg must be installed to generate test fixtures");
+
+    assert!(
+        status.success(),
+        "ffmpeg failed to generate test video {name}"
+    );
+    assert!(output_path.exists(), "test video was not created: {name}");
+
+    output_path
+}
+
 /// Generate a test video with audio.
 pub fn generate_test_video_with_audio(
     output_dir: &Path,
@@ -89,6 +127,15 @@ mod tests {
     fn test_generate_test_video() {
         let dir = fixture_dir();
         let path = generate_test_video(dir.path(), "test_basic", 1.0);
+        assert!(path.exists());
+        let metadata = std::fs::metadata(&path).unwrap();
+        assert!(metadata.len() > 0, "generated video should not be empty");
+    }
+
+    #[test]
+    fn test_generate_test_video_with_size() {
+        let dir = fixture_dir();
+        let path = generate_test_video_with_size(dir.path(), "test_sized", 1.0, 500, 500);
         assert!(path.exists());
         let metadata = std::fs::metadata(&path).unwrap();
         assert!(metadata.len() > 0, "generated video should not be empty");

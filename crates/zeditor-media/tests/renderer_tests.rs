@@ -1,8 +1,11 @@
 use std::path::PathBuf;
 
 use zeditor_core::media::{MediaAsset, SourceLibrary};
+use zeditor_core::project::ProjectSettings;
 use zeditor_core::timeline::{Clip, TimeRange, Timeline, TimelinePosition};
-use zeditor_media::renderer::{derive_render_config, render_timeline, RenderConfig, ScalingAlgorithm};
+use zeditor_media::renderer::{
+    compute_canvas_layout, derive_render_config, render_timeline, RenderConfig, ScalingAlgorithm,
+};
 use zeditor_test_harness::fixtures;
 
 /// Helper: create a timeline with one video track, one audio track,
@@ -39,6 +42,8 @@ fn test_render_config_defaults() {
     let config = RenderConfig::default_with_path(PathBuf::from("/tmp/test.mkv"));
     assert_eq!(config.width, 1920);
     assert_eq!(config.height, 1080);
+    assert_eq!(config.canvas_width, 1920);
+    assert_eq!(config.canvas_height, 1080);
     assert!((config.fps - 30.0).abs() < 0.001);
     assert_eq!(config.crf, 22);
     assert_eq!(config.preset, "superfast");
@@ -59,6 +64,8 @@ fn test_render_single_clip() {
         output_path: output_path.clone(),
         width: 320,
         height: 240,
+        canvas_width: 320,
+        canvas_height: 240,
         fps: 30.0,
         crf: 22,
         preset: "superfast".to_string(),
@@ -115,6 +122,8 @@ fn test_render_with_gap() {
         output_path: output_path.clone(),
         width: 320,
         height: 240,
+        canvas_width: 320,
+        canvas_height: 240,
         fps: 30.0,
         crf: 22,
         preset: "superfast".to_string(),
@@ -179,6 +188,8 @@ fn test_render_multiple_clips() {
         output_path: output_path.clone(),
         width: 320,
         height: 240,
+        canvas_width: 320,
+        canvas_height: 240,
         fps: 30.0,
         crf: 22,
         preset: "superfast".to_string(),
@@ -213,6 +224,8 @@ fn test_render_with_audio() {
         output_path: output_path.clone(),
         width: 320,
         height: 240,
+        canvas_width: 320,
+        canvas_height: 240,
         fps: 30.0,
         crf: 22,
         preset: "superfast".to_string(),
@@ -249,10 +262,13 @@ fn test_derive_render_config_from_asset() {
     let asset = zeditor_media::probe::probe(&video_path).unwrap();
     let (timeline, source_library) = single_clip_timeline(&asset, false);
 
-    let config = derive_render_config(&timeline, &source_library, output_path.clone());
-    // Resolution always stays at default 1920x1080 regardless of source
+    let settings = ProjectSettings::default();
+    let config = derive_render_config(&timeline, &source_library, &settings, output_path.clone());
+    // Resolution matches project settings (default 1920x1080)
     assert_eq!(config.width, 1920);
     assert_eq!(config.height, 1080);
+    assert_eq!(config.canvas_width, 1920);
+    assert_eq!(config.canvas_height, 1080);
     // FPS should be derived from source (~25fps for testsrc)
     assert!(config.fps > 0.0, "FPS should be derived from source");
     assert_eq!(config.scaling, ScalingAlgorithm::Lanczos);
@@ -265,7 +281,8 @@ fn test_derive_render_config_empty_timeline() {
     let source_library = SourceLibrary::new();
     let output_path = PathBuf::from("/tmp/empty_output.mkv");
 
-    let config = derive_render_config(&timeline, &source_library, output_path);
+    let settings = ProjectSettings::default();
+    let config = derive_render_config(&timeline, &source_library, &settings, output_path);
     // Should fall back to defaults
     assert_eq!(config.width, 1920);
     assert_eq!(config.height, 1080);
@@ -288,6 +305,8 @@ fn test_render_upscale_to_1080p() {
         output_path: output_path.clone(),
         width: 1920,
         height: 1080,
+        canvas_width: 1920,
+        canvas_height: 1080,
         fps: 30.0,
         crf: 22,
         preset: "superfast".to_string(),
@@ -325,6 +344,8 @@ fn test_render_upscale_with_audio() {
         output_path: output_path.clone(),
         width: 1920,
         height: 1080,
+        canvas_width: 1920,
+        canvas_height: 1080,
         fps: 30.0,
         crf: 22,
         preset: "superfast".to_string(),
@@ -357,10 +378,179 @@ fn test_derive_render_config_preserves_1080p_with_any_source() {
     let (timeline, source_library) = single_clip_timeline(&asset, false);
     let output_path = PathBuf::from("/tmp/derive_preserve_output.mkv");
 
-    let config = derive_render_config(&timeline, &source_library, output_path);
+    let settings = ProjectSettings::default();
+    let config = derive_render_config(&timeline, &source_library, &settings, output_path);
     assert_eq!(config.width, 1920);
     assert_eq!(config.height, 1080);
+    assert_eq!(config.canvas_width, 1920);
+    assert_eq!(config.canvas_height, 1080);
     assert_eq!(config.scaling, ScalingAlgorithm::Lanczos);
     // FPS should be derived from the source asset
     assert!(config.fps > 0.0, "FPS should be derived from source");
+}
+
+// =============================================================================
+// Canvas composition tests
+// =============================================================================
+
+#[test]
+fn test_compute_canvas_layout() {
+    // 4:3 source on 16:9 canvas at 1920x1080 render
+    // Source 320x240 (4:3) fits 1440x1080 centered in 1920x1080 canvas
+    let layout = compute_canvas_layout(320, 240, 1920, 1080, 1920, 1080);
+    assert_eq!(layout.clip_w, 1440);
+    assert_eq!(layout.clip_h, 1080);
+    assert_eq!(layout.clip_x, 240);
+    assert_eq!(layout.clip_y, 0);
+    // All values must be even
+    assert_eq!(layout.clip_w % 2, 0);
+    assert_eq!(layout.clip_h % 2, 0);
+    assert_eq!(layout.clip_x % 2, 0);
+    assert_eq!(layout.clip_y % 2, 0);
+
+    // Square source on widescreen canvas
+    let layout2 = compute_canvas_layout(500, 500, 1920, 1080, 1920, 1080);
+    assert_eq!(layout2.clip_h, 1080);
+    assert_eq!(layout2.clip_w, 1080);
+    // Centered horizontally: (1920 - 1080) / 2 = 420
+    assert_eq!(layout2.clip_x, 420);
+    assert_eq!(layout2.clip_y, 0);
+
+    // Source matches canvas exactly
+    let layout3 = compute_canvas_layout(1920, 1080, 1920, 1080, 1920, 1080);
+    assert_eq!(layout3.clip_w, 1920);
+    assert_eq!(layout3.clip_h, 1080);
+    assert_eq!(layout3.clip_x, 0);
+    assert_eq!(layout3.clip_y, 0);
+
+    // Different render vs canvas aspect ratio (e.g. render 4:3 from 16:9 canvas)
+    let layout4 = compute_canvas_layout(320, 240, 1920, 1080, 1280, 960);
+    // Canvas 16:9 scaled to fit 1280x960 (4:3): width=1280, height=720, offset_y=120
+    // Clip 4:3 in canvas: 1440x1080, centered at (240, 0)
+    // Mapped to render: clip_w=1440*(1280/1920)=960, clip_h=1080*(1280/1920)=720
+    // clip_x = 120 + 240*(1280/1920) = 120+160 = 280... let me verify with even rounding
+    assert_eq!(layout4.clip_w % 2, 0);
+    assert_eq!(layout4.clip_h % 2, 0);
+    assert_eq!(layout4.clip_x % 2, 0);
+    assert_eq!(layout4.clip_y % 2, 0);
+    // Clip should not exceed render bounds
+    assert!(layout4.clip_x + layout4.clip_w <= 1280);
+    assert!(layout4.clip_y + layout4.clip_h <= 960);
+}
+
+#[test]
+fn test_render_canvas_composition() {
+    // 500x500 source on 1920x1080 canvas, rendered at 1920x1080
+    // The clip should be letterboxed (pillarboxed) within the output
+    let dir = fixtures::fixture_dir();
+    let video_path =
+        fixtures::generate_test_video_with_size(dir.path(), "canvas_compose", 2.0, 500, 500);
+    let output_path = dir.path().join("output_canvas_compose.mkv");
+
+    let asset = zeditor_media::probe::probe(&video_path).unwrap();
+    assert_eq!(asset.width, 500);
+    assert_eq!(asset.height, 500);
+
+    let (timeline, source_library) = single_clip_timeline(&asset, false);
+
+    let config = RenderConfig {
+        output_path: output_path.clone(),
+        width: 1920,
+        height: 1080,
+        canvas_width: 1920,
+        canvas_height: 1080,
+        fps: 30.0,
+        crf: 22,
+        preset: "superfast".to_string(),
+        scaling: ScalingAlgorithm::Lanczos,
+    };
+
+    render_timeline(&timeline, &source_library, &config).unwrap();
+
+    let output_asset = zeditor_media::probe::probe(&output_path).unwrap();
+    assert_eq!(output_asset.width, 1920);
+    assert_eq!(output_asset.height, 1080);
+    let dur = output_asset.duration.as_secs_f64();
+    assert!(
+        dur >= 1.5 && dur <= 3.0,
+        "Expected ~2s duration, got {dur}s"
+    );
+}
+
+#[test]
+fn test_render_canvas_downscale() {
+    // 320x240 source on 1920x1080 canvas, rendered at 1280x720
+    // Output should be 1280x720 with the clip properly scaled
+    let dir = fixtures::fixture_dir();
+    let video_path = fixtures::generate_test_video(dir.path(), "canvas_downscale", 2.0);
+    let output_path = dir.path().join("output_canvas_downscale.mkv");
+
+    let asset = zeditor_media::probe::probe(&video_path).unwrap();
+    assert_eq!(asset.width, 320);
+    assert_eq!(asset.height, 240);
+
+    let (timeline, source_library) = single_clip_timeline(&asset, false);
+
+    let config = RenderConfig {
+        output_path: output_path.clone(),
+        width: 1280,
+        height: 720,
+        canvas_width: 1920,
+        canvas_height: 1080,
+        fps: 30.0,
+        crf: 22,
+        preset: "superfast".to_string(),
+        scaling: ScalingAlgorithm::Lanczos,
+    };
+
+    render_timeline(&timeline, &source_library, &config).unwrap();
+
+    let output_asset = zeditor_media::probe::probe(&output_path).unwrap();
+    assert_eq!(output_asset.width, 1280);
+    assert_eq!(output_asset.height, 720);
+    let dur = output_asset.duration.as_secs_f64();
+    assert!(
+        dur >= 1.5 && dur <= 3.0,
+        "Expected ~2s duration, got {dur}s"
+    );
+}
+
+#[test]
+fn test_render_source_matches_canvas() {
+    // 320x240 source on 320x240 canvas, rendered at 320x240
+    // Clip should fill the entire frame (no borders)
+    let dir = fixtures::fixture_dir();
+    let video_path = fixtures::generate_test_video(dir.path(), "canvas_match", 2.0);
+    let output_path = dir.path().join("output_canvas_match.mkv");
+
+    let asset = zeditor_media::probe::probe(&video_path).unwrap();
+    assert_eq!(asset.width, 320);
+    assert_eq!(asset.height, 240);
+
+    let (timeline, source_library) = single_clip_timeline(&asset, false);
+
+    let config = RenderConfig {
+        output_path: output_path.clone(),
+        width: 320,
+        height: 240,
+        canvas_width: 320,
+        canvas_height: 240,
+        fps: 30.0,
+        crf: 22,
+        preset: "superfast".to_string(),
+        scaling: ScalingAlgorithm::Lanczos,
+    };
+
+    render_timeline(&timeline, &source_library, &config).unwrap();
+
+    let output_asset = zeditor_media::probe::probe(&output_path).unwrap();
+    assert_eq!(output_asset.width, 320);
+    assert_eq!(output_asset.height, 240);
+
+    // Verify layout: clip should fill entire frame
+    let layout = compute_canvas_layout(320, 240, 320, 240, 320, 240);
+    assert_eq!(layout.clip_x, 0);
+    assert_eq!(layout.clip_y, 0);
+    assert_eq!(layout.clip_w, 320);
+    assert_eq!(layout.clip_h, 240);
 }

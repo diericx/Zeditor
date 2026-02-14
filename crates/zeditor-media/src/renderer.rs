@@ -10,6 +10,7 @@ use rsmpeg::swresample::SwrContext;
 use rsmpeg::swscale::SwsContext;
 
 use zeditor_core::media::SourceLibrary;
+use zeditor_core::project::ProjectSettings;
 use zeditor_core::timeline::{Timeline, TimelinePosition, TrackType};
 
 use crate::decoder::{FfmpegDecoder, VideoDecoder};
@@ -43,6 +44,8 @@ pub struct RenderConfig {
     pub output_path: PathBuf,
     pub width: u32,
     pub height: u32,
+    pub canvas_width: u32,
+    pub canvas_height: u32,
     pub fps: f64,
     pub crf: u32,
     pub preset: String,
@@ -50,12 +53,14 @@ pub struct RenderConfig {
 }
 
 impl RenderConfig {
-    /// Default config: 1920x1080, 30fps, CRF 22, superfast preset, Lanczos scaling.
+    /// Default config: 1920x1080 canvas & render, 30fps, CRF 22, superfast preset, Lanczos scaling.
     pub fn default_with_path(output_path: PathBuf) -> Self {
         Self {
             output_path,
             width: 1920,
             height: 1080,
+            canvas_width: 1920,
+            canvas_height: 1080,
             fps: 30.0,
             crf: 22,
             preset: "superfast".to_string(),
@@ -64,17 +69,23 @@ impl RenderConfig {
     }
 }
 
-/// Derive render config from timeline content. Uses the first video clip's
-/// source FPS (to avoid temporal artifacts), but always renders at the
-/// default 1920x1080 resolution regardless of source dimensions.
+/// Derive render config from timeline content and project settings.
+/// Uses the project canvas dimensions for both canvas and render output,
+/// and derives FPS from the first video clip's source (to avoid temporal artifacts).
 pub fn derive_render_config(
     timeline: &Timeline,
     source_library: &SourceLibrary,
+    settings: &ProjectSettings,
     output_path: PathBuf,
 ) -> RenderConfig {
     let mut config = RenderConfig::default_with_path(output_path);
+    config.canvas_width = settings.canvas_width;
+    config.canvas_height = settings.canvas_height;
+    config.width = settings.canvas_width;
+    config.height = settings.canvas_height;
+    config.fps = settings.fps;
 
-    // Find the first video clip and derive FPS from its source asset
+    // Override FPS from first source clip if available (to avoid temporal artifacts)
     for track in &timeline.tracks {
         if track.track_type == TrackType::Video {
             if let Some(clip) = track.clips.first() {
@@ -291,6 +302,9 @@ fn encode_video_frames(
     stream_tb: ffi::AVRational,
     video_decoders: &mut HashMap<PathBuf, CachedVideoDecoder>,
 ) -> Result<()> {
+    let canvas_w = config.canvas_width;
+    let canvas_h = config.canvas_height;
+
     for frame_idx in 0..total_frames {
         let timeline_time = frame_idx as f64 / config.fps;
         let pos = TimelinePosition::from_secs_f64(timeline_time);
@@ -303,6 +317,8 @@ fn encode_video_frames(
                 source_time,
                 width,
                 height,
+                canvas_w,
+                canvas_h,
                 video_decoders,
                 config.scaling.to_sws_flags(),
             )?
@@ -324,13 +340,17 @@ fn encode_video_frames(
     Ok(())
 }
 
-/// Decode a raw video frame from source and convert directly to YUV420P at target dimensions.
-/// Uses raw AVFrames from the decoder (no RGB round-trip) with per-source SWS contexts.
+/// Decode a raw video frame from source and compose it onto a canvas at render dimensions.
+///
+/// The source is scaled to fit within the project canvas (preserving aspect ratio),
+/// centered, then the canvas is mapped onto the render output.
 fn decode_and_convert_video_frame(
     source_path: &Path,
     source_time: f64,
-    width: i32,
-    height: i32,
+    render_w: i32,
+    render_h: i32,
+    canvas_w: u32,
+    canvas_h: u32,
     decoders: &mut HashMap<PathBuf, CachedVideoDecoder>,
     sws_flags: ffi::SwsFlags,
 ) -> Result<AVFrame> {
@@ -369,19 +389,29 @@ fn decode_and_convert_video_frame(
             Some((raw_frame, pts_secs)) => {
                 cached.last_pts = pts_secs;
                 if pts_secs >= source_time - 0.05 {
-                    // Create/reuse SWS context for this source's pixel format → YUV420P
                     let src_w = raw_frame.width;
                     let src_h = raw_frame.height;
                     let src_fmt = raw_frame.format;
 
+                    // Compute canvas layout for this source
+                    let layout = compute_canvas_layout(
+                        src_w as u32,
+                        src_h as u32,
+                        canvas_w,
+                        canvas_h,
+                        render_w as u32,
+                        render_h as u32,
+                    );
+
+                    // Create/reuse SWS context: source → clip dimensions (not full render)
                     if cached.sws_ctx.is_none() {
                         cached.sws_ctx = Some(
                             SwsContext::get_context(
                                 src_w,
                                 src_h,
                                 src_fmt,
-                                width,
-                                height,
+                                layout.clip_w,
+                                layout.clip_h,
                                 ffi::AV_PIX_FMT_YUV420P,
                                 sws_flags,
                                 None,
@@ -398,25 +428,19 @@ fn decode_and_convert_video_frame(
 
                     let sws = cached.sws_ctx.as_mut().unwrap();
 
-                    let mut dst_frame = AVFrame::new();
-                    dst_frame.set_width(width);
-                    dst_frame.set_height(height);
-                    dst_frame.set_format(ffi::AV_PIX_FMT_YUV420P);
-                    dst_frame.alloc_buffer().map_err(|e| {
-                        MediaError::EncoderError(format!("alloc dst frame: {e}"))
-                    })?;
-
-                    sws.scale_frame(&raw_frame, 0, src_h, &mut dst_frame)
-                        .map_err(|e| {
-                            MediaError::EncoderError(format!("scale_frame: {e}"))
-                        })?;
-
-                    return Ok(dst_frame);
+                    return compose_clip_onto_canvas(
+                        &raw_frame,
+                        &layout,
+                        render_w,
+                        render_h,
+                        sws,
+                        src_h,
+                    );
                 }
                 // Otherwise skip (seeking landed before target)
             }
             None => {
-                return create_black_yuv_frame(width, height);
+                return create_black_yuv_frame(render_w, render_h);
             }
         }
     }
@@ -781,6 +805,176 @@ fn write_samples_to_buffer(
 // =============================================================================
 // Shared helpers
 // =============================================================================
+
+// =============================================================================
+// Canvas composition — scale-to-fit + centered letterboxing
+// =============================================================================
+
+/// Layout describing where the clip lands on the render output.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CanvasLayout {
+    /// Clip dimensions in render-space (pixels).
+    pub clip_w: i32,
+    pub clip_h: i32,
+    /// Clip offset in render-space (pixels from top-left).
+    pub clip_x: i32,
+    pub clip_y: i32,
+}
+
+/// Compute where a source clip should be placed on the render output.
+///
+/// The pipeline is:
+/// 1. Map the project canvas onto the render output (scale-to-fit, centered).
+/// 2. Scale the source clip to fit within the project canvas (preserve aspect ratio).
+/// 3. Map the clip position from canvas-space to render-space.
+///
+/// All dimensions and offsets are forced even (`& !1`) for YUV420P chroma alignment.
+pub fn compute_canvas_layout(
+    src_w: u32,
+    src_h: u32,
+    canvas_w: u32,
+    canvas_h: u32,
+    render_w: u32,
+    render_h: u32,
+) -> CanvasLayout {
+    let src_w = src_w.max(1) as f64;
+    let src_h = src_h.max(1) as f64;
+    let canvas_w = canvas_w.max(1) as f64;
+    let canvas_h = canvas_h.max(1) as f64;
+    let render_w = render_w.max(1) as f64;
+    let render_h = render_h.max(1) as f64;
+
+    // Step 1: Map canvas onto render output (scale-to-fit)
+    let canvas_scale = (render_w / canvas_w).min(render_h / canvas_h);
+    let mapped_canvas_w = canvas_w * canvas_scale;
+    let mapped_canvas_h = canvas_h * canvas_scale;
+    let canvas_offset_x = (render_w - mapped_canvas_w) / 2.0;
+    let canvas_offset_y = (render_h - mapped_canvas_h) / 2.0;
+
+    // Step 2: Scale source to fit within canvas (preserve aspect ratio)
+    let clip_scale = (canvas_w / src_w).min(canvas_h / src_h);
+    let clip_in_canvas_w = src_w * clip_scale;
+    let clip_in_canvas_h = src_h * clip_scale;
+    let clip_in_canvas_x = (canvas_w - clip_in_canvas_w) / 2.0;
+    let clip_in_canvas_y = (canvas_h - clip_in_canvas_h) / 2.0;
+
+    // Step 3: Map from canvas-space to render-space
+    let clip_render_w = (clip_in_canvas_w * canvas_scale) as i32 & !1;
+    let clip_render_h = (clip_in_canvas_h * canvas_scale) as i32 & !1;
+    let clip_render_x = (canvas_offset_x + clip_in_canvas_x * canvas_scale) as i32 & !1;
+    let clip_render_y = (canvas_offset_y + clip_in_canvas_y * canvas_scale) as i32 & !1;
+
+    CanvasLayout {
+        clip_w: clip_render_w.max(2),
+        clip_h: clip_render_h.max(2),
+        clip_x: clip_render_x,
+        clip_y: clip_render_y,
+    }
+}
+
+/// Compose a decoded source frame onto a black canvas at the render output dimensions.
+///
+/// 1. SWS-scale source to `(layout.clip_w, layout.clip_h)` in YUV420P
+/// 2. Create a black frame at `(render_w, render_h)`
+/// 3. Blit the scaled clip onto the canvas at `(layout.clip_x, layout.clip_y)`
+fn compose_clip_onto_canvas(
+    raw_frame: &AVFrame,
+    layout: &CanvasLayout,
+    render_w: i32,
+    render_h: i32,
+    sws_ctx: &mut SwsContext,
+    src_h: i32,
+) -> Result<AVFrame> {
+    // Scale source to clip dimensions
+    let mut scaled = AVFrame::new();
+    scaled.set_width(layout.clip_w);
+    scaled.set_height(layout.clip_h);
+    scaled.set_format(ffi::AV_PIX_FMT_YUV420P);
+    scaled.alloc_buffer().map_err(|e| {
+        MediaError::EncoderError(format!("alloc scaled frame: {e}"))
+    })?;
+
+    sws_ctx
+        .scale_frame(raw_frame, 0, src_h, &mut scaled)
+        .map_err(|e| MediaError::EncoderError(format!("scale_frame: {e}")))?;
+
+    // Create black canvas at render dimensions
+    let mut canvas = create_black_yuv_frame(render_w, render_h)?;
+
+    // Blit scaled clip onto canvas
+    blit_yuv_frame(&scaled, &mut canvas, layout.clip_x, layout.clip_y);
+
+    Ok(canvas)
+}
+
+/// Blit a YUV420P source frame onto a YUV420P destination frame at the given offset.
+/// Handles bounds clamping to prevent buffer overflows.
+fn blit_yuv_frame(src: &AVFrame, dst: &mut AVFrame, offset_x: i32, offset_y: i32) {
+    let src_w = src.width as usize;
+    let src_h = src.height as usize;
+    let dst_w = dst.width as usize;
+    let dst_h = dst.height as usize;
+
+    unsafe {
+        let src_ptr = (*src.as_ptr()).data;
+        let src_linesize = (*src.as_ptr()).linesize;
+        let dst_ptr = (*dst.as_mut_ptr()).data;
+        let dst_linesize = (*dst.as_mut_ptr()).linesize;
+
+        // Y plane
+        let y_src = src_ptr[0] as *const u8;
+        let y_dst = dst_ptr[0] as *mut u8;
+        let y_src_stride = src_linesize[0] as usize;
+        let y_dst_stride = dst_linesize[0] as usize;
+
+        for row in 0..src_h {
+            let dst_row = offset_y as usize + row;
+            if dst_row >= dst_h {
+                break;
+            }
+            let copy_w = src_w.min(dst_w.saturating_sub(offset_x as usize));
+            if copy_w == 0 {
+                continue;
+            }
+            std::ptr::copy_nonoverlapping(
+                y_src.add(row * y_src_stride),
+                y_dst.add(dst_row * y_dst_stride + offset_x as usize),
+                copy_w,
+            );
+        }
+
+        // U and V planes (4:2:0 — half dimensions and offsets)
+        let half_src_w = src_w / 2;
+        let half_src_h = src_h / 2;
+        let half_dst_w = dst_w / 2;
+        let half_dst_h = dst_h / 2;
+        let half_off_x = offset_x as usize / 2;
+        let half_off_y = offset_y as usize / 2;
+
+        for plane in 1..=2usize {
+            let p_src = src_ptr[plane] as *const u8;
+            let p_dst = dst_ptr[plane] as *mut u8;
+            let p_src_stride = src_linesize[plane] as usize;
+            let p_dst_stride = dst_linesize[plane] as usize;
+
+            for row in 0..half_src_h {
+                let dst_row = half_off_y + row;
+                if dst_row >= half_dst_h {
+                    break;
+                }
+                let copy_w = half_src_w.min(half_dst_w.saturating_sub(half_off_x));
+                if copy_w == 0 {
+                    continue;
+                }
+                std::ptr::copy_nonoverlapping(
+                    p_src.add(row * p_src_stride),
+                    p_dst.add(dst_row * p_dst_stride + half_off_x),
+                    copy_w,
+                );
+            }
+        }
+    }
+}
 
 /// Find the video clip at a timeline position and return (source_path, source_time).
 fn find_video_clip_at(

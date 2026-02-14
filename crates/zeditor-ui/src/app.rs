@@ -886,6 +886,7 @@ impl App {
                         let config = zeditor_media::renderer::derive_render_config(
                             &timeline,
                             &source_library,
+                            &self.project.settings,
                             path,
                         );
                         Task::perform(

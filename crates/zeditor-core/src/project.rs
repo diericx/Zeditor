@@ -11,6 +11,24 @@ use crate::error::{CoreError, Result};
 use crate::media::SourceLibrary;
 use crate::timeline::{Timeline, TrackType};
 
+/// Project-level settings defining the editing canvas and default framerate.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ProjectSettings {
+    pub canvas_width: u32,
+    pub canvas_height: u32,
+    pub fps: f64,
+}
+
+impl Default for ProjectSettings {
+    fn default() -> Self {
+        Self {
+            canvas_width: 1920,
+            canvas_height: 1080,
+            fps: 30.0,
+        }
+    }
+}
+
 /// Current version written into new save files.
 pub const CURRENT_PROJECT_VERSION: &str = "1.0.0";
 
@@ -30,6 +48,8 @@ pub struct Project {
     pub name: String,
     pub timeline: Timeline,
     pub source_library: SourceLibrary,
+    #[serde(default)]
+    pub settings: ProjectSettings,
     #[serde(skip)]
     pub command_history: CommandHistory,
 }
@@ -45,6 +65,7 @@ impl Project {
             name: name.into(),
             timeline,
             source_library: SourceLibrary::new(),
+            settings: ProjectSettings::default(),
             command_history: CommandHistory::new(),
         }
     }
@@ -104,6 +125,7 @@ impl PartialEq for Project {
         self.name == other.name
             && self.timeline == other.timeline
             && self.source_library == other.source_library
+            && self.settings == other.settings
     }
 }
 

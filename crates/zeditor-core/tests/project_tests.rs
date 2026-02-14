@@ -2,7 +2,7 @@ use std::time::Duration;
 
 use zeditor_core::error::CoreError;
 use zeditor_core::media::MediaAsset;
-use zeditor_core::project::{Project, CURRENT_PROJECT_VERSION};
+use zeditor_core::project::{Project, ProjectSettings, CURRENT_PROJECT_VERSION};
 use zeditor_core::timeline::*;
 
 #[test]
@@ -223,4 +223,53 @@ fn test_project_file_roundtrip_full_data() {
 
     // Full equality check (catches any future #[serde(skip)] additions)
     assert_eq!(loaded, project, "loaded project should equal original");
+}
+
+#[test]
+fn test_project_settings_default() {
+    let settings = ProjectSettings::default();
+    assert_eq!(settings.canvas_width, 1920);
+    assert_eq!(settings.canvas_height, 1080);
+    assert!((settings.fps - 30.0).abs() < 0.001);
+}
+
+#[test]
+fn test_project_save_load_with_settings() {
+    let mut project = Project::new("Settings Test");
+    project.settings = ProjectSettings {
+        canvas_width: 1280,
+        canvas_height: 720,
+        fps: 24.0,
+    };
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("settings.zpf");
+    project.save(&path).unwrap();
+
+    let loaded = Project::load(&path).unwrap();
+    assert_eq!(loaded.settings.canvas_width, 1280);
+    assert_eq!(loaded.settings.canvas_height, 720);
+    assert!((loaded.settings.fps - 24.0).abs() < 0.001);
+    assert_eq!(loaded, project);
+}
+
+#[test]
+fn test_project_load_without_settings_field() {
+    // Save a project, strip the `settings` key from JSON, then load — should get defaults
+    let project = Project::new("Backward Compat");
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("compat.zpf");
+    project.save(&path).unwrap();
+
+    // Remove `settings` from the saved JSON
+    let mut raw: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    raw["project"]
+        .as_object_mut()
+        .unwrap()
+        .remove("settings");
+    std::fs::write(&path, serde_json::to_string(&raw).unwrap()).unwrap();
+
+    let loaded = Project::load(&path).unwrap();
+    assert_eq!(loaded.settings, ProjectSettings::default());
 }
