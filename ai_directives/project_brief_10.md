@@ -39,3 +39,32 @@ We now want to implement the final core piece of our app; video rendering.
 - Render runs on a background `Task::perform` thread via iced's async runtime — UI shows "Rendering..." status and updates on completion/error
 
 **Test results:** All 216 workspace tests pass (55 core + 21 media + 2 test-harness + 147 UI including 8 new renderer tests + 5 new UI tests)
+
+### Bug Fix: Scrambled Video, Choppy Audio, Wrong Resolution
+
+**Root causes identified:**
+1. **Video scramble (diagonal lines)**: `FfmpegDecoder::frame_to_scaled()` extracted RGB data with `from_raw_parts(data[0], width*height*bpp)` which didn't account for linesize padding. When `linesize > width*bpp` (due to 32-byte alignment), rows were shifted producing diagonal scrambled lines. The renderer then re-created an AVFrame from this corrupted data via `rgb_to_yuv()`, propagating the corruption.
+2. **Wrong resolution**: `derive_render_config()` correctly picks up source asset dimensions, but the stride-corrupted video data made the output appear distorted. The actual encoder dimensions were correct.
+3. **Choppy audio**: `encode_audio_frames()` called `decode_and_create_audio_frame()` per output frame, which sought and decoded per-frame. This caused gaps between decoded frames (each seek lands on a keyframe, skipping intermediate samples) producing choppy/stuttering audio.
+
+**Fix approach:**
+1. **Video**: Added `decode_next_raw_frame()` to `FfmpegDecoder` — returns raw `AVFrame` in the decoder's native pixel format (typically YUV420P for h264) without any RGB conversion. The renderer now uses per-source `SwsContext` to convert directly from source pixel format → YUV420P at target dimensions, completely bypassing the RGB round-trip and its stride bug.
+2. **Audio**: Rewrote audio encoding as "offline clip-at-a-time" rendering:
+   - Pre-allocates a contiguous f32 sample buffer for the entire timeline duration at 48kHz stereo
+   - Processes each audio clip independently: opens source, creates `SwrContext` for format+rate conversion to 48kHz stereo f32, seeks to clip start, decodes sequentially, writes samples at the correct buffer position
+   - Slices the buffer into AAC frame-sized chunks and encodes
+   - Handles sample rate conversion (e.g. 44100→48000) via SwrContext
+   - No per-frame seeking — fully sequential decode within each clip
+
+**Files modified:**
+- `crates/zeditor-media/src/decoder.rs` — Added `pub(crate) fn decode_next_raw_frame()` returning `(AVFrame, f64)` and `fn frame_pts_secs()` helper
+- `crates/zeditor-media/src/renderer.rs` — Major rewrite:
+  - `CachedVideoDecoder` now has per-source `sws_ctx: Option<SwsContext>`
+  - `decode_and_convert_video_frame()` uses raw frames + direct SWS (removed `rgb_to_yuv()`)
+  - Removed global SWS context from `encode_video_frames()` parameters
+  - Replaced `encode_audio_frames()` with `encode_audio_offline()` (clip-at-a-time approach)
+  - Added `decode_audio_clip_into_buffer()` for per-clip sequential decode with SwrContext resampling
+  - Added `convert_audio_frame()` and `write_samples_to_buffer()` helpers
+  - Removed `FfmpegAudioDecoder` dependency (uses raw rsmpeg audio decode in renderer)
+
+**Test results:** All 216 workspace tests pass

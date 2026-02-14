@@ -187,6 +187,59 @@ impl VideoDecoder for FfmpegDecoder {
 }
 
 impl FfmpegDecoder {
+    /// Decode the next raw video frame without pixel format conversion.
+    /// Returns the raw AVFrame in the decoder's native pixel format along with PTS in seconds.
+    /// Used by the renderer to avoid unnecessary RGB round-trips that lose data due to stride.
+    pub(crate) fn decode_next_raw_frame(
+        &mut self,
+    ) -> Result<Option<(rsmpeg::avutil::AVFrame, f64)>> {
+        loop {
+            match self.input_ctx.read_packet() {
+                Ok(Some(packet)) => {
+                    if packet.stream_index as usize != self.video_stream_index {
+                        continue;
+                    }
+                    self.decode_ctx.send_packet(Some(&packet)).map_err(|e| {
+                        crate::error::MediaError::DecoderError(format!("send_packet: {e}"))
+                    })?;
+
+                    match self.decode_ctx.receive_frame() {
+                        Ok(frame) => {
+                            let pts_secs = self.frame_pts_secs(&frame);
+                            return Ok(Some((frame, pts_secs)));
+                        }
+                        Err(_) => continue,
+                    }
+                }
+                Ok(None) => {
+                    self.decode_ctx.send_packet(None).ok();
+                    match self.decode_ctx.receive_frame() {
+                        Ok(frame) => {
+                            let pts_secs = self.frame_pts_secs(&frame);
+                            return Ok(Some((frame, pts_secs)));
+                        }
+                        Err(_) => return Ok(None),
+                    }
+                }
+                Err(e) => {
+                    return Err(crate::error::MediaError::DecoderError(format!(
+                        "read_packet: {e}"
+                    )));
+                }
+            }
+        }
+    }
+
+    fn frame_pts_secs(&self, frame: &rsmpeg::avutil::AVFrame) -> f64 {
+        let streams = self.input_ctx.streams();
+        let tb = streams[self.video_stream_index].time_base;
+        if frame.pts != rsmpeg::ffi::AV_NOPTS_VALUE {
+            frame.pts as f64 * tb.num as f64 / tb.den as f64
+        } else {
+            0.0
+        }
+    }
+
     /// Decode the next frame, scaling to the given max dimensions for preview.
     /// Maintains aspect ratio. If max_width/max_height are 0, uses original size.
     /// Output is RGB24 format.

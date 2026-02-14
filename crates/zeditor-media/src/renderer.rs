@@ -3,15 +3,15 @@ use std::ffi::CString;
 use std::path::{Path, PathBuf};
 
 use rsmpeg::avcodec::{AVCodec, AVCodecContext};
-use rsmpeg::avformat::AVFormatContextOutput;
+use rsmpeg::avformat::{AVFormatContextInput, AVFormatContextOutput};
 use rsmpeg::avutil::{AVChannelLayout, AVFrame};
 use rsmpeg::ffi;
+use rsmpeg::swresample::SwrContext;
 use rsmpeg::swscale::SwsContext;
 
 use zeditor_core::media::SourceLibrary;
 use zeditor_core::timeline::{Timeline, TimelinePosition, TrackType};
 
-use crate::audio_decoder::FfmpegAudioDecoder;
 use crate::decoder::{FfmpegDecoder, VideoDecoder};
 use crate::error::{MediaError, Result};
 
@@ -68,17 +68,17 @@ pub fn derive_render_config(
     config
 }
 
-/// Cached video decoder with last decoded PTS for seek optimization.
+/// Cached video decoder with per-source SWS context for direct pixel format conversion.
 struct CachedVideoDecoder {
     decoder: FfmpegDecoder,
     last_pts: f64,
+    /// SWS context for converting from source pixel format to YUV420P at target dimensions.
+    /// Created lazily on first decoded frame (needs source format/dimensions).
+    sws_ctx: Option<SwsContext>,
 }
 
-/// Cached audio decoder with last decoded PTS for seek optimization.
-struct CachedAudioDecoder {
-    decoder: FfmpegAudioDecoder,
-    last_pts: f64,
-}
+const OUTPUT_SAMPLE_RATE: i32 = 48000;
+const OUTPUT_CHANNELS: i32 = 2;
 
 /// Render the timeline to an output video file.
 ///
@@ -139,7 +139,6 @@ pub fn render_timeline(
     let c_crf = CString::new(crf_str.as_str())
         .map_err(|_| MediaError::EncoderError("Invalid CRF".into()))?;
     let opts = rsmpeg::avutil::AVDictionary::new(c"preset", &c_preset, 0);
-    // AVDictionary::new returns an owned dict. set() consumes and returns a new one.
     let opts = opts.set(c"crf", &c_crf, 0);
 
     video_enc_ctx
@@ -151,11 +150,11 @@ pub fn render_timeline(
         .ok_or_else(|| MediaError::EncoderError("AAC encoder not found".into()))?;
 
     let mut audio_enc_ctx = AVCodecContext::new(&audio_codec);
-    audio_enc_ctx.set_sample_rate(48000);
+    audio_enc_ctx.set_sample_rate(OUTPUT_SAMPLE_RATE);
     audio_enc_ctx.set_sample_fmt(ffi::AV_SAMPLE_FMT_FLTP);
-    audio_enc_ctx.set_time_base(ffi::AVRational { num: 1, den: 48000 });
+    audio_enc_ctx.set_time_base(ffi::AVRational { num: 1, den: OUTPUT_SAMPLE_RATE });
 
-    let stereo_layout = AVChannelLayout::from_nb_channels(2);
+    let stereo_layout = AVChannelLayout::from_nb_channels(OUTPUT_CHANNELS);
     unsafe {
         ffi::av_channel_layout_copy(
             &mut (*audio_enc_ctx.as_mut_ptr()).ch_layout,
@@ -199,27 +198,8 @@ pub fn render_timeline(
     let video_stream_tb = output_ctx.streams()[video_stream_index as usize].time_base;
     let audio_stream_tb = output_ctx.streams()[audio_stream_index as usize].time_base;
 
-    // --- Create SWS context for RGB24 → YUV420P ---
-    let mut sws_ctx = SwsContext::get_context(
-        width,
-        height,
-        ffi::AV_PIX_FMT_RGB24,
-        width,
-        height,
-        ffi::AV_PIX_FMT_YUV420P,
-        ffi::SWS_FAST_BILINEAR,
-        None,
-        None,
-        None,
-    )
-    .ok_or_else(|| MediaError::EncoderError("Failed to create SWS context".into()))?;
-
-    // --- Decoder caches ---
+    // --- Decoder cache for video ---
     let mut video_decoders: HashMap<PathBuf, CachedVideoDecoder> = HashMap::new();
-    let mut audio_decoders: HashMap<PathBuf, CachedAudioDecoder> = HashMap::new();
-
-    // Audio resampler for converting decoded f32 interleaved → FLTP for AAC
-    // We'll handle this manually when creating audio frames.
 
     // --- Video encoding loop ---
     encode_video_frames(
@@ -229,7 +209,6 @@ pub fn render_timeline(
         total_frames,
         width,
         height,
-        &mut sws_ctx,
         &mut video_enc_ctx,
         &mut output_ctx,
         video_stream_index,
@@ -237,8 +216,8 @@ pub fn render_timeline(
         &mut video_decoders,
     )?;
 
-    // --- Audio encoding loop ---
-    encode_audio_frames(
+    // --- Audio encoding: pre-render all clips into buffer, then encode ---
+    encode_audio_offline(
         timeline,
         source_library,
         total_duration.as_secs_f64(),
@@ -247,7 +226,6 @@ pub fn render_timeline(
         &mut output_ctx,
         audio_stream_index,
         audio_stream_tb,
-        &mut audio_decoders,
     )?;
 
     // --- Flush video encoder ---
@@ -274,6 +252,10 @@ pub fn render_timeline(
     Ok(())
 }
 
+// =============================================================================
+// Video encoding — uses raw AVFrames with per-source SWS contexts
+// =============================================================================
+
 fn encode_video_frames(
     timeline: &Timeline,
     source_library: &SourceLibrary,
@@ -281,7 +263,6 @@ fn encode_video_frames(
     total_frames: u64,
     width: i32,
     height: i32,
-    sws_ctx: &mut SwsContext,
     video_enc_ctx: &mut AVCodecContext,
     output_ctx: &mut AVFormatContextOutput,
     stream_index: i32,
@@ -292,7 +273,6 @@ fn encode_video_frames(
         let timeline_time = frame_idx as f64 / config.fps;
         let pos = TimelinePosition::from_secs_f64(timeline_time);
 
-        // Find video clip at this timeline position
         let clip_info = find_video_clip_at(timeline, source_library, pos);
 
         let yuv_frame = if let Some((source_path, source_time)) = clip_info {
@@ -301,15 +281,12 @@ fn encode_video_frames(
                 source_time,
                 width,
                 height,
-                &mut *sws_ctx,
                 video_decoders,
             )?
         } else {
-            // Black frame
             create_black_yuv_frame(width, height)?
         };
 
-        // Set PTS and encode
         let mut frame = yuv_frame;
         frame.set_pts(frame_idx as i64);
 
@@ -324,7 +301,110 @@ fn encode_video_frames(
     Ok(())
 }
 
-fn encode_audio_frames(
+/// Decode a raw video frame from source and convert directly to YUV420P at target dimensions.
+/// Uses raw AVFrames from the decoder (no RGB round-trip) with per-source SWS contexts.
+fn decode_and_convert_video_frame(
+    source_path: &Path,
+    source_time: f64,
+    width: i32,
+    height: i32,
+    decoders: &mut HashMap<PathBuf, CachedVideoDecoder>,
+) -> Result<AVFrame> {
+    let path_key = source_path.to_path_buf();
+
+    // Open or reuse decoder
+    if !decoders.contains_key(&path_key) {
+        let decoder = FfmpegDecoder::open(source_path)?;
+        decoders.insert(
+            path_key.clone(),
+            CachedVideoDecoder {
+                decoder,
+                last_pts: -1.0,
+                sws_ctx: None,
+            },
+        );
+    }
+
+    let cached = decoders.get_mut(&path_key).unwrap();
+
+    // Seek if needed
+    let needs_seek = source_time < cached.last_pts
+        || (source_time - cached.last_pts) > 2.0
+        || cached.last_pts < 0.0;
+
+    if needs_seek {
+        cached.decoder.seek_to(source_time)?;
+        cached.last_pts = -1.0;
+        // Invalidate SWS context in case source format changed after seek
+        cached.sws_ctx = None;
+    }
+
+    // Decode raw frames until we get one at or past the target time
+    loop {
+        match cached.decoder.decode_next_raw_frame()? {
+            Some((raw_frame, pts_secs)) => {
+                cached.last_pts = pts_secs;
+                if pts_secs >= source_time - 0.05 {
+                    // Create/reuse SWS context for this source's pixel format → YUV420P
+                    let src_w = raw_frame.width;
+                    let src_h = raw_frame.height;
+                    let src_fmt = raw_frame.format;
+
+                    if cached.sws_ctx.is_none() {
+                        cached.sws_ctx = Some(
+                            SwsContext::get_context(
+                                src_w,
+                                src_h,
+                                src_fmt,
+                                width,
+                                height,
+                                ffi::AV_PIX_FMT_YUV420P,
+                                ffi::SWS_FAST_BILINEAR,
+                                None,
+                                None,
+                                None,
+                            )
+                            .ok_or_else(|| {
+                                MediaError::EncoderError(
+                                    "Failed to create SWS context for source".into(),
+                                )
+                            })?,
+                        );
+                    }
+
+                    let sws = cached.sws_ctx.as_mut().unwrap();
+
+                    let mut dst_frame = AVFrame::new();
+                    dst_frame.set_width(width);
+                    dst_frame.set_height(height);
+                    dst_frame.set_format(ffi::AV_PIX_FMT_YUV420P);
+                    dst_frame.alloc_buffer().map_err(|e| {
+                        MediaError::EncoderError(format!("alloc dst frame: {e}"))
+                    })?;
+
+                    sws.scale_frame(&raw_frame, 0, src_h, &mut dst_frame)
+                        .map_err(|e| {
+                            MediaError::EncoderError(format!("scale_frame: {e}"))
+                        })?;
+
+                    return Ok(dst_frame);
+                }
+                // Otherwise skip (seeking landed before target)
+            }
+            None => {
+                return create_black_yuv_frame(width, height);
+            }
+        }
+    }
+}
+
+// =============================================================================
+// Audio encoding — offline clip-at-a-time rendering with sequential decode
+// =============================================================================
+
+/// Pre-render all audio clips into a contiguous sample buffer, then encode into AAC frames.
+/// This avoids per-frame seeking which caused choppy audio.
+fn encode_audio_offline(
     timeline: &Timeline,
     source_library: &SourceLibrary,
     total_duration_secs: f64,
@@ -333,50 +413,350 @@ fn encode_audio_frames(
     output_ctx: &mut AVFormatContextOutput,
     stream_index: i32,
     stream_tb: ffi::AVRational,
-    audio_decoders: &mut HashMap<PathBuf, CachedAudioDecoder>,
 ) -> Result<()> {
-    let sample_rate = 48000i32;
-    let channels = 2i32;
     let samples_per_frame = if frame_size > 0 { frame_size } else { 1024 };
+    let total_samples =
+        (total_duration_secs * OUTPUT_SAMPLE_RATE as f64).ceil() as usize;
 
+    // Pre-allocate output buffer: interleaved f32 at 48kHz stereo, initialized to silence
+    let mut output_buffer = vec![0.0f32; total_samples * OUTPUT_CHANNELS as usize];
+
+    // Process each audio clip: decode sequentially and write into the buffer
+    for track in &timeline.tracks {
+        if track.track_type != TrackType::Audio {
+            continue;
+        }
+        for clip in &track.clips {
+            if let Some(asset) = source_library.get(clip.asset_id) {
+                decode_audio_clip_into_buffer(
+                    &asset.path,
+                    clip.source_range.start.as_secs_f64(),
+                    clip.timeline_range.start.as_secs_f64(),
+                    clip.timeline_range.end.as_secs_f64(),
+                    &mut output_buffer,
+                )?;
+            }
+        }
+    }
+
+    // Encode the buffer into AAC frames
     let mut audio_pts: i64 = 0;
-    let total_samples = (total_duration_secs * sample_rate as f64).ceil() as i64;
+    let mut offset = 0usize;
+    let frame_sample_count = samples_per_frame as usize * OUTPUT_CHANNELS as usize;
 
-    while audio_pts < total_samples {
-        let timeline_time = audio_pts as f64 / sample_rate as f64;
-        let pos = TimelinePosition::from_secs_f64(timeline_time);
+    while offset < output_buffer.len() {
+        let remaining = output_buffer.len() - offset;
+        let chunk_size = remaining.min(frame_sample_count);
+        let chunk = &output_buffer[offset..offset + chunk_size];
+        let actual_nb_samples = (chunk_size / OUTPUT_CHANNELS as usize) as i32;
 
-        // Find audio clip at this timeline position
-        let clip_info = find_audio_clip_at(timeline, source_library, pos);
-
-        let audio_frame = if let Some((source_path, source_time)) = clip_info {
-            decode_and_create_audio_frame(
-                &source_path,
-                source_time,
-                samples_per_frame,
-                sample_rate,
-                channels,
-                audio_pts,
-                audio_decoders,
-            )?
-        } else {
-            // Silence frame
-            create_silence_frame(samples_per_frame, sample_rate, channels, audio_pts)?
-        };
+        let frame = interleaved_f32_to_fltp_frame(
+            chunk,
+            OUTPUT_CHANNELS,
+            actual_nb_samples,
+            OUTPUT_SAMPLE_RATE,
+            OUTPUT_CHANNELS,
+            audio_pts,
+        )?;
 
         encode_frame(
             audio_enc_ctx,
             output_ctx,
-            Some(&audio_frame),
+            Some(&frame),
             stream_index,
             stream_tb,
         )?;
 
-        audio_pts += samples_per_frame as i64;
+        audio_pts += actual_nb_samples as i64;
+        offset += chunk_size;
     }
 
     Ok(())
 }
+
+/// Decode audio from a single clip and write resampled samples into the output buffer.
+/// Uses a SwrContext to convert from source format to 48kHz stereo interleaved f32.
+fn decode_audio_clip_into_buffer(
+    source_path: &Path,
+    source_start_secs: f64,
+    timeline_start_secs: f64,
+    timeline_end_secs: f64,
+    output_buffer: &mut [f32],
+) -> Result<()> {
+    let path_str = source_path.to_string_lossy().to_string();
+    let c_path = CString::new(path_str.clone())
+        .map_err(|_| MediaError::OpenFailed(path_str.clone()))?;
+
+    let mut input_ctx = AVFormatContextInput::open(&c_path)
+        .map_err(|e| MediaError::OpenFailed(format!("{path_str}: {e}")))?;
+
+    // Find audio stream
+    let (audio_stream_index, decoder) = {
+        let streams = input_ctx.streams();
+        let mut found = None;
+        for (i, stream) in streams.iter().enumerate() {
+            let codecpar = stream.codecpar();
+            if codecpar.codec_type == ffi::AVMEDIA_TYPE_AUDIO {
+                let codec_id = codecpar.codec_id;
+                if let Some(dec) = AVCodec::find_decoder(codec_id) {
+                    found = Some((i, dec));
+                    break;
+                }
+            }
+        }
+        match found {
+            Some(f) => f,
+            None => return Ok(()), // No audio stream — skip silently
+        }
+    };
+
+    let mut decode_ctx = AVCodecContext::new(&decoder);
+    {
+        let streams = input_ctx.streams();
+        let audio_stream = &streams[audio_stream_index];
+        decode_ctx
+            .apply_codecpar(&audio_stream.codecpar())
+            .map_err(|e| MediaError::DecoderError(format!("apply_codecpar: {e}")))?;
+    }
+
+    unsafe {
+        use rsmpeg::UnsafeDerefMut;
+        decode_ctx.deref_mut().thread_count = 0;
+    }
+
+    decode_ctx
+        .open(None)
+        .map_err(|e| MediaError::DecoderError(format!("open: {e}")))?;
+
+    // Set up SwrContext: source format → 48kHz stereo interleaved f32
+    let in_sample_rate = decode_ctx.sample_rate;
+    let in_sample_fmt = decode_ctx.sample_fmt;
+    let in_ch_layout = unsafe {
+        rsmpeg::avutil::AVChannelLayoutRef::new(&decode_ctx.ch_layout)
+    };
+
+    let out_ch_layout = AVChannelLayout::from_nb_channels(OUTPUT_CHANNELS);
+
+    let mut swr_ctx = SwrContext::new(
+        &out_ch_layout,
+        ffi::AV_SAMPLE_FMT_FLT, // interleaved f32
+        OUTPUT_SAMPLE_RATE,
+        &in_ch_layout,
+        in_sample_fmt,
+        in_sample_rate,
+    )
+    .map_err(|e| MediaError::DecoderError(format!("swr_alloc: {e}")))?;
+
+    swr_ctx
+        .init()
+        .map_err(|e| MediaError::DecoderError(format!("swr_init: {e}")))?;
+
+    // Seek to source start
+    {
+        let streams = input_ctx.streams();
+        let audio_stream = &streams[audio_stream_index];
+        let tb = audio_stream.time_base;
+        let ts = (source_start_secs * tb.den as f64 / tb.num as f64) as i64;
+        let _ = streams;
+
+        // Seek may fail for short files or at start — that's OK
+        let _ = input_ctx.seek(
+            audio_stream_index as i32,
+            ts,
+            ffi::AVSEEK_FLAG_BACKWARD as i32,
+        );
+        decode_ctx.flush_buffers();
+    }
+
+    // Calculate output buffer positions
+    let clip_start_sample =
+        (timeline_start_secs * OUTPUT_SAMPLE_RATE as f64) as usize;
+    let clip_end_sample =
+        (timeline_end_secs * OUTPUT_SAMPLE_RATE as f64) as usize;
+    let clip_duration_samples = clip_end_sample.saturating_sub(clip_start_sample);
+    let max_output_floats = clip_duration_samples * OUTPUT_CHANNELS as usize;
+
+    let mut samples_written = 0usize;
+    let mut past_source_start = false;
+
+    // Decode sequentially
+    loop {
+        if samples_written >= max_output_floats {
+            break;
+        }
+
+        let packet = match input_ctx.read_packet() {
+            Ok(Some(p)) => p,
+            Ok(None) => {
+                // EOF: flush decoder
+                decode_ctx.send_packet(None).ok();
+                loop {
+                    match decode_ctx.receive_frame() {
+                        Ok(frame) => {
+                            let converted = convert_audio_frame(
+                                &mut swr_ctx,
+                                &frame,
+                                &input_ctx,
+                                audio_stream_index,
+                            )?;
+                            if let Some((samples, pts_secs)) = converted {
+                                if pts_secs < source_start_secs - 0.05 {
+                                    continue;
+                                }
+                                let written = write_samples_to_buffer(
+                                    &samples,
+                                    output_buffer,
+                                    clip_start_sample,
+                                    samples_written,
+                                    max_output_floats,
+                                );
+                                samples_written += written;
+                            }
+                        }
+                        Err(_) => break,
+                    }
+                }
+                break;
+            }
+            Err(_) => break,
+        };
+
+        if packet.stream_index as usize != audio_stream_index {
+            continue;
+        }
+
+        decode_ctx.send_packet(Some(&packet)).map_err(|e| {
+            MediaError::DecoderError(format!("send_packet: {e}"))
+        })?;
+
+        loop {
+            match decode_ctx.receive_frame() {
+                Ok(frame) => {
+                    let converted = convert_audio_frame(
+                        &mut swr_ctx,
+                        &frame,
+                        &input_ctx,
+                        audio_stream_index,
+                    )?;
+                    if let Some((samples, pts_secs)) = converted {
+                        // Skip frames before source start
+                        if !past_source_start {
+                            if pts_secs < source_start_secs - 0.05 {
+                                continue;
+                            }
+                            past_source_start = true;
+                        }
+
+                        let written = write_samples_to_buffer(
+                            &samples,
+                            output_buffer,
+                            clip_start_sample,
+                            samples_written,
+                            max_output_floats,
+                        );
+                        samples_written += written;
+
+                        if samples_written >= max_output_floats {
+                            return Ok(());
+                        }
+                    }
+                }
+                Err(_) => break, // EAGAIN
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Convert a decoded audio frame to interleaved f32 at 48kHz stereo via SwrContext.
+/// Returns the samples and the PTS in seconds.
+fn convert_audio_frame(
+    swr_ctx: &mut SwrContext,
+    frame: &AVFrame,
+    input_ctx: &AVFormatContextInput,
+    audio_stream_index: usize,
+) -> Result<Option<(Vec<f32>, f64)>> {
+    let nb_samples = frame.nb_samples;
+
+    let mut dst_frame = AVFrame::new();
+    dst_frame.set_format(ffi::AV_SAMPLE_FMT_FLT);
+    dst_frame.set_sample_rate(OUTPUT_SAMPLE_RATE);
+
+    let out_ch_layout = AVChannelLayout::from_nb_channels(OUTPUT_CHANNELS);
+    unsafe {
+        ffi::av_channel_layout_copy(
+            &mut (*dst_frame.as_mut_ptr()).ch_layout,
+            out_ch_layout.as_ptr(),
+        );
+    }
+    // Estimate output samples for rate conversion
+    let estimated_out = unsafe {
+        ffi::swr_get_out_samples(swr_ctx.as_mut_ptr(), nb_samples)
+    };
+    dst_frame.set_nb_samples(estimated_out.max(nb_samples));
+    dst_frame.alloc_buffer().map_err(|e| {
+        MediaError::DecoderError(format!("alloc_buffer: {e}"))
+    })?;
+
+    swr_ctx
+        .convert_frame(Some(frame), &mut dst_frame)
+        .map_err(|e| MediaError::DecoderError(format!("convert_frame: {e}")))?;
+
+    let actual_samples = dst_frame.nb_samples;
+    let total_floats = actual_samples as usize * OUTPUT_CHANNELS as usize;
+    let samples = unsafe {
+        std::slice::from_raw_parts(
+            dst_frame.data[0] as *const f32,
+            total_floats,
+        )
+        .to_vec()
+    };
+
+    let pts_secs = {
+        let streams = input_ctx.streams();
+        let tb = streams[audio_stream_index].time_base;
+        if frame.pts != ffi::AV_NOPTS_VALUE {
+            frame.pts as f64 * tb.num as f64 / tb.den as f64
+        } else {
+            0.0
+        }
+    };
+
+    Ok(Some((samples, pts_secs)))
+}
+
+/// Write decoded samples into the output buffer at the correct position.
+/// Returns the number of f32 values written.
+fn write_samples_to_buffer(
+    samples: &[f32],
+    output_buffer: &mut [f32],
+    clip_start_sample: usize,
+    samples_already_written: usize,
+    max_output_floats: usize,
+) -> usize {
+    let buf_offset =
+        clip_start_sample * OUTPUT_CHANNELS as usize + samples_already_written;
+    let remaining = max_output_floats - samples_already_written;
+    let to_write = samples.len().min(remaining);
+
+    if buf_offset + to_write <= output_buffer.len() {
+        output_buffer[buf_offset..buf_offset + to_write]
+            .copy_from_slice(&samples[..to_write]);
+    } else if buf_offset < output_buffer.len() {
+        let avail = output_buffer.len() - buf_offset;
+        let actual = to_write.min(avail);
+        output_buffer[buf_offset..buf_offset + actual]
+            .copy_from_slice(&samples[..actual]);
+        return actual;
+    }
+
+    to_write
+}
+
+// =============================================================================
+// Shared helpers
+// =============================================================================
 
 /// Find the video clip at a timeline position and return (source_path, source_time).
 fn find_video_clip_at(
@@ -399,6 +779,7 @@ fn find_video_clip_at(
 }
 
 /// Find the audio clip at a timeline position and return (source_path, source_time).
+#[allow(dead_code)]
 fn find_audio_clip_at(
     timeline: &Timeline,
     source_library: &SourceLibrary,
@@ -416,147 +797,6 @@ fn find_audio_clip_at(
         }
     }
     None
-}
-
-/// Decode a video frame from source and convert to YUV420P at the target dimensions.
-fn decode_and_convert_video_frame(
-    source_path: &Path,
-    source_time: f64,
-    width: i32,
-    height: i32,
-    sws_ctx: &mut SwsContext,
-    decoders: &mut HashMap<PathBuf, CachedVideoDecoder>,
-) -> Result<AVFrame> {
-    let path_key = source_path.to_path_buf();
-
-    // Open or reuse decoder
-    if !decoders.contains_key(&path_key) {
-        let decoder = FfmpegDecoder::open(source_path)?;
-        decoders.insert(
-            path_key.clone(),
-            CachedVideoDecoder {
-                decoder,
-                last_pts: -1.0,
-            },
-        );
-    }
-
-    let cached = decoders.get_mut(&path_key).unwrap();
-
-    // Seek if needed
-    let needs_seek = source_time < cached.last_pts
-        || (source_time - cached.last_pts) > 2.0
-        || cached.last_pts < 0.0;
-
-    if needs_seek {
-        cached.decoder.seek_to(source_time)?;
-        cached.last_pts = -1.0;
-    }
-
-    // Decode frames until we get one at or past the target time
-    loop {
-        match cached.decoder.decode_next_frame()? {
-            Some(frame) => {
-                cached.last_pts = frame.pts_secs;
-                // Accept the frame if it's close enough to the target time
-                if frame.pts_secs >= source_time - 0.05 {
-                    // Convert RGB24 → YUV420P
-                    return rgb_to_yuv(
-                        &frame.data,
-                        frame.width as i32,
-                        frame.height as i32,
-                        width,
-                        height,
-                        sws_ctx,
-                    );
-                }
-                // Otherwise skip (seeking landed before target)
-            }
-            None => {
-                // EOF — return black frame
-                return create_black_yuv_frame(width, height);
-            }
-        }
-    }
-}
-
-/// Convert RGB24 source frame data to a YUV420P AVFrame at the target dimensions.
-fn rgb_to_yuv(
-    rgb_data: &[u8],
-    src_width: i32,
-    src_height: i32,
-    dst_width: i32,
-    dst_height: i32,
-    sws_ctx: &mut SwsContext,
-) -> Result<AVFrame> {
-    // Create source AVFrame with RGB24 data
-    let mut src_frame = AVFrame::new();
-    src_frame.set_width(src_width);
-    src_frame.set_height(src_height);
-    src_frame.set_format(ffi::AV_PIX_FMT_RGB24);
-    src_frame
-        .alloc_buffer()
-        .map_err(|e| MediaError::EncoderError(format!("alloc src frame: {e}")))?;
-
-    // Copy RGB data into frame, handling stride differences
-    let linesize = unsafe { (*src_frame.as_ptr()).linesize[0] } as usize;
-    let row_bytes = (src_width * 3) as usize;
-    unsafe {
-        let dst_ptr = src_frame.data[0] as *mut u8;
-        for y in 0..src_height as usize {
-            std::ptr::copy_nonoverlapping(
-                rgb_data.as_ptr().add(y * row_bytes),
-                dst_ptr.add(y * linesize),
-                row_bytes,
-            );
-        }
-    }
-
-    // If dimensions differ, we need a separate scaling SWS context
-    if src_width != dst_width || src_height != dst_height {
-        let mut scale_sws = SwsContext::get_context(
-            src_width,
-            src_height,
-            ffi::AV_PIX_FMT_RGB24,
-            dst_width,
-            dst_height,
-            ffi::AV_PIX_FMT_YUV420P,
-            ffi::SWS_FAST_BILINEAR,
-            None,
-            None,
-            None,
-        )
-        .ok_or_else(|| MediaError::EncoderError("Failed to create scale SWS context".into()))?;
-
-        let mut dst_frame = AVFrame::new();
-        dst_frame.set_width(dst_width);
-        dst_frame.set_height(dst_height);
-        dst_frame.set_format(ffi::AV_PIX_FMT_YUV420P);
-        dst_frame
-            .alloc_buffer()
-            .map_err(|e| MediaError::EncoderError(format!("alloc dst frame: {e}")))?;
-
-        scale_sws
-            .scale_frame(&src_frame, 0, src_height, &mut dst_frame)
-            .map_err(|e| MediaError::EncoderError(format!("scale_frame: {e}")))?;
-
-        Ok(dst_frame)
-    } else {
-        // Same dimensions — use the provided SWS context
-        let mut dst_frame = AVFrame::new();
-        dst_frame.set_width(dst_width);
-        dst_frame.set_height(dst_height);
-        dst_frame.set_format(ffi::AV_PIX_FMT_YUV420P);
-        dst_frame
-            .alloc_buffer()
-            .map_err(|e| MediaError::EncoderError(format!("alloc dst frame: {e}")))?;
-
-        sws_ctx
-            .scale_frame(&src_frame, 0, src_height, &mut dst_frame)
-            .map_err(|e| MediaError::EncoderError(format!("scale_frame: {e}")))?;
-
-        Ok(dst_frame)
-    }
 }
 
 /// Create a black YUV420P frame.
@@ -592,67 +832,6 @@ fn create_black_yuv_frame(width: i32, height: i32) -> Result<AVFrame> {
     }
 
     Ok(frame)
-}
-
-/// Decode audio from source and create a FLTP AVFrame suitable for AAC encoding.
-fn decode_and_create_audio_frame(
-    source_path: &Path,
-    source_time: f64,
-    nb_samples: i32,
-    sample_rate: i32,
-    channels: i32,
-    pts: i64,
-    decoders: &mut HashMap<PathBuf, CachedAudioDecoder>,
-) -> Result<AVFrame> {
-    let path_key = source_path.to_path_buf();
-
-    // Open or reuse decoder
-    if !decoders.contains_key(&path_key) {
-        let decoder = FfmpegAudioDecoder::open(source_path)?;
-        decoders.insert(
-            path_key.clone(),
-            CachedAudioDecoder {
-                decoder,
-                last_pts: -1.0,
-            },
-        );
-    }
-
-    let cached = decoders.get_mut(&path_key).unwrap();
-
-    // Seek if needed
-    let needs_seek = source_time < cached.last_pts
-        || (source_time - cached.last_pts) > 2.0
-        || cached.last_pts < 0.0;
-
-    if needs_seek {
-        cached.decoder.seek_to(source_time)?;
-        cached.last_pts = -1.0;
-    }
-
-    // Decode until we get audio near the target time
-    loop {
-        match cached.decoder.decode_next_audio_frame() {
-            Ok(Some(frame)) => {
-                cached.last_pts = frame.pts_secs;
-                if frame.pts_secs >= source_time - 0.05 {
-                    // Convert interleaved f32 samples to FLTP AVFrame
-                    return interleaved_f32_to_fltp_frame(
-                        &frame.samples,
-                        frame.channels as i32,
-                        nb_samples,
-                        sample_rate,
-                        channels,
-                        pts,
-                    );
-                }
-            }
-            Ok(None) | Err(_) => {
-                // EOF or error — return silence
-                return create_silence_frame(nb_samples, sample_rate, channels, pts);
-            }
-        }
-    }
 }
 
 /// Convert interleaved f32 PCM samples to a planar float (FLTP) AVFrame.
@@ -698,43 +877,6 @@ fn interleaved_f32_to_fltp_frame(
                 };
                 *plane_ptr.add(s as usize) = val;
             }
-        }
-    }
-
-    Ok(frame)
-}
-
-/// Create a silent FLTP audio frame.
-fn create_silence_frame(
-    nb_samples: i32,
-    sample_rate: i32,
-    channels: i32,
-    pts: i64,
-) -> Result<AVFrame> {
-    let mut frame = AVFrame::new();
-    frame.set_format(ffi::AV_SAMPLE_FMT_FLTP);
-    frame.set_sample_rate(sample_rate);
-    frame.set_nb_samples(nb_samples);
-
-    let ch_layout = AVChannelLayout::from_nb_channels(channels);
-    unsafe {
-        ffi::av_channel_layout_copy(
-            &mut (*frame.as_mut_ptr()).ch_layout,
-            ch_layout.as_ptr(),
-        );
-    }
-
-    frame
-        .alloc_buffer()
-        .map_err(|e| MediaError::EncoderError(format!("alloc silence frame: {e}")))?;
-
-    frame.set_pts(pts);
-
-    // Zero all planes
-    for ch in 0..channels {
-        unsafe {
-            let plane_ptr = frame.data[ch as usize] as *mut f32;
-            std::ptr::write_bytes(plane_ptr, 0, nb_samples as usize);
         }
     }
 
