@@ -1140,7 +1140,7 @@ impl App {
         };
 
         // Add drag ghost overlay if dragging
-        if let Some(drag) = &self.drag_state {
+        let content: Element<'_, Message> = if let Some(drag) = &self.drag_state {
             let ghost = self.view_drag_overlay(drag);
             stack![base_layout, ghost]
                 .width(Length::Fill)
@@ -1148,7 +1148,21 @@ impl App {
                 .into()
         } else {
             base_layout
-        }
+        };
+
+        // Wrap in background container (#2b2d31) for consistent dark background on all platforms
+        container(content)
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .style(|_theme| container::Style {
+                background: Some(Background::Color(Color::from_rgb(
+                    0x2b as f32 / 255.0,
+                    0x2d as f32 / 255.0,
+                    0x31 as f32 / 255.0,
+                ))),
+                ..Default::default()
+            })
+            .into()
     }
 
     fn view_source_library(&self) -> Element<'_, Message> {
