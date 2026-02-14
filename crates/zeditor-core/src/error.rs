@@ -26,6 +26,18 @@ pub enum CoreError {
         end: TimelinePosition,
     },
 
+    #[error("no mirror track exists for track {0}")]
+    NoMirrorTrack(usize),
+
+    #[error("track type mismatch: expected {expected:?} but got {got:?}")]
+    TrackTypeMismatch {
+        expected: crate::timeline::TrackType,
+        got: crate::timeline::TrackType,
+    },
+
+    #[error("cannot insert: track {0} is not a {1:?} track")]
+    InvalidTrackInsertion(usize, crate::timeline::TrackType),
+
     #[error("nothing to undo")]
     NothingToUndo,
 

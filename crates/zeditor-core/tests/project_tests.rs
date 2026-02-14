@@ -9,8 +9,8 @@ use zeditor_core::timeline::*;
 fn test_new_project_has_default_tracks() {
     let project = Project::new("Test");
     assert_eq!(project.timeline.tracks.len(), 2);
-    assert_eq!(project.timeline.tracks[0].name, "Video 1");
-    assert_eq!(project.timeline.tracks[1].name, "Audio 1");
+    assert_eq!(project.timeline.tracks[0].name, "V1");
+    assert_eq!(project.timeline.tracks[1].name, "A1");
 }
 
 #[test]

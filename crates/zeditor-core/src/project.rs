@@ -4,8 +4,6 @@ use std::path::Path;
 use semver::Version;
 use serde::{Deserialize, Serialize};
 
-use uuid::Uuid;
-
 use crate::commands::CommandHistory;
 use crate::error::{CoreError, Result};
 use crate::media::SourceLibrary;
@@ -57,9 +55,8 @@ pub struct Project {
 impl Project {
     pub fn new(name: impl Into<String>) -> Self {
         let mut timeline = Timeline::new();
-        let group_id = Uuid::new_v4();
-        timeline.add_track_with_group("Video 1", TrackType::Video, Some(group_id));
-        timeline.add_track_with_group("Audio 1", TrackType::Audio, Some(group_id));
+        timeline.add_track("V1", TrackType::Video);
+        timeline.add_track("A1", TrackType::Audio);
 
         Self {
             name: name.into(),

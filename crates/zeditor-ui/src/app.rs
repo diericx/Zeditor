@@ -13,7 +13,7 @@ use zeditor_core::project::Project;
 use zeditor_core::timeline::{Clip, TimeRange, TimelinePosition, TrackType};
 
 use crate::audio_player::AudioPlayer;
-use crate::message::{ConfirmAction, ConfirmDialog, DragPayload, DragState, LeftPanelTab, MenuAction, MenuId, Message, SourceDragPreview, ToolMode};
+use crate::message::{ConfirmAction, ConfirmDialog, DragPayload, DragState, LeftPanelTab, MenuAction, MenuId, Message, SourceDragPreview, ToolMode, TrackContextMenu};
 use crate::widgets::timeline_canvas::TimelineCanvas;
 
 /// Preview resolution cap. 4K frames are scaled down to this for display.
@@ -79,6 +79,7 @@ pub struct App {
     pub selected_clip: Option<(usize, Uuid)>,
     pub confirm_dialog: Option<ConfirmDialog>,
     pub left_panel_tab: LeftPanelTab,
+    pub track_context_menu: Option<TrackContextMenu>,
     pub current_frame_transform: ResolvedTransform,
     decode_tx: Option<mpsc::Sender<DecodeRequest>>,
     pub(crate) decode_rx: Option<mpsc::Receiver<DecodedFrame>>,
@@ -119,6 +120,7 @@ impl Default for App {
             selected_clip: None,
             confirm_dialog: None,
             left_panel_tab: LeftPanelTab::default(),
+            track_context_menu: None,
             current_frame_transform: ResolvedTransform::default(),
             decode_tx: None,
             decode_rx: None,
@@ -157,6 +159,7 @@ impl App {
         self.selected_clip = None;
         self.confirm_dialog = None;
         self.left_panel_tab = LeftPanelTab::default();
+        self.track_context_menu = None;
         self.current_frame_transform = ResolvedTransform::default();
         self.thumbnails.clear();
         self.drag_state = None;
@@ -469,12 +472,14 @@ impl App {
             }
             Message::DragOverTimeline(point) => {
                 if let Some(drag) = &mut self.drag_state {
-                    // Account for controls row height (~30px) and ruler height (20px)
+                    // Account for controls row height (~30px), header column, and ruler height (20px)
                     let controls_height = 30.0_f32;
                     let ruler_height = 20.0_f32;
                     let track_height = 50.0_f32;
+                    let header_width = 60.0_f32;
 
-                    let secs = ((point.x + self.timeline_scroll) / self.timeline_zoom) as f64;
+                    let canvas_x = (point.x - header_width).max(0.0);
+                    let secs = ((canvas_x + self.timeline_scroll) / self.timeline_zoom) as f64;
                     let secs = secs.max(0.0);
 
                     let track_y = point.y - controls_height - ruler_height;
@@ -485,7 +490,7 @@ impl App {
                         idx.min(self.project.timeline.tracks.len().saturating_sub(1))
                     };
 
-                    // Only place on video tracks
+                    // Snap to nearest video track (for assets with video)
                     let video_track_index = self
                         .project
                         .timeline
@@ -761,6 +766,13 @@ impl App {
                         }
                         return Task::none();
                     }
+                    // When a track context menu is open, Escape dismisses it and all other keys are swallowed
+                    if self.track_context_menu.is_some() {
+                        if matches!(key.as_ref(), keyboard::Key::Named(keyboard::key::Named::Escape)) {
+                            self.track_context_menu = None;
+                        }
+                        return Task::none();
+                    }
                     // When a confirm dialog is open, Escape dismisses it and all other keys are swallowed
                     if self.confirm_dialog.is_some() {
                         if matches!(key.as_ref(), keyboard::Key::Named(keyboard::key::Named::Escape)) {
@@ -1022,6 +1034,85 @@ impl App {
                 }
             }
             Message::Exit => iced::exit(),
+            Message::ShowTrackContextMenu { track_index, screen_position } => {
+                if let Some(track) = self.project.timeline.tracks.get(track_index) {
+                    self.track_context_menu = Some(TrackContextMenu {
+                        track_index,
+                        position: screen_position,
+                        track_type: track.track_type,
+                    });
+                }
+                Task::none()
+            }
+            Message::DismissTrackContextMenu => {
+                self.track_context_menu = None;
+                Task::none()
+            }
+            Message::AddVideoTrackAbove(ref_idx) => {
+                self.track_context_menu = None;
+                let result = self.project.command_history.execute(
+                    &mut self.project.timeline,
+                    "Add video track above",
+                    |tl| { tl.insert_video_track_above(ref_idx)?; Ok(()) },
+                );
+                match result {
+                    Ok(()) => {
+                        self.status_message = "Video track added".into();
+                        // Clear selected clip since indices may have shifted
+                        self.selected_clip = None;
+                    }
+                    Err(e) => self.status_message = format!("Add track failed: {e}"),
+                }
+                Task::none()
+            }
+            Message::AddVideoTrackBelow(ref_idx) => {
+                self.track_context_menu = None;
+                let result = self.project.command_history.execute(
+                    &mut self.project.timeline,
+                    "Add video track below",
+                    |tl| { tl.insert_video_track_below(ref_idx)?; Ok(()) },
+                );
+                match result {
+                    Ok(()) => {
+                        self.status_message = "Video track added".into();
+                        self.selected_clip = None;
+                    }
+                    Err(e) => self.status_message = format!("Add track failed: {e}"),
+                }
+                Task::none()
+            }
+            Message::AddAudioTrackAbove(ref_idx) => {
+                self.track_context_menu = None;
+                let result = self.project.command_history.execute(
+                    &mut self.project.timeline,
+                    "Add audio track above",
+                    |tl| { tl.insert_audio_track_above(ref_idx)?; Ok(()) },
+                );
+                match result {
+                    Ok(()) => {
+                        self.status_message = "Audio track added".into();
+                        self.selected_clip = None;
+                    }
+                    Err(e) => self.status_message = format!("Add track failed: {e}"),
+                }
+                Task::none()
+            }
+            Message::AddAudioTrackBelow(ref_idx) => {
+                self.track_context_menu = None;
+                let result = self.project.command_history.execute(
+                    &mut self.project.timeline,
+                    "Add audio track below",
+                    |tl| { tl.insert_audio_track_below(ref_idx)?; Ok(()) },
+                );
+                match result {
+                    Ok(()) => {
+                        self.status_message = "Audio track added".into();
+                        self.selected_clip = None;
+                    }
+                    Err(e) => self.status_message = format!("Add track failed: {e}"),
+                }
+                Task::none()
+            }
             Message::SwitchLeftPanelTab(tab) => {
                 self.left_panel_tab = tab;
                 Task::none()
@@ -1142,7 +1233,10 @@ impl App {
         let top_row = row![source_panel, video_viewport].spacing(4);
 
         // Timeline row: timeline panel + effects inspector
-        let timeline_row: Element<'_, Message> = row![timeline_panel, effects_inspector].spacing(4).into();
+        let timeline_row: Element<'_, Message> = row![timeline_panel, effects_inspector]
+            .spacing(4)
+            .height(Length::Fill)
+            .into();
 
         // Main content area (without status bar)
         let main_content: Element<'_, Message> = if self.open_menu.is_some() {
@@ -1631,12 +1725,70 @@ impl App {
             source_drag,
         })
         .width(Length::Fill)
-        .height(200);
+        .height(Length::Fill);
 
-        let timeline_content: Element<'_, Message> = column![controls, canvas].spacing(4).into();
+        // Track headers column (fixed width, left of canvas)
+        let header_width: f32 = 60.0;
+        let ruler_height: f32 = 20.0;
+        let track_height: f32 = 50.0;
+
+        let mut header_items: Vec<Element<'_, Message>> = Vec::new();
+        // Ruler-height spacer at top to align with canvas ruler
+        header_items.push(
+            container(text("").size(1))
+                .height(ruler_height)
+                .width(header_width)
+                .into()
+        );
+
+        for (i, track) in self.project.timeline.tracks.iter().enumerate() {
+            let bg_color = match track.track_type {
+                TrackType::Video => Color::from_rgb(0.16, 0.18, 0.16),
+                TrackType::Audio => Color::from_rgb(0.14, 0.16, 0.20),
+            };
+            let header = container(
+                text(&track.name)
+                    .size(12)
+                    .color(Color::from_rgb(0.8, 0.8, 0.8))
+            )
+            .padding([4, 6])
+            .width(header_width)
+            .height(track_height)
+            .style(move |_theme| container::Style {
+                background: Some(Background::Color(bg_color)),
+                border: Border {
+                    color: Color::from_rgb(0.3, 0.3, 0.35),
+                    width: 0.0,
+                    radius: 0.0.into(),
+                },
+                ..Default::default()
+            });
+            // Wrap in mouse_area to detect right-click for context menu
+            let header_with_menu: Element<'_, Message> = mouse_area(header)
+                .on_right_press(Message::ShowTrackContextMenu {
+                    track_index: i,
+                    screen_position: Point::new(
+                        header_width,
+                        ruler_height + i as f32 * track_height,
+                    ),
+                })
+                .into();
+            header_items.push(header_with_menu);
+        }
+
+        let header_col: Element<'_, Message> = column(header_items).into();
+
+        let timeline_row: Element<'_, Message> = row![header_col, canvas]
+            .height(Length::Fill)
+            .into();
+
+        let timeline_content: Element<'_, Message> = column![controls, timeline_row]
+            .spacing(4)
+            .height(Length::Fill)
+            .into();
 
         // When dragging, wrap timeline in mouse_area for enter/exit/move detection
-        if self.drag_state.is_some() {
+        let timeline_content: Element<'_, Message> = if self.drag_state.is_some() {
             mouse_area(timeline_content)
                 .on_enter(Message::DragEnteredTimeline)
                 .on_exit(Message::DragExitedTimeline)
@@ -1644,7 +1796,90 @@ impl App {
                 .into()
         } else {
             timeline_content
+        };
+
+        // Add context menu overlay if present
+        if let Some(ref ctx) = self.track_context_menu {
+            let track_type = ctx.track_type;
+            let track_index = ctx.track_index;
+            let menu_y = ctx.position.y;
+            let menu_x = ctx.position.x;
+
+            let click_off: Element<'_, Message> = mouse_area(
+                container("")
+                    .width(Length::Fill)
+                    .height(Length::Fill),
+            )
+            .on_press(Message::DismissTrackContextMenu)
+            .into();
+
+            let menu_items: Vec<Element<'_, Message>> = match track_type {
+                TrackType::Video => vec![
+                    self.context_menu_item("Add Video Track Above", Message::AddVideoTrackAbove(track_index)),
+                    self.context_menu_item("Add Video Track Below", Message::AddVideoTrackBelow(track_index)),
+                ],
+                TrackType::Audio => vec![
+                    self.context_menu_item("Add Audio Track Above", Message::AddAudioTrackAbove(track_index)),
+                    self.context_menu_item("Add Audio Track Below", Message::AddAudioTrackBelow(track_index)),
+                ],
+            };
+
+            let menu = container(column(menu_items).spacing(0))
+                .width(200)
+                .padding(4)
+                .style(|_theme| container::Style {
+                    background: Some(Background::Color(Color::from_rgb(0.22, 0.22, 0.24))),
+                    border: Border {
+                        color: Color::from_rgb(0.15, 0.15, 0.17),
+                        width: 1.0,
+                        radius: 6.0.into(),
+                    },
+                    ..Default::default()
+                });
+
+            let positioned_menu = container(menu)
+                .padding(Padding {
+                    top: menu_y.max(0.0),
+                    left: menu_x.max(0.0),
+                    right: 0.0,
+                    bottom: 0.0,
+                })
+                .width(Length::Fill)
+                .height(Length::Fill);
+
+            stack![timeline_content, opaque(click_off), positioned_menu]
+                .width(Length::Fill)
+                .height(Length::Fill)
+                .into()
+        } else {
+            timeline_content
         }
+    }
+
+    fn context_menu_item<'a>(&self, label: &'a str, msg: Message) -> Element<'a, Message> {
+        button(
+            text(label).size(13).color(Color::WHITE).width(Length::Fill),
+        )
+        .on_press(msg)
+        .width(Length::Fill)
+        .padding([6, 10])
+        .style(|_theme, status| {
+            let bg = if matches!(status, button::Status::Hovered) {
+                Color::from_rgb(0.32, 0.32, 0.35)
+            } else {
+                Color::TRANSPARENT
+            };
+            button::Style {
+                background: Some(Background::Color(bg)),
+                text_color: Color::WHITE,
+                border: Border {
+                    radius: 4.0.into(),
+                    ..Default::default()
+                },
+                ..Default::default()
+            }
+        })
+        .into()
     }
 
     fn compute_source_drag_preview(&self) -> Option<SourceDragPreview> {

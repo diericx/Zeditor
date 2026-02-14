@@ -2,7 +2,7 @@ use std::path::PathBuf;
 
 use uuid::Uuid;
 use zeditor_core::effects::EffectType;
-use zeditor_core::timeline::TimelinePosition;
+use zeditor_core::timeline::{TimelinePosition, TrackType};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ToolMode {
@@ -56,6 +56,14 @@ pub enum DragPayload {
         thumbnail: Option<iced::widget::image::Handle>,
         name: String,
     },
+}
+
+/// State for a right-click context menu on a track header.
+#[derive(Debug, Clone)]
+pub struct TrackContextMenu {
+    pub track_index: usize,
+    pub position: iced::Point,
+    pub track_type: TrackType,
 }
 
 /// Preview state for a source asset being dragged over the timeline.
@@ -177,6 +185,17 @@ pub enum Message {
 
     // Left panel tabs
     SwitchLeftPanelTab(LeftPanelTab),
+
+    // Track context menu
+    ShowTrackContextMenu {
+        track_index: usize,
+        screen_position: iced::Point,
+    },
+    DismissTrackContextMenu,
+    AddVideoTrackAbove(usize),
+    AddVideoTrackBelow(usize),
+    AddAudioTrackAbove(usize),
+    AddAudioTrackBelow(usize),
 
     // Effects
     AddEffectToSelectedClip(EffectType),

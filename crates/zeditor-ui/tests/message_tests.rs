@@ -1087,13 +1087,14 @@ fn test_drag_over_timeline_computes_position() {
     app.update(Message::StartDragFromSource(asset_id));
     app.update(Message::DragEnteredTimeline);
 
-    // Simulate cursor at x=200, y=70 (past controls + ruler + into track 0)
-    app.update(Message::DragOverTimeline(iced::Point::new(200.0, 70.0)));
+    // Simulate cursor at x=260, y=70 (past 60px header + controls + ruler + into track 0)
+    // After header_width (60px) subtraction, effective x = 200 → 2.0 seconds at zoom 100
+    app.update(Message::DragOverTimeline(iced::Point::new(260.0, 70.0)));
 
     let drag = app.drag_state.as_ref().unwrap();
     assert!(drag.timeline_track.is_some());
     assert!(drag.timeline_position.is_some());
-    // At default zoom 100, x=200 → 2.0 seconds
+    // At default zoom 100, effective x=200 → 2.0 seconds
     let pos = drag.timeline_position.unwrap();
     assert!((pos.as_secs_f64() - 2.0).abs() < 0.1);
 }
@@ -2038,4 +2039,234 @@ fn test_switch_left_panel_tab() {
         app.left_panel_tab,
         zeditor_ui::message::LeftPanelTab::ProjectLibrary
     );
+}
+
+// =============================================================================
+// Brief 14: Multiple tracks tests
+// =============================================================================
+
+#[test]
+fn test_show_track_context_menu() {
+    let mut app = App::new();
+    assert!(app.track_context_menu.is_none());
+
+    app.update(Message::ShowTrackContextMenu {
+        track_index: 0,
+        screen_position: iced::Point::new(100.0, 50.0),
+    });
+
+    let menu = app.track_context_menu.as_ref().unwrap();
+    assert_eq!(menu.track_index, 0);
+    assert_eq!(menu.position, iced::Point::new(100.0, 50.0));
+}
+
+#[test]
+fn test_dismiss_track_context_menu() {
+    let mut app = App::new();
+    app.update(Message::ShowTrackContextMenu {
+        track_index: 0,
+        screen_position: iced::Point::new(100.0, 50.0),
+    });
+    assert!(app.track_context_menu.is_some());
+
+    app.update(Message::DismissTrackContextMenu);
+    assert!(app.track_context_menu.is_none());
+}
+
+#[test]
+fn test_escape_dismisses_track_context_menu() {
+    let mut app = App::new();
+    app.update(Message::ShowTrackContextMenu {
+        track_index: 0,
+        screen_position: iced::Point::new(100.0, 50.0),
+    });
+    assert!(app.track_context_menu.is_some());
+
+    app.update(Message::KeyboardEvent(iced::keyboard::Event::KeyPressed {
+        key: iced::keyboard::Key::Named(iced::keyboard::key::Named::Escape),
+        modified_key: iced::keyboard::Key::Named(iced::keyboard::key::Named::Escape),
+        physical_key: iced::keyboard::key::Physical::Unidentified(
+            iced::keyboard::key::NativeCode::Unidentified,
+        ),
+        location: iced::keyboard::Location::Standard,
+        modifiers: iced::keyboard::Modifiers::empty(),
+        text: None,
+        repeat: false,
+    }));
+    assert!(app.track_context_menu.is_none());
+}
+
+#[test]
+fn test_add_video_track_above() {
+    let mut app = App::new();
+    assert_eq!(app.project.timeline.tracks.len(), 2); // V1, A1
+
+    app.update(Message::AddVideoTrackAbove(0));
+
+    assert_eq!(app.project.timeline.tracks.len(), 3);
+    // After renumbering: V2 (index 0), V1 (index 1), A1 (index 2)
+    assert_eq!(app.project.timeline.tracks[0].name, "V2");
+    assert_eq!(app.project.timeline.tracks[1].name, "V1");
+    assert_eq!(app.project.timeline.tracks[2].name, "A1");
+}
+
+#[test]
+fn test_add_video_track_below() {
+    let mut app = App::new();
+    assert_eq!(app.project.timeline.tracks.len(), 2);
+
+    app.update(Message::AddVideoTrackBelow(0));
+
+    assert_eq!(app.project.timeline.tracks.len(), 3);
+    // After renumbering: V2 (index 0), V1 (index 1), A1 (index 2)
+    assert_eq!(app.project.timeline.tracks[0].name, "V2");
+    assert_eq!(app.project.timeline.tracks[1].name, "V1");
+    assert_eq!(app.project.timeline.tracks[2].name, "A1");
+}
+
+#[test]
+fn test_add_audio_track_above() {
+    let mut app = App::new();
+    assert_eq!(app.project.timeline.tracks.len(), 2);
+
+    app.update(Message::AddAudioTrackAbove(1));
+
+    assert_eq!(app.project.timeline.tracks.len(), 3);
+    // After renumbering: V1 (index 0), A1 (index 1), A2 (index 2)
+    assert_eq!(app.project.timeline.tracks[0].name, "V1");
+    assert_eq!(app.project.timeline.tracks[1].name, "A1");
+    assert_eq!(app.project.timeline.tracks[2].name, "A2");
+}
+
+#[test]
+fn test_add_audio_track_below() {
+    let mut app = App::new();
+    assert_eq!(app.project.timeline.tracks.len(), 2);
+
+    app.update(Message::AddAudioTrackBelow(1));
+
+    assert_eq!(app.project.timeline.tracks.len(), 3);
+    // After renumbering: V1 (index 0), A1 (index 1), A2 (index 2)
+    assert_eq!(app.project.timeline.tracks[0].name, "V1");
+    assert_eq!(app.project.timeline.tracks[1].name, "A1");
+    assert_eq!(app.project.timeline.tracks[2].name, "A2");
+}
+
+#[test]
+fn test_add_track_is_undoable() {
+    let mut app = App::new();
+    assert_eq!(app.project.timeline.tracks.len(), 2);
+
+    app.update(Message::AddVideoTrackAbove(0));
+    assert_eq!(app.project.timeline.tracks.len(), 3);
+
+    app.update(Message::Undo);
+    assert_eq!(app.project.timeline.tracks.len(), 2);
+
+    app.update(Message::Redo);
+    assert_eq!(app.project.timeline.tracks.len(), 3);
+}
+
+#[test]
+fn test_add_track_clears_context_menu() {
+    let mut app = App::new();
+    app.update(Message::ShowTrackContextMenu {
+        track_index: 0,
+        screen_position: iced::Point::new(100.0, 50.0),
+    });
+    assert!(app.track_context_menu.is_some());
+
+    app.update(Message::AddVideoTrackAbove(0));
+    assert!(app.track_context_menu.is_none());
+}
+
+#[test]
+fn test_add_multiple_tracks_renumbers_correctly() {
+    let mut app = App::new();
+
+    // Add two more video tracks
+    app.update(Message::AddVideoTrackAbove(0));
+    app.update(Message::AddVideoTrackAbove(0));
+
+    // Add one more audio track
+    let audio_idx = app.project.timeline.first_audio_track_index().unwrap();
+    app.update(Message::AddAudioTrackBelow(audio_idx));
+
+    // Should have V3, V2, V1, A1, A2
+    assert_eq!(app.project.timeline.tracks.len(), 5);
+    assert_eq!(app.project.timeline.tracks[0].name, "V3");
+    assert_eq!(app.project.timeline.tracks[1].name, "V2");
+    assert_eq!(app.project.timeline.tracks[2].name, "V1");
+    assert_eq!(app.project.timeline.tracks[3].name, "A1");
+    assert_eq!(app.project.timeline.tracks[4].name, "A2");
+}
+
+#[test]
+fn test_default_project_track_names() {
+    let app = App::new();
+    assert_eq!(app.project.timeline.tracks[0].name, "V1");
+    assert_eq!(app.project.timeline.tracks[1].name, "A1");
+}
+
+#[test]
+fn test_move_grouped_clip_v1_to_v2() {
+    let mut app = App::new();
+
+    // Add grouped clip on V1/A1
+    let asset = make_test_asset("clip1", 5.0); // has_audio: true
+    let asset_id = asset.id;
+    app.update(Message::MediaImported(Ok(asset)));
+    app.update(Message::AddClipToTimeline {
+        asset_id,
+        track_index: 0,
+        position: TimelinePosition::zero(),
+    });
+
+    // Verify clips on V1 (index 0) and A1 (index 1)
+    assert_eq!(app.project.timeline.tracks[0].clips.len(), 1);
+    assert_eq!(app.project.timeline.tracks[1].clips.len(), 1);
+    let vid_id = app.project.timeline.tracks[0].clips[0].id;
+
+    // Add V2 above V1 and A2 below A1
+    // Layout becomes: V2(0), V1(1), A1(2), A2(3)
+    app.update(Message::AddVideoTrackAbove(0));
+    let audio_idx = app.project.timeline.first_audio_track_index().unwrap();
+    app.update(Message::AddAudioTrackBelow(audio_idx));
+
+    assert_eq!(app.project.timeline.tracks.len(), 4);
+    assert_eq!(app.project.timeline.tracks[0].name, "V2");
+    assert_eq!(app.project.timeline.tracks[1].name, "V1");
+    assert_eq!(app.project.timeline.tracks[2].name, "A1");
+    assert_eq!(app.project.timeline.tracks[3].name, "A2");
+
+    // Clip should still be on V1 (now index 1) and A1 (now index 2)
+    assert_eq!(app.project.timeline.tracks[1].clips.len(), 1, "V1 should have clip");
+    assert_eq!(app.project.timeline.tracks[2].clips.len(), 1, "A1 should have clip");
+    // The clip ID may have shifted since undo/redo snapshots tracks
+    let vid_id = app.project.timeline.tracks[1].clips[0].id;
+
+    // Move grouped clip from V1(1) to V2(0) at 1.0s
+    app.update(Message::MoveClip {
+        source_track: 1,
+        clip_id: vid_id,
+        dest_track: 0,
+        position: TimelinePosition::from_secs_f64(1.0),
+    });
+
+    // Video should be on V2 (index 0)
+    assert_eq!(
+        app.project.timeline.tracks[0].clips.len(), 1,
+        "V2 should have the video clip. Status: {}",
+        app.status_message
+    );
+    // V1 should be empty
+    assert_eq!(app.project.timeline.tracks[1].clips.len(), 0, "V1 should be empty");
+    // Audio should be on A2 (index 3, mirror of V2)
+    assert_eq!(
+        app.project.timeline.tracks[3].clips.len(), 1,
+        "A2 should have the audio clip. Status: {}",
+        app.status_message
+    );
+    // A1 should be empty
+    assert_eq!(app.project.timeline.tracks[2].clips.len(), 0, "A1 should be empty");
 }

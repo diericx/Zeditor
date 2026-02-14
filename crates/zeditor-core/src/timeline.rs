@@ -474,6 +474,144 @@ impl Timeline {
         idx
     }
 
+    /// Return indices of all video tracks, in Vec order (top to bottom).
+    pub fn video_track_indices(&self) -> Vec<usize> {
+        self.tracks
+            .iter()
+            .enumerate()
+            .filter(|(_, t)| t.track_type == TrackType::Video)
+            .map(|(i, _)| i)
+            .collect()
+    }
+
+    /// Return indices of all audio tracks, in Vec order (top to bottom).
+    pub fn audio_track_indices(&self) -> Vec<usize> {
+        self.tracks
+            .iter()
+            .enumerate()
+            .filter(|(_, t)| t.track_type == TrackType::Audio)
+            .map(|(i, _)| i)
+            .collect()
+    }
+
+    /// Index of the first audio track (the V/A boundary).
+    pub fn first_audio_track_index(&self) -> Option<usize> {
+        self.tracks
+            .iter()
+            .position(|t| t.track_type == TrackType::Audio)
+    }
+
+    /// Mirror audio track for a video track using center-out mirroring:
+    /// V1 (last video, closest to boundary) ↔ A1 (first audio).
+    /// V2 ↔ A2, etc.
+    pub fn mirror_audio_track_for_video(&self, video_idx: usize) -> Option<usize> {
+        let video_indices = self.video_track_indices();
+        let audio_indices = self.audio_track_indices();
+        // Video tracks are numbered top-to-bottom: last video = V1 (closest to boundary)
+        let video_pos = video_indices.iter().position(|&i| i == video_idx)?;
+        // Mirror index: last video → first audio, second-to-last video → second audio, etc.
+        let mirror_pos = video_indices.len().checked_sub(1)? - video_pos;
+        audio_indices.get(mirror_pos).copied()
+    }
+
+    /// Mirror video track for an audio track (inverse of mirror_audio_track_for_video).
+    pub fn mirror_video_track_for_audio(&self, audio_idx: usize) -> Option<usize> {
+        let video_indices = self.video_track_indices();
+        let audio_indices = self.audio_track_indices();
+        let audio_pos = audio_indices.iter().position(|&i| i == audio_idx)?;
+        // First audio → last video, second audio → second-to-last video, etc.
+        let mirror_pos = video_indices.len().checked_sub(1)? - audio_pos;
+        video_indices.get(mirror_pos).copied()
+    }
+
+    /// Insert a new video track above (before) the reference track in the Vec.
+    /// Returns the new track's index. Fails if ref_idx is not a video track.
+    pub fn insert_video_track_above(&mut self, ref_idx: usize) -> Result<usize> {
+        if ref_idx >= self.tracks.len() {
+            return Err(CoreError::TrackNotFound(ref_idx));
+        }
+        if self.tracks[ref_idx].track_type != TrackType::Video {
+            return Err(CoreError::InvalidTrackInsertion(ref_idx, TrackType::Video));
+        }
+        let track = Track::new("", TrackType::Video);
+        self.tracks.insert(ref_idx, track);
+        self.renumber_tracks();
+        Ok(ref_idx)
+    }
+
+    /// Insert a new video track below (after) the reference track in the Vec.
+    /// If ref_idx is the last video track, inserts before the first audio track.
+    pub fn insert_video_track_below(&mut self, ref_idx: usize) -> Result<usize> {
+        if ref_idx >= self.tracks.len() {
+            return Err(CoreError::TrackNotFound(ref_idx));
+        }
+        if self.tracks[ref_idx].track_type != TrackType::Video {
+            return Err(CoreError::InvalidTrackInsertion(ref_idx, TrackType::Video));
+        }
+        let insert_idx = ref_idx + 1;
+        // Don't insert into the audio section
+        let first_audio = self.first_audio_track_index().unwrap_or(self.tracks.len());
+        let insert_idx = insert_idx.min(first_audio);
+        let track = Track::new("", TrackType::Video);
+        self.tracks.insert(insert_idx, track);
+        self.renumber_tracks();
+        Ok(insert_idx)
+    }
+
+    /// Insert a new audio track above (before) the reference track in the Vec.
+    pub fn insert_audio_track_above(&mut self, ref_idx: usize) -> Result<usize> {
+        if ref_idx >= self.tracks.len() {
+            return Err(CoreError::TrackNotFound(ref_idx));
+        }
+        if self.tracks[ref_idx].track_type != TrackType::Audio {
+            return Err(CoreError::InvalidTrackInsertion(ref_idx, TrackType::Audio));
+        }
+        // Don't insert into the video section
+        let first_audio = self.first_audio_track_index().unwrap_or(ref_idx);
+        let insert_idx = ref_idx.max(first_audio);
+        let track = Track::new("", TrackType::Audio);
+        self.tracks.insert(insert_idx, track);
+        self.renumber_tracks();
+        Ok(insert_idx)
+    }
+
+    /// Insert a new audio track below (after) the reference track in the Vec.
+    pub fn insert_audio_track_below(&mut self, ref_idx: usize) -> Result<usize> {
+        if ref_idx >= self.tracks.len() {
+            return Err(CoreError::TrackNotFound(ref_idx));
+        }
+        if self.tracks[ref_idx].track_type != TrackType::Audio {
+            return Err(CoreError::InvalidTrackInsertion(ref_idx, TrackType::Audio));
+        }
+        let insert_idx = ref_idx + 1;
+        let track = Track::new("", TrackType::Audio);
+        self.tracks.insert(insert_idx, track);
+        self.renumber_tracks();
+        Ok(insert_idx)
+    }
+
+    /// Rename all tracks using KDEnlive-style naming:
+    /// Video tracks top-to-bottom: VN, V(N-1), ..., V2, V1
+    /// Audio tracks top-to-bottom: A1, A2, ..., AN
+    pub fn renumber_tracks(&mut self) {
+        let video_count = self.video_track_indices().len();
+        let mut video_num = video_count;
+        let mut audio_num = 1;
+
+        for track in &mut self.tracks {
+            match track.track_type {
+                TrackType::Video => {
+                    track.name = format!("V{}", video_num);
+                    video_num = video_num.saturating_sub(1);
+                }
+                TrackType::Audio => {
+                    track.name = format!("A{}", audio_num);
+                    audio_num += 1;
+                }
+            }
+        }
+    }
+
     /// Find all track indices that share the same group_id as the given track.
     pub fn group_members(&self, track_index: usize) -> Vec<usize> {
         let group_id = match self.tracks.get(track_index) {
@@ -506,14 +644,9 @@ impl Timeline {
         result
     }
 
-    /// Find the audio track paired with a video track via group_id.
+    /// Find the audio track paired with a video track via mirror computation.
     pub fn find_paired_audio_track(&self, video_track_index: usize) -> Option<usize> {
-        let group_id = self.tracks.get(video_track_index)?.group_id?;
-        self.tracks
-            .iter()
-            .enumerate()
-            .find(|(i, t)| *i != video_track_index && t.group_id == Some(group_id) && t.track_type == TrackType::Audio)
-            .map(|(i, _)| i)
+        self.mirror_audio_track_for_video(video_track_index)
     }
 
     pub fn track(&self, index: usize) -> Result<&Track> {
@@ -852,6 +985,8 @@ impl Timeline {
     }
 
     /// Move a clip and all its linked clips by the same delta.
+    /// When dest_track differs from source_track, computes the mirror track
+    /// for linked clips. Returns `NoMirrorTrack` if no mirror exists.
     pub fn move_clip_grouped(
         &mut self,
         source_track: usize,
@@ -865,6 +1000,20 @@ impl Timeline {
             let clip = track.get_clip(clip_id).ok_or(CoreError::ClipNotFound(clip_id))?;
             (clip.timeline_range.start, clip.link_id)
         };
+
+        // If cross-track move with linked clips, verify mirror track exists
+        if source_track != dest_track {
+            if let Some(_link_id) = link_id {
+                let source_type = self.track(source_track)?.track_type;
+                if source_type == TrackType::Video {
+                    if self.mirror_audio_track_for_video(dest_track).is_none() {
+                        return Err(CoreError::NoMirrorTrack(dest_track));
+                    }
+                } else if self.mirror_video_track_for_audio(dest_track).is_none() {
+                    return Err(CoreError::NoMirrorTrack(dest_track));
+                }
+            }
+        }
 
         // Move the primary clip
         self.move_clip(source_track, clip_id, dest_track, new_position)?;
@@ -881,13 +1030,29 @@ impl Timeline {
                     let track = self.track(track_idx)?;
                     match track.get_clip(linked_clip_id) {
                         Some(clip) => clip.timeline_range.start,
-                        None => continue, // linked clip was deleted independently
+                        None => continue,
                     }
                 };
                 let new_linked_pos = TimelinePosition::from_secs_f64(
                     (linked_pos.as_secs_f64() + delta_secs).max(0.0)
                 );
-                self.move_clip(track_idx, linked_clip_id, track_idx, new_linked_pos)?;
+                // Compute destination for linked clip
+                let linked_dest = if source_track != dest_track {
+                    // Move linked clip to the mirror of dest_track
+                    let dest_type = self.track(dest_track)?.track_type;
+                    if dest_type == TrackType::Video {
+                        // Primary moved to a video track, linked is audio → mirror
+                        self.mirror_audio_track_for_video(dest_track)
+                            .ok_or(CoreError::NoMirrorTrack(dest_track))?
+                    } else {
+                        // Primary moved to an audio track, linked is video → mirror
+                        self.mirror_video_track_for_audio(dest_track)
+                            .ok_or(CoreError::NoMirrorTrack(dest_track))?
+                    }
+                } else {
+                    track_idx
+                };
+                self.move_clip(track_idx, linked_clip_id, linked_dest, new_linked_pos)?;
             }
         }
 

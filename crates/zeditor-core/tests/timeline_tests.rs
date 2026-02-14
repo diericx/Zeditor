@@ -1083,6 +1083,239 @@ fn test_cut_preserves_effects() {
 }
 
 #[test]
+// ===== Multiple tracks tests =====
+
+#[test]
+fn test_mirror_computation_2v_2a() {
+    let mut timeline = Timeline::new();
+    timeline.add_track("V2", TrackType::Video); // index 0
+    timeline.add_track("V1", TrackType::Video); // index 1
+    timeline.add_track("A1", TrackType::Audio); // index 2
+    timeline.add_track("A2", TrackType::Audio); // index 3
+
+    // V1 (index 1, closest to boundary) ↔ A1 (index 2)
+    assert_eq!(timeline.mirror_audio_track_for_video(1), Some(2));
+    assert_eq!(timeline.mirror_video_track_for_audio(2), Some(1));
+    // V2 (index 0) ↔ A2 (index 3)
+    assert_eq!(timeline.mirror_audio_track_for_video(0), Some(3));
+    assert_eq!(timeline.mirror_video_track_for_audio(3), Some(0));
+}
+
+#[test]
+fn test_mirror_computation_3v_2a_no_match() {
+    let mut timeline = Timeline::new();
+    timeline.add_track("V3", TrackType::Video); // index 0
+    timeline.add_track("V2", TrackType::Video); // index 1
+    timeline.add_track("V1", TrackType::Video); // index 2
+    timeline.add_track("A1", TrackType::Audio); // index 3
+    timeline.add_track("A2", TrackType::Audio); // index 4
+
+    // V1 (index 2) ↔ A1 (index 3)
+    assert_eq!(timeline.mirror_audio_track_for_video(2), Some(3));
+    // V2 (index 1) ↔ A2 (index 4)
+    assert_eq!(timeline.mirror_audio_track_for_video(1), Some(4));
+    // V3 (index 0) has no mirror (only 2 audio tracks)
+    assert_eq!(timeline.mirror_audio_track_for_video(0), None);
+}
+
+#[test]
+fn test_video_audio_track_indices() {
+    let mut timeline = Timeline::new();
+    timeline.add_track("V2", TrackType::Video);
+    timeline.add_track("V1", TrackType::Video);
+    timeline.add_track("A1", TrackType::Audio);
+    timeline.add_track("A2", TrackType::Audio);
+
+    assert_eq!(timeline.video_track_indices(), vec![0, 1]);
+    assert_eq!(timeline.audio_track_indices(), vec![2, 3]);
+    assert_eq!(timeline.first_audio_track_index(), Some(2));
+}
+
+#[test]
+fn test_insert_video_track_above() {
+    let mut timeline = Timeline::new();
+    timeline.add_track("V1", TrackType::Video);
+    timeline.add_track("A1", TrackType::Audio);
+
+    let new_idx = timeline.insert_video_track_above(0).unwrap();
+    assert_eq!(new_idx, 0);
+    assert_eq!(timeline.tracks.len(), 3);
+    assert_eq!(timeline.tracks[0].track_type, TrackType::Video);
+    assert_eq!(timeline.tracks[0].name, "V2");
+    assert_eq!(timeline.tracks[1].name, "V1");
+    assert_eq!(timeline.tracks[2].name, "A1");
+}
+
+#[test]
+fn test_insert_video_track_below() {
+    let mut timeline = Timeline::new();
+    timeline.add_track("V1", TrackType::Video);
+    timeline.add_track("A1", TrackType::Audio);
+
+    let new_idx = timeline.insert_video_track_below(0).unwrap();
+    assert_eq!(new_idx, 1);
+    assert_eq!(timeline.tracks.len(), 3);
+    // Renumbered: V2 (top), V1 (new), A1
+    assert_eq!(timeline.tracks[0].name, "V2");
+    assert_eq!(timeline.tracks[1].name, "V1");
+    assert_eq!(timeline.tracks[2].name, "A1");
+}
+
+#[test]
+fn test_insert_audio_track_below() {
+    let mut timeline = Timeline::new();
+    timeline.add_track("V1", TrackType::Video);
+    timeline.add_track("A1", TrackType::Audio);
+
+    let new_idx = timeline.insert_audio_track_below(1).unwrap();
+    assert_eq!(new_idx, 2);
+    assert_eq!(timeline.tracks.len(), 3);
+    assert_eq!(timeline.tracks[0].name, "V1");
+    assert_eq!(timeline.tracks[1].name, "A1");
+    assert_eq!(timeline.tracks[2].name, "A2");
+}
+
+#[test]
+fn test_insert_audio_track_above() {
+    let mut timeline = Timeline::new();
+    timeline.add_track("V1", TrackType::Video);
+    timeline.add_track("A1", TrackType::Audio);
+
+    let new_idx = timeline.insert_audio_track_above(1).unwrap();
+    assert_eq!(new_idx, 1);
+    assert_eq!(timeline.tracks.len(), 3);
+    assert_eq!(timeline.tracks[0].name, "V1");
+    assert_eq!(timeline.tracks[1].name, "A1");
+    assert_eq!(timeline.tracks[2].name, "A2");
+}
+
+#[test]
+fn test_renumber_tracks() {
+    let mut timeline = Timeline::new();
+    timeline.add_track("old_v", TrackType::Video);
+    timeline.add_track("old_v2", TrackType::Video);
+    timeline.add_track("old_a", TrackType::Audio);
+    timeline.add_track("old_a2", TrackType::Audio);
+
+    timeline.renumber_tracks();
+
+    assert_eq!(timeline.tracks[0].name, "V2");
+    assert_eq!(timeline.tracks[1].name, "V1");
+    assert_eq!(timeline.tracks[2].name, "A1");
+    assert_eq!(timeline.tracks[3].name, "A2");
+}
+
+#[test]
+fn test_track_ordering_invariant_after_insertions() {
+    let mut timeline = Timeline::new();
+    timeline.add_track("V1", TrackType::Video);
+    timeline.add_track("A1", TrackType::Audio);
+
+    // Insert video above, video below, audio above, audio below
+    timeline.insert_video_track_above(0).unwrap();
+    timeline.insert_audio_track_below(timeline.tracks.len() - 1).unwrap();
+
+    // Verify all video tracks come before all audio tracks
+    let mut seen_audio = false;
+    for track in &timeline.tracks {
+        if track.track_type == TrackType::Audio {
+            seen_audio = true;
+        } else if seen_audio {
+            panic!("Video track found after audio track: {:?}", timeline.tracks.iter().map(|t| &t.name).collect::<Vec<_>>());
+        }
+    }
+}
+
+#[test]
+fn test_insert_wrong_type_fails() {
+    let mut timeline = Timeline::new();
+    timeline.add_track("V1", TrackType::Video);
+    timeline.add_track("A1", TrackType::Audio);
+
+    // Trying to insert video on audio track should fail
+    assert!(timeline.insert_video_track_above(1).is_err());
+    assert!(timeline.insert_video_track_below(1).is_err());
+    // Trying to insert audio on video track should fail
+    assert!(timeline.insert_audio_track_above(0).is_err());
+    assert!(timeline.insert_audio_track_below(0).is_err());
+}
+
+#[test]
+fn test_grouped_cross_track_move_with_mirror() {
+    let mut timeline = Timeline::new();
+    timeline.add_track("V2", TrackType::Video); // 0
+    timeline.add_track("V1", TrackType::Video); // 1
+    timeline.add_track("A1", TrackType::Audio); // 2
+    timeline.add_track("A2", TrackType::Audio); // 3
+
+    let asset_id = Uuid::new_v4();
+    let source_range = TimeRange::new(
+        TimelinePosition::zero(),
+        TimelinePosition::from_secs_f64(5.0),
+    ).unwrap();
+
+    // Add linked clips on V1 (idx 1) and A1 (idx 2)
+    let (vid, aud) = timeline.add_clip_with_audio(1, 2, asset_id, TimelinePosition::zero(), source_range).unwrap();
+
+    // Move video clip from V1 (idx 1) to V2 (idx 0) → audio should go to A2 (idx 3)
+    timeline.move_clip_grouped(1, vid, 0, TimelinePosition::from_secs_f64(1.0)).unwrap();
+
+    // Video should be on track 0
+    assert!(timeline.tracks[0].get_clip(vid).is_some());
+    assert!(timeline.tracks[1].get_clip(vid).is_none());
+    // Audio should be on track 3 (mirror of V2)
+    assert!(timeline.tracks[3].get_clip(aud).is_some());
+    assert!(timeline.tracks[2].get_clip(aud).is_none());
+}
+
+#[test]
+fn test_grouped_move_rejected_when_no_mirror() {
+    let mut timeline = Timeline::new();
+    timeline.add_track("V3", TrackType::Video); // 0
+    timeline.add_track("V2", TrackType::Video); // 1
+    timeline.add_track("V1", TrackType::Video); // 2
+    timeline.add_track("A1", TrackType::Audio); // 3
+    timeline.add_track("A2", TrackType::Audio); // 4
+
+    let asset_id = Uuid::new_v4();
+    let source_range = TimeRange::new(
+        TimelinePosition::zero(),
+        TimelinePosition::from_secs_f64(5.0),
+    ).unwrap();
+
+    // Add linked clips on V1 (idx 2) and A1 (idx 3)
+    let (vid, _aud) = timeline.add_clip_with_audio(2, 3, asset_id, TimelinePosition::zero(), source_range).unwrap();
+
+    // Move to V3 (idx 0) — has no mirror (only 2 audio tracks)
+    let result = timeline.move_clip_grouped(2, vid, 0, TimelinePosition::from_secs_f64(1.0));
+    assert!(result.is_err(), "should fail when no mirror track exists");
+}
+
+#[test]
+fn test_find_paired_audio_track_uses_mirror() {
+    let mut timeline = Timeline::new();
+    timeline.add_track("V2", TrackType::Video); // 0
+    timeline.add_track("V1", TrackType::Video); // 1
+    timeline.add_track("A1", TrackType::Audio); // 2
+    timeline.add_track("A2", TrackType::Audio); // 3
+
+    // find_paired_audio_track should use mirroring
+    assert_eq!(timeline.find_paired_audio_track(1), Some(2)); // V1 → A1
+    assert_eq!(timeline.find_paired_audio_track(0), Some(3)); // V2 → A2
+}
+
+#[test]
+fn test_default_project_tracks() {
+    use zeditor_core::project::Project;
+    let project = Project::new("Test");
+    assert_eq!(project.timeline.tracks.len(), 2);
+    assert_eq!(project.timeline.tracks[0].name, "V1");
+    assert_eq!(project.timeline.tracks[0].track_type, TrackType::Video);
+    assert_eq!(project.timeline.tracks[1].name, "A1");
+    assert_eq!(project.timeline.tracks[1].track_type, TrackType::Audio);
+}
+
+#[test]
 fn test_split_by_overlap_preserves_effects() {
     let mut timeline = Timeline::new();
     timeline.add_track("Video 1", TrackType::Video);

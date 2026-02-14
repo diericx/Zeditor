@@ -31,6 +31,7 @@ pub enum TimelineInteraction {
         offset_px: f32,
         current_x: f32,
         start_x: f32,
+        start_y: f32,
     },
     Resizing {
         track_index: usize,
@@ -113,6 +114,80 @@ impl<'a> TimelineCanvas<'a> {
             .find(|c| c.id == clip_id)
             .map(|c| c.duration().as_secs_f64())
             .unwrap_or(0.0)
+    }
+
+    /// Validate the destination track for a drag operation.
+    /// Solo clips: must match clip's track type; snaps to nearest track of correct type.
+    /// Grouped clips: dest must have a mirror track; snaps to last valid track if not.
+    fn validate_drag_dest_track(
+        &self,
+        source_track: usize,
+        clip_id: Uuid,
+        raw_dest: usize,
+    ) -> usize {
+        let clip = self.timeline.track(source_track)
+            .ok()
+            .and_then(|t| t.get_clip(clip_id));
+        let clip = match clip {
+            Some(c) => c,
+            None => return raw_dest,
+        };
+
+        let source_type = self.timeline.tracks.get(source_track)
+            .map(|t| t.track_type)
+            .unwrap_or(TrackType::Video);
+        let has_link = clip.link_id.is_some();
+
+        if has_link {
+            // Grouped clip: dest_track must have a mirror
+            if source_type == TrackType::Video {
+                // Check if mirror audio track exists for raw_dest
+                if self.timeline.mirror_audio_track_for_video(raw_dest).is_some() {
+                    return raw_dest;
+                }
+                // Snap to nearest video track that has a mirror
+                self.nearest_video_track_with_mirror(raw_dest)
+                    .unwrap_or(source_track)
+            } else {
+                if self.timeline.mirror_video_track_for_audio(raw_dest).is_some() {
+                    return raw_dest;
+                }
+                self.nearest_audio_track_with_mirror(raw_dest)
+                    .unwrap_or(source_track)
+            }
+        } else {
+            // Solo clip: dest must match track type
+            let dest_type = self.timeline.tracks.get(raw_dest)
+                .map(|t| t.track_type)
+                .unwrap_or(TrackType::Video);
+            if dest_type == source_type {
+                raw_dest
+            } else {
+                // Snap to nearest track of correct type
+                self.nearest_track_of_type(raw_dest, source_type)
+                    .unwrap_or(source_track)
+            }
+        }
+    }
+
+    fn nearest_track_of_type(&self, target: usize, track_type: TrackType) -> Option<usize> {
+        self.timeline.tracks.iter()
+            .enumerate()
+            .filter(|(_, t)| t.track_type == track_type)
+            .min_by_key(|(i, _)| (*i as isize - target as isize).unsigned_abs())
+            .map(|(i, _)| i)
+    }
+
+    fn nearest_video_track_with_mirror(&self, target: usize) -> Option<usize> {
+        self.timeline.video_track_indices().into_iter()
+            .filter(|&i| self.timeline.mirror_audio_track_for_video(i).is_some())
+            .min_by_key(|&i| (i as isize - target as isize).unsigned_abs())
+    }
+
+    fn nearest_audio_track_with_mirror(&self, target: usize) -> Option<usize> {
+        self.timeline.audio_track_indices().into_iter()
+            .filter(|&i| self.timeline.mirror_video_track_for_audio(i).is_some())
+            .min_by_key(|&i| (i as isize - target as isize).unsigned_abs())
     }
 
     /// Compute the effective drop position for a drag, accounting for snap.
@@ -242,6 +317,10 @@ impl<'a> canvas::Program<Message> for TimelineCanvas<'a> {
                     )
                 }
             }
+            canvas::Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Right)) => {
+                // Right-click on canvas is a no-op; context menu is on track headers
+                Some(canvas::Action::capture())
+            }
             canvas::Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)) => {
                 if let Some((track_index, clip_id, zone)) =
                     self.hit_test_clip(cursor_pos.x, cursor_pos.y)
@@ -269,6 +348,7 @@ impl<'a> canvas::Program<Message> for TimelineCanvas<'a> {
                                         offset_px: cursor_pos.x - clip_start_px,
                                         current_x: cursor_pos.x,
                                         start_x: cursor_pos.x,
+                                        start_y: cursor_pos.y,
                                     };
                                 }
                             }
@@ -332,9 +412,11 @@ impl<'a> canvas::Program<Message> for TimelineCanvas<'a> {
                         offset_px,
                         current_x,
                         start_x,
+                        start_y,
                     } => {
-                        // If total movement < 5px, treat as click-to-select
-                        if (current_x - start_x).abs() < 5.0 {
+                        // If total movement < 5px in both axes, treat as click-to-select
+                        let dy = cursor_pos.y - start_y;
+                        if (current_x - start_x).abs() < 5.0 && dy.abs() < 5.0 {
                             return Some(
                                 canvas::Action::publish(Message::SelectTimelineClip(
                                     Some((track_index, clip_id)),
@@ -343,8 +425,14 @@ impl<'a> canvas::Program<Message> for TimelineCanvas<'a> {
                             );
                         }
                         let raw_secs = self.px_to_secs(current_x - offset_px).max(0.0);
-                        let dest_track = self.track_at_y(cursor_pos.y);
+                        let raw_dest_track = self.track_at_y(cursor_pos.y);
                         let duration = self.clip_duration_secs(clip_id);
+
+                        // Validate track type for the drop
+                        let dest_track = self.validate_drag_dest_track(
+                            track_index, clip_id, raw_dest_track,
+                        );
+
                         let effective_secs = self.compute_snapped_start(
                             raw_secs, duration, dest_track, clip_id,
                         );
@@ -434,10 +522,14 @@ impl<'a> canvas::Program<Message> for TimelineCanvas<'a> {
             let drag_left_px = current_x - offset_px;
             let raw_start = self.px_to_secs(drag_left_px).max(0.0);
             let drag_duration = self.clip_duration_secs(*drag_clip_id);
-            let dest_track = cursor
+            let raw_dest = cursor
                 .position_in(bounds)
                 .map(|p| self.track_at_y(p.y))
                 .unwrap_or(0);
+            // Validate dest track (type match / mirror existence) for preview
+            let dest_track = self.validate_drag_dest_track(
+                *drag_track, *drag_clip_id, raw_dest,
+            );
 
             // Compute effective position with snap
             let effective_start = self.compute_snapped_start(
@@ -478,16 +570,34 @@ impl<'a> canvas::Program<Message> for TimelineCanvas<'a> {
                         .unwrap_or(0.0);
                     let delta = effective_start - orig_start;
 
+                    // Compute the mirror track for the linked clip if cross-track drag
+                    let dest_type = self.timeline.tracks.get(dest_track)
+                        .map(|t| t.track_type);
+                    let linked_dest = if *drag_track != dest_track {
+                        match dest_type {
+                            Some(TrackType::Video) => self.timeline.mirror_audio_track_for_video(dest_track),
+                            Some(TrackType::Audio) => self.timeline.mirror_video_track_for_audio(dest_track),
+                            None => None,
+                        }
+                    } else {
+                        None // same-track move: linked clips stay on their original tracks
+                    };
+
                     for (linked_track_idx, linked_clip_id) in self.timeline.find_linked_clips(link_id) {
                         if linked_clip_id == *drag_clip_id {
                             continue;
                         }
+                        // Use mirror dest if cross-track, otherwise keep on original track
+                        let preview_track = linked_dest.unwrap_or(linked_track_idx);
                         if let Ok(linked_track) = self.timeline.track(linked_track_idx) {
                             if let Some(linked_clip) = linked_track.get_clip(linked_clip_id) {
                                 let linked_start = linked_clip.timeline_range.start.as_secs_f64() + delta;
                                 let linked_dur = linked_clip.duration().as_secs_f64();
                                 let linked_end = linked_start + linked_dur;
-                                let linked_previews = linked_track.preview_trim_overlaps(
+                                // Preview trim on the destination track (may differ from current)
+                                let preview_track_ref = self.timeline.track(preview_track)
+                                    .unwrap_or(linked_track);
+                                let linked_previews = preview_track_ref.preview_trim_overlaps(
                                     linked_start,
                                     linked_end,
                                     Some(linked_clip_id),
@@ -499,7 +609,7 @@ impl<'a> canvas::Program<Message> for TimelineCanvas<'a> {
                                 let linked_start_px = self.secs_to_px(linked_start);
                                 let linked_end_px = self.secs_to_px(linked_end);
                                 linked.push(LinkedDragPreview {
-                                    track_index: linked_track_idx,
+                                    track_index: preview_track,
                                     clip_id: linked_clip_id,
                                     effective_start_px: linked_start_px,
                                     effective_width_px: linked_end_px - linked_start_px,
@@ -691,10 +801,16 @@ impl<'a> canvas::Program<Message> for TimelineCanvas<'a> {
                 };
                 let is_linked_dragged = linked_drag_info.is_some();
 
+                // Skip dragged/linked clips on their original track —
+                // they'll be drawn on the destination track after the loop.
+                if is_dragged_clip || is_linked_dragged {
+                    continue;
+                }
+
                 // If this clip is on the dest track (or linked track) and has preview
                 // data, draw the preview pieces (trimmed/split) instead of the
                 // original clip shape.
-                if !is_dragged_clip && !is_linked_dragged {
+                if true {
                     if let Some(ref info) = drag_preview {
                         // Check primary drag preview map
                         if i == info.dest_track {
@@ -770,20 +886,10 @@ impl<'a> canvas::Program<Message> for TimelineCanvas<'a> {
                     }
                 }
 
-                // Dragged clip: draw at effective (snapped) position
-                // Linked-dragged clip: draw at linked effective position
                 // Resized clip: draw at current cursor position
                 // Linked-resized clip: draw with adjusted width
                 // Normal clip: draw at original position
-                let (draw_x, draw_width, dur) = if is_dragged_clip {
-                    if let Some(ref info) = drag_preview {
-                        (info.effective_start_px, info.effective_width_px, info.effective_duration)
-                    } else {
-                        (clip_start_px, clip_width, clip.duration().as_secs_f64())
-                    }
-                } else if let Some(linked_info) = linked_drag_info {
-                    (linked_info.effective_start_px, linked_info.effective_width_px, linked_info.effective_duration)
-                } else if let Some(&new_end_px) = linked_resize.get(&clip.id) {
+                let (draw_x, draw_width, dur) = if let Some(&new_end_px) = linked_resize.get(&clip.id) {
                     let w = new_end_px - clip_start_px;
                     (clip_start_px, w, self.px_to_secs(w.max(4.0)))
                 } else {
@@ -834,6 +940,42 @@ impl<'a> canvas::Program<Message> for TimelineCanvas<'a> {
                         sd_info.duration_secs,
                     );
                 }
+            }
+        }
+
+        // Draw dragged clips on their destination tracks (after the main loop
+        // so they render on top of other clips).
+        if let Some(ref info) = drag_preview {
+            // Primary dragged clip on dest_track
+            let dest_top = RULER_HEIGHT + info.dest_track as f32 * TRACK_HEIGHT;
+            let dest_type = self.timeline.tracks.get(info.dest_track)
+                .map(|t| t.track_type)
+                .unwrap_or(TrackType::Video);
+            let color = color_for_track_type(dest_type);
+            draw_clip_shape(
+                &mut frame,
+                info.effective_start_px,
+                info.effective_width_px.max(4.0),
+                dest_top,
+                color,
+                info.effective_duration,
+            );
+
+            // Linked dragged clips on their destination tracks
+            for linked in &info.linked {
+                let linked_top = RULER_HEIGHT + linked.track_index as f32 * TRACK_HEIGHT;
+                let linked_type = self.timeline.tracks.get(linked.track_index)
+                    .map(|t| t.track_type)
+                    .unwrap_or(TrackType::Audio);
+                let linked_color = color_for_track_type(linked_type);
+                draw_clip_shape(
+                    &mut frame,
+                    linked.effective_start_px,
+                    linked.effective_width_px.max(4.0),
+                    linked_top,
+                    linked_color,
+                    linked.effective_duration,
+                );
             }
         }
 
@@ -1160,6 +1302,7 @@ mod tests {
             offset_px: 50.0, // clicked 50px from clip's left edge
             current_x: 100.0,
             start_x: 100.0,
+            start_y: RULER_HEIGHT + 25.0,
         };
 
         let bounds = Rectangle::new(Point::ORIGIN, Size::new(800.0, 200.0));
