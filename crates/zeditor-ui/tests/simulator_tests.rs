@@ -149,10 +149,9 @@ fn test_view_shows_status_message() {
     app.status_message = "Test status".into();
 
     let mut ui = simulator(app.view());
-    // Status bar now contains combined info: "Test status | 00:00:00.000 | Zoom: 100% | Stopped"
+    // Status bar is now separate and shows just the message
     assert!(
-        ui.find("Test status | 00:00:00.000 | Zoom: 100% | Stopped")
-            .is_ok(),
+        ui.find("Test status").is_ok(),
         "Should display status bar with message"
     );
 }

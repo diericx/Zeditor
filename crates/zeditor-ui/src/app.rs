@@ -1030,9 +1030,10 @@ impl App {
         let minutes = (total_secs % 3600) / 60;
         let seconds = total_secs % 60;
         let millis = ((pos_secs - total_secs as f64) * 1000.0) as u64;
-        let status = text(format!(
-            "{} | {:02}:{:02}:{:02}.{:03} | Zoom: {:.0}% | {}",
-            self.status_message,
+
+        // Playback info line (above timeline)
+        let playback_info = text(format!(
+            "{:02}:{:02}:{:02}.{:03} | Zoom: {:.0}% | {}",
             hours,
             minutes,
             seconds,
@@ -1042,9 +1043,33 @@ impl App {
         ))
         .size(14);
 
+        // System message status bar (bottom of window)
+        let status_message = if self.status_message.is_empty() {
+            "No system messages"
+        } else {
+            &self.status_message
+        };
+        let status_bar = container(
+            text(status_message)
+                .size(13)
+                .color(Color::from_rgb(0.7, 0.7, 0.7))
+        )
+        .padding([4, 8])
+        .width(Length::Fill)
+        .style(|_theme| container::Style {
+            background: Some(Background::Color(Color::from_rgb(0.18, 0.18, 0.20))),
+            border: Border {
+                color: Color::from_rgb(0.15, 0.15, 0.17),
+                width: 1.0,
+                radius: 0.0.into(),
+            },
+            ..Default::default()
+        });
+
         let top_row = row![source_panel, video_viewport].spacing(4);
 
-        let base_layout: Element<'_, Message> = if self.open_menu.is_some() {
+        // Main content area (without status bar)
+        let main_content: Element<'_, Message> = if self.open_menu.is_some() {
             let click_off: Element<'_, Message> = mouse_area(
                 container("")
                     .width(Length::Fill)
@@ -1055,7 +1080,7 @@ impl App {
 
             let dropdown = self.view_dropdown();
 
-            let content_below = column![top_row, timeline_panel, status].spacing(4);
+            let content_below = column![top_row, timeline_panel, playback_info].spacing(4);
 
             let stacked_content = stack![content_below, click_off, opaque(dropdown)]
                 .width(Length::Fill)
@@ -1066,11 +1091,22 @@ impl App {
                 .padding(4)
                 .into()
         } else {
-            column![menu_bar, top_row, timeline_panel, status]
+            column![menu_bar, top_row, timeline_panel, playback_info]
                 .spacing(4)
                 .padding(4)
                 .into()
         };
+
+        // Wrap main content in a container that takes up remaining space
+        let main_container = container(main_content)
+            .width(Length::Fill)
+            .height(Length::Fill);
+
+        // Layout with status bar pinned to bottom
+        let base_layout: Element<'_, Message> = column![main_container, status_bar]
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .into();
 
         // Add confirmation dialog overlay if present
         let base_layout: Element<'_, Message> = if let Some(dialog) = &self.confirm_dialog {
