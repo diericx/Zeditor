@@ -27,6 +27,19 @@ pub enum MenuAction {
     Redo,
 }
 
+/// Action pending user confirmation.
+#[derive(Debug, Clone)]
+pub enum ConfirmAction {
+    RemoveAsset { asset_id: Uuid },
+}
+
+/// A pending confirmation dialog.
+#[derive(Debug, Clone)]
+pub struct ConfirmDialog {
+    pub message: String,
+    pub action: ConfirmAction,
+}
+
 /// Payload describing what is being dragged. Extensible for future drag sources.
 #[derive(Debug, Clone)]
 pub enum DragPayload {
@@ -73,6 +86,11 @@ pub enum Message {
         result: Result<(Vec<u8>, u32, u32), String>,
     },
 
+    // Source library confirmation
+    ConfirmRemoveAsset(Uuid),
+    ConfirmDialogAccepted,
+    ConfirmDialogDismissed,
+
     // Source card hover
     SourceCardHovered(Option<Uuid>),
 
@@ -83,6 +101,13 @@ pub enum Message {
     DragEnteredTimeline,
     DragExitedTimeline,
     DragOverTimeline(iced::Point),
+
+    // Timeline clip selection
+    SelectTimelineClip(Option<(usize, uuid::Uuid)>),
+    RemoveClip {
+        track_index: usize,
+        clip_id: uuid::Uuid,
+    },
 
     // Timeline
     AddClipToTimeline {
@@ -106,11 +131,6 @@ pub enum Message {
         new_end: TimelinePosition,
     },
     TimelineClickEmpty(TimelinePosition),
-    PlaceSelectedClip {
-        asset_id: Uuid,
-        track_index: usize,
-        position: TimelinePosition,
-    },
 
     // Timeline view
     TimelineZoom { delta: f32, cursor_secs: f64 },

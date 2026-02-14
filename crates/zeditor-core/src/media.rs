@@ -16,6 +16,9 @@ pub struct MediaAsset {
     pub height: u32,
     pub fps: f64,
     pub has_audio: bool,
+    /// Rotation metadata in degrees (0, 90, 180, 270). Defaults to 0.
+    #[serde(default)]
+    pub rotation: u32,
 }
 
 impl MediaAsset {
@@ -37,6 +40,25 @@ impl MediaAsset {
             height,
             fps,
             has_audio,
+            rotation: 0,
+        }
+    }
+
+    /// Width after applying rotation (swaps for 90/270).
+    pub fn display_width(&self) -> u32 {
+        if self.rotation == 90 || self.rotation == 270 {
+            self.height
+        } else {
+            self.width
+        }
+    }
+
+    /// Height after applying rotation (swaps for 90/270).
+    pub fn display_height(&self) -> u32 {
+        if self.rotation == 90 || self.rotation == 270 {
+            self.width
+        } else {
+            self.height
         }
     }
 }

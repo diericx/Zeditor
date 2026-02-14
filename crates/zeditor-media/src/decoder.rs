@@ -32,6 +32,7 @@ pub struct StreamInfo {
     pub fps: f64,
     pub duration_secs: f64,
     pub codec_name: String,
+    pub rotation: u32,
 }
 
 pub struct FfmpegDecoder {
@@ -41,6 +42,7 @@ pub struct FfmpegDecoder {
     sws_dst_dims: (i32, i32),
     video_stream_index: usize,
     stream_info: StreamInfo,
+    rotation: u32,
 }
 
 impl VideoDecoder for FfmpegDecoder {
@@ -94,7 +96,7 @@ impl VideoDecoder for FfmpegDecoder {
         let width = decode_ctx.width as u32;
         let height = decode_ctx.height as u32;
 
-        let stream_info = {
+        let (stream_info, rotation) = {
             let streams = input_ctx.streams();
             let video_stream = &streams[video_stream_index];
             let tb = video_stream.time_base;
@@ -111,13 +113,15 @@ impl VideoDecoder for FfmpegDecoder {
                     30.0
                 }
             };
-            StreamInfo {
+            let rotation = crate::probe::extract_rotation_from_side_data(&video_stream);
+            (StreamInfo {
                 width,
                 height,
                 fps,
                 duration_secs: duration,
                 codec_name: decoder.name().to_string_lossy().to_string(),
-            }
+                rotation,
+            }, rotation)
         };
 
         Ok(Self {
@@ -127,6 +131,7 @@ impl VideoDecoder for FfmpegDecoder {
             sws_dst_dims: (0, 0),
             video_stream_index,
             stream_info,
+            rotation,
         })
     }
 
@@ -184,6 +189,55 @@ impl VideoDecoder for FfmpegDecoder {
     fn stream_info(&self) -> StreamInfo {
         self.stream_info.clone()
     }
+}
+
+/// Rotate RGBA pixel data 90 degrees clockwise. Returns (new_data, new_w, new_h).
+pub fn rotate_rgba_90(data: &[u8], w: u32, h: u32) -> (Vec<u8>, u32, u32) {
+    let new_w = h;
+    let new_h = w;
+    let mut out = vec![0u8; (new_w * new_h * 4) as usize];
+    for y in 0..h {
+        for x in 0..w {
+            let src = ((y * w + x) * 4) as usize;
+            let dst_x = (h - 1 - y) as usize;
+            let dst_y = x as usize;
+            let dst = (dst_y * new_w as usize + dst_x) * 4;
+            out[dst..dst + 4].copy_from_slice(&data[src..src + 4]);
+        }
+    }
+    (out, new_w, new_h)
+}
+
+/// Rotate RGBA pixel data 180 degrees. Returns (new_data, new_w, new_h).
+pub fn rotate_rgba_180(data: &[u8], w: u32, h: u32) -> (Vec<u8>, u32, u32) {
+    let mut out = vec![0u8; (w * h * 4) as usize];
+    for y in 0..h {
+        for x in 0..w {
+            let src = ((y * w + x) * 4) as usize;
+            let dst_x = (w - 1 - x) as usize;
+            let dst_y = (h - 1 - y) as usize;
+            let dst = (dst_y * w as usize + dst_x) * 4;
+            out[dst..dst + 4].copy_from_slice(&data[src..src + 4]);
+        }
+    }
+    (out, w, h)
+}
+
+/// Rotate RGBA pixel data 270 degrees clockwise (90 degrees counter-clockwise).
+pub fn rotate_rgba_270(data: &[u8], w: u32, h: u32) -> (Vec<u8>, u32, u32) {
+    let new_w = h;
+    let new_h = w;
+    let mut out = vec![0u8; (new_w * new_h * 4) as usize];
+    for y in 0..h {
+        for x in 0..w {
+            let src = ((y * w + x) * 4) as usize;
+            let dst_x = y as usize;
+            let dst_y = (w - 1 - x) as usize;
+            let dst = (dst_y * new_w as usize + dst_x) * 4;
+            out[dst..dst + 4].copy_from_slice(&data[src..src + 4]);
+        }
+    }
+    (out, new_w, new_h)
 }
 
 impl FfmpegDecoder {
@@ -315,6 +369,7 @@ impl FfmpegDecoder {
     ) -> Result<VideoFrame> {
         let src_w = frame.width;
         let src_h = frame.height;
+        let rotation = self.rotation;
 
         let dst_fmt = if rgba {
             rsmpeg::ffi::AV_PIX_FMT_RGBA
@@ -323,13 +378,23 @@ impl FfmpegDecoder {
         };
         let bytes_per_pixel: u32 = if rgba { 4 } else { 3 };
 
-        // Calculate output dimensions
+        // For rotated video, compute scaling based on post-rotation dimensions.
+        // The pre-rotation frame needs to be scaled such that after rotation it
+        // fits within the max bounds.
+        let (effective_src_w, effective_src_h) = if rotation == 90 || rotation == 270 {
+            (src_h, src_w) // post-rotation dimensions
+        } else {
+            (src_w, src_h)
+        };
+
+        // Calculate target scale based on post-rotation dimensions
         let (dst_w, dst_h) = if max_width > 0 && max_height > 0
-            && (src_w as u32 > max_width || src_h as u32 > max_height)
+            && (effective_src_w as u32 > max_width || effective_src_h as u32 > max_height)
         {
-            let scale_w = max_width as f64 / src_w as f64;
-            let scale_h = max_height as f64 / src_h as f64;
+            let scale_w = max_width as f64 / effective_src_w as f64;
+            let scale_h = max_height as f64 / effective_src_h as f64;
             let scale = scale_w.min(scale_h);
+            // Apply scale to pre-rotation dimensions
             let w = ((src_w as f64 * scale) as i32).max(2) & !1; // ensure even
             let h = ((src_h as f64 * scale) as i32).max(2) & !1;
             (w, h)
@@ -377,9 +442,23 @@ impl FfmpegDecoder {
 
         let width = dst_w as u32;
         let height = dst_h as u32;
-        let data_size = (width * height * bytes_per_pixel) as usize;
+        let row_bytes = (width * bytes_per_pixel) as usize;
+        let data_size = row_bytes * height as usize;
         let data = unsafe {
-            std::slice::from_raw_parts(dst_frame.data[0] as *const u8, data_size).to_vec()
+            let linesize = (*dst_frame.as_ptr()).linesize[0] as usize;
+            if linesize == row_bytes {
+                // Tightly packed — fast path
+                std::slice::from_raw_parts(dst_frame.data[0] as *const u8, data_size).to_vec()
+            } else {
+                // Stride differs from row width — copy row-by-row to strip padding
+                let src_ptr = dst_frame.data[0] as *const u8;
+                let mut buf = vec![0u8; data_size];
+                for y in 0..height as usize {
+                    let src_row = std::slice::from_raw_parts(src_ptr.add(y * linesize), row_bytes);
+                    buf[y * row_bytes..(y + 1) * row_bytes].copy_from_slice(src_row);
+                }
+                buf
+            }
         };
 
         let pts_secs = {
@@ -391,6 +470,22 @@ impl FfmpegDecoder {
                 0.0
             }
         };
+
+        // Apply rotation if needed (only for RGBA output since preview/thumbnails need it)
+        if rgba && rotation != 0 {
+            let (rotated_data, rotated_w, rotated_h) = match rotation {
+                90 => rotate_rgba_90(&data, width, height),
+                180 => rotate_rgba_180(&data, width, height),
+                270 => rotate_rgba_270(&data, width, height),
+                _ => (data, width, height),
+            };
+            return Ok(VideoFrame {
+                width: rotated_w,
+                height: rotated_h,
+                data: rotated_data,
+                pts_secs,
+            });
+        }
 
         Ok(VideoFrame {
             width,

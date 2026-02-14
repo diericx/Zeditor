@@ -12,7 +12,7 @@ use zeditor_core::project::Project;
 use zeditor_core::timeline::{Clip, TimeRange, TimelinePosition, TrackType};
 
 use crate::audio_player::AudioPlayer;
-use crate::message::{DragPayload, DragState, MenuAction, MenuId, Message, SourceDragPreview, ToolMode};
+use crate::message::{ConfirmAction, ConfirmDialog, DragPayload, DragState, MenuAction, MenuId, Message, SourceDragPreview, ToolMode};
 use crate::widgets::timeline_canvas::TimelineCanvas;
 
 /// Preview resolution cap. 4K frames are scaled down to this for display.
@@ -75,6 +75,8 @@ pub struct App {
     pub thumbnails: HashMap<Uuid, iced::widget::image::Handle>,
     pub drag_state: Option<DragState>,
     pub hovered_asset_id: Option<Uuid>,
+    pub selected_clip: Option<(usize, Uuid)>,
+    pub confirm_dialog: Option<ConfirmDialog>,
     decode_tx: Option<mpsc::Sender<DecodeRequest>>,
     pub(crate) decode_rx: Option<mpsc::Receiver<DecodedFrame>>,
     pub(crate) decode_clip_id: Option<Uuid>,
@@ -111,6 +113,8 @@ impl Default for App {
             thumbnails: HashMap::new(),
             drag_state: None,
             hovered_asset_id: None,
+            selected_clip: None,
+            confirm_dialog: None,
             decode_tx: None,
             decode_rx: None,
             decode_clip_id: None,
@@ -145,6 +149,8 @@ impl App {
         self.current_frame = None;
         self.selected_asset_id = None;
         self.hovered_asset_id = None;
+        self.selected_clip = None;
+        self.confirm_dialog = None;
         self.thumbnails.clear();
         self.drag_state = None;
         self.timeline_zoom = 100.0;
@@ -315,12 +321,79 @@ impl App {
                 Task::none()
             }
             Message::RemoveAsset(id) => {
+                // Remove all clips using this asset (via command history for undo)
+                let clips_using = self.project.timeline.clips_using_asset(id);
+                if !clips_using.is_empty() {
+                    self.project.command_history.execute(
+                        &mut self.project.timeline,
+                        "Remove clips for asset",
+                        |tl| { tl.remove_clips_by_asset(id); Ok(()) },
+                    ).ok();
+                }
                 match self.project.source_library.remove(id) {
                     Ok(asset) => {
                         self.status_message = format!("Removed: {}", asset.name);
+                        self.thumbnails.remove(&id);
+                        if self.selected_asset_id == Some(id) {
+                            self.selected_asset_id = None;
+                        }
                     }
                     Err(e) => {
                         self.status_message = format!("Remove failed: {e}");
+                    }
+                }
+                Task::none()
+            }
+            Message::ConfirmRemoveAsset(asset_id) => {
+                let clips_using = self.project.timeline.clips_using_asset(asset_id);
+                if clips_using.is_empty() {
+                    // No clips in use — remove directly
+                    return self.update(Message::RemoveAsset(asset_id));
+                }
+                // Clips in use — show confirmation dialog
+                let count = clips_using.len();
+                self.confirm_dialog = Some(ConfirmDialog {
+                    message: format!(
+                        "This asset is used by {count} clip(s) in the timeline. Delete the asset and all its clips?"
+                    ),
+                    action: ConfirmAction::RemoveAsset { asset_id },
+                });
+                Task::none()
+            }
+            Message::ConfirmDialogAccepted => {
+                if let Some(dialog) = self.confirm_dialog.take() {
+                    match dialog.action {
+                        ConfirmAction::RemoveAsset { asset_id } => {
+                            return self.update(Message::RemoveAsset(asset_id));
+                        }
+                    }
+                }
+                Task::none()
+            }
+            Message::ConfirmDialogDismissed => {
+                self.confirm_dialog = None;
+                Task::none()
+            }
+            Message::SelectTimelineClip(selection) => {
+                self.selected_clip = selection;
+                Task::none()
+            }
+            Message::RemoveClip {
+                track_index,
+                clip_id,
+            } => {
+                let result = self.project.command_history.execute(
+                    &mut self.project.timeline,
+                    "Remove clip",
+                    |tl| tl.remove_clip_grouped(track_index, clip_id),
+                );
+                match result {
+                    Ok(()) => {
+                        self.status_message = "Clip removed".into();
+                        self.selected_clip = None;
+                    }
+                    Err(e) => {
+                        self.status_message = format!("Remove clip failed: {e}");
                     }
                 }
                 Task::none()
@@ -586,6 +659,7 @@ impl App {
                 Task::none()
             }
             Message::TimelineClickEmpty(pos) => {
+                self.selected_clip = None;
                 if self.is_playing {
                     self.is_playing = false;
                     self.playback_start_wall = None;
@@ -596,59 +670,6 @@ impl App {
                 }
                 self.playback_position = pos;
                 self.send_decode_seek(false); // scrub, not continuous
-                Task::none()
-            }
-            Message::PlaceSelectedClip {
-                asset_id,
-                track_index,
-                position,
-            } => {
-                self.selected_asset_id = None;
-                if let Some(asset) = self.project.source_library.get(asset_id) {
-                    let source_range = TimeRange {
-                        start: TimelinePosition::zero(),
-                        end: TimelinePosition::from_secs_f64(asset.duration.as_secs_f64()),
-                    };
-                    let has_audio = asset.has_audio;
-                    let audio_track = self.project.timeline.find_paired_audio_track(track_index);
-
-                    if has_audio && audio_track.is_some() {
-                        let audio_track = audio_track.unwrap();
-                        let result = self.project.command_history.execute(
-                            &mut self.project.timeline,
-                            "Place clip",
-                            |tl| {
-                                tl.add_clip_with_audio(track_index, audio_track, asset_id, position, source_range)
-                            },
-                        );
-                        match result {
-                            Ok(_) => {
-                                self.status_message = "Clip placed".into();
-                            }
-                            Err(e) => {
-                                self.status_message = format!("Place failed: {e}");
-                            }
-                        }
-                    } else {
-                        let clip = Clip::new(asset_id, position, source_range);
-                        let result = self.project.command_history.execute(
-                            &mut self.project.timeline,
-                            "Place clip",
-                            |tl| tl.add_clip_trimming_overlaps(track_index, clip),
-                        );
-                        match result {
-                            Ok(()) => {
-                                self.status_message = "Clip placed".into();
-                            }
-                            Err(e) => {
-                                self.status_message = format!("Place failed: {e}");
-                            }
-                        }
-                    }
-                } else {
-                    self.status_message = "Asset not found".into();
-                }
-                self.send_decode_seek(self.is_playing);
                 Task::none()
             }
             Message::Play => {
@@ -733,6 +754,13 @@ impl App {
                         }
                         return Task::none();
                     }
+                    // When a confirm dialog is open, Escape dismisses it and all other keys are swallowed
+                    if self.confirm_dialog.is_some() {
+                        if matches!(key.as_ref(), keyboard::Key::Named(keyboard::key::Named::Escape)) {
+                            self.confirm_dialog = None;
+                        }
+                        return Task::none();
+                    }
                     // When a menu is open, Escape closes it and all other keys are swallowed
                     if self.open_menu.is_some() {
                         if matches!(key.as_ref(), keyboard::Key::Named(keyboard::key::Named::Escape)) {
@@ -743,6 +771,17 @@ impl App {
                     match key.as_ref() {
                         keyboard::Key::Named(keyboard::key::Named::Space) => {
                             return self.update(Message::TogglePlayback);
+                        }
+                        keyboard::Key::Named(keyboard::key::Named::Delete) | keyboard::Key::Named(keyboard::key::Named::Backspace) => {
+                            if let Some((track_index, clip_id)) = self.selected_clip {
+                                return self.update(Message::RemoveClip {
+                                    track_index,
+                                    clip_id,
+                                });
+                            }
+                            if let Some(asset_id) = self.selected_asset_id {
+                                return self.update(Message::ConfirmRemoveAsset(asset_id));
+                            }
                         }
                         keyboard::Key::Character("a") => {
                             self.tool_mode = ToolMode::Arrow;
@@ -1033,6 +1072,73 @@ impl App {
                 .into()
         };
 
+        // Add confirmation dialog overlay if present
+        let base_layout: Element<'_, Message> = if let Some(dialog) = &self.confirm_dialog {
+            let click_off: Element<'_, Message> = mouse_area(
+                container("")
+                    .width(Length::Fill)
+                    .height(Length::Fill),
+            )
+            .on_press(Message::ConfirmDialogDismissed)
+            .into();
+
+            let dialog_card = container(
+                column![
+                    text(&dialog.message).size(14).color(Color::WHITE),
+                    row![
+                        button(text("Delete").size(14).color(Color::WHITE))
+                            .on_press(Message::ConfirmDialogAccepted)
+                            .padding([6, 16])
+                            .style(|_theme, _status| button::Style {
+                                background: Some(Background::Color(Color::from_rgb(0.8, 0.2, 0.2))),
+                                text_color: Color::WHITE,
+                                border: Border {
+                                    radius: 4.0.into(),
+                                    ..Default::default()
+                                },
+                                ..Default::default()
+                            }),
+                        button(text("Cancel").size(14).color(Color::WHITE))
+                            .on_press(Message::ConfirmDialogDismissed)
+                            .padding([6, 16])
+                            .style(|_theme, _status| button::Style {
+                                background: Some(Background::Color(Color::from_rgb(0.3, 0.3, 0.33))),
+                                text_color: Color::WHITE,
+                                border: Border {
+                                    radius: 4.0.into(),
+                                    ..Default::default()
+                                },
+                                ..Default::default()
+                            }),
+                    ]
+                    .spacing(8)
+                ]
+                .spacing(12),
+            )
+            .padding(20)
+            .width(400)
+            .style(|_theme| container::Style {
+                background: Some(Background::Color(Color::from_rgb(0.22, 0.22, 0.25))),
+                border: Border {
+                    color: Color::from_rgb(0.4, 0.4, 0.45),
+                    width: 1.0,
+                    radius: 8.0.into(),
+                },
+                ..Default::default()
+            });
+
+            let centered_dialog = center(dialog_card)
+                .width(Length::Fill)
+                .height(Length::Fill);
+
+            stack![base_layout, click_off, opaque(centered_dialog)]
+                .width(Length::Fill)
+                .height(Length::Fill)
+                .into()
+        } else {
+            base_layout
+        };
+
         // Add drag ghost overlay if dragging
         if let Some(drag) = &self.drag_state {
             let ghost = self.view_drag_overlay(drag);
@@ -1073,13 +1179,7 @@ impl App {
 
         let asset_grid = scrollable(column(grid_rows).spacing(6));
 
-        let hint = if self.selected_asset_id.is_some() {
-            text("Click timeline to place clip").size(12)
-        } else {
-            text("").size(12)
-        };
-
-        column![title, import_btn, asset_grid, hint]
+        column![title, import_btn, asset_grid]
             .spacing(8)
             .width(300)
             .into()
@@ -1087,6 +1187,7 @@ impl App {
 
     fn view_source_card<'a>(&'a self, asset: &'a zeditor_core::media::MediaAsset) -> Element<'a, Message> {
         let is_hovered = self.hovered_asset_id == Some(asset.id);
+        let is_selected = self.selected_asset_id == Some(asset.id);
         let asset_id = asset.id;
 
         // Thumbnail or placeholder
@@ -1107,7 +1208,9 @@ impl App {
                 .into()
         };
 
-        let border_color = if is_hovered {
+        let border_color = if is_selected {
+            Color::from_rgb(1.0, 0.2, 0.2)
+        } else if is_hovered {
             Color::from_rgb(0.3, 0.5, 0.9)
         } else {
             Color::TRANSPARENT
@@ -1138,6 +1241,7 @@ impl App {
             .on_enter(Message::SourceCardHovered(Some(asset_id)))
             .on_exit(Message::SourceCardHovered(None))
             .on_press(Message::StartDragFromSource(asset_id))
+            .on_release(Message::SelectSourceAsset(Some(asset_id)))
             .into()
     }
 
@@ -1216,7 +1320,7 @@ impl App {
         let canvas = iced::widget::canvas(TimelineCanvas {
             timeline: &self.project.timeline,
             playback_position: self.playback_position,
-            selected_asset_id: self.selected_asset_id,
+            selected_clip: self.selected_clip,
             zoom: self.timeline_zoom,
             scroll_offset: self.timeline_scroll,
             tool_mode: self.tool_mode,

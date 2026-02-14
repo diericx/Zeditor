@@ -215,27 +215,6 @@ fn test_click_import_button() {
 }
 
 #[test]
-fn test_select_asset_shows_placement_hint() {
-    let mut app = App::new();
-    let asset = make_test_asset("my_clip", 5.0);
-    let asset_id = asset.id;
-    app.update(Message::MediaImported(Ok(asset)));
-
-    // Before selection: no placement hint
-    {
-        let mut ui = simulator(app.view());
-        assert!(ui.find("my_clip").is_ok(), "Should display asset name in card");
-    }
-
-    // Select the asset
-    app.update(Message::SelectSourceAsset(Some(asset_id)));
-
-    // After selection: placement hint visible
-    let mut ui = simulator(app.view());
-    assert!(ui.find("Click timeline to place clip").is_ok());
-}
-
-#[test]
 fn test_full_simulator_workflow() {
     let mut app = App::new();
 

@@ -30,6 +30,7 @@ pub enum TimelineInteraction {
         clip_id: Uuid,
         offset_px: f32,
         current_x: f32,
+        start_x: f32,
     },
     Resizing {
         track_index: usize,
@@ -57,7 +58,7 @@ impl Default for TimelineCanvasState {
 pub struct TimelineCanvas<'a> {
     pub timeline: &'a Timeline,
     pub playback_position: TimelinePosition,
-    pub selected_asset_id: Option<Uuid>,
+    pub selected_clip: Option<(usize, Uuid)>,
     pub zoom: f32,
     pub scroll_offset: f32,
     pub tool_mode: ToolMode,
@@ -185,12 +186,11 @@ fn draw_clip_shape(
     }
 }
 
-fn color_from_uuid(id: Uuid) -> Color {
-    let bytes = id.as_bytes();
-    let r = bytes[0] as f32 / 255.0 * 0.6 + 0.3;
-    let g = bytes[4] as f32 / 255.0 * 0.6 + 0.3;
-    let b = bytes[8] as f32 / 255.0 * 0.6 + 0.3;
-    Color::from_rgb(r, g, b)
+pub fn color_for_track_type(track_type: TrackType) -> Color {
+    match track_type {
+        TrackType::Video => Color::from_rgb(0.25, 0.65, 0.35),
+        TrackType::Audio => Color::from_rgb(0.25, 0.45, 0.75),
+    }
 }
 
 pub fn clamp_zoom(zoom: f32) -> f32 {
@@ -268,6 +268,7 @@ impl<'a> canvas::Program<Message> for TimelineCanvas<'a> {
                                         clip_id,
                                         offset_px: cursor_pos.x - clip_start_px,
                                         current_x: cursor_pos.x,
+                                        start_x: cursor_pos.x,
                                     };
                                 }
                             }
@@ -285,18 +286,6 @@ impl<'a> canvas::Program<Message> for TimelineCanvas<'a> {
                 }
 
                 let secs = self.px_to_secs(cursor_pos.x).max(0.0);
-                let track_index = self.track_at_y(cursor_pos.y);
-
-                if let Some(asset_id) = self.selected_asset_id {
-                    return Some(
-                        canvas::Action::publish(Message::PlaceSelectedClip {
-                            asset_id,
-                            track_index,
-                            position: TimelinePosition::from_secs_f64(secs),
-                        })
-                        .and_capture(),
-                    );
-                }
 
                 Some(
                     canvas::Action::publish(Message::TimelineClickEmpty(
@@ -342,7 +331,17 @@ impl<'a> canvas::Program<Message> for TimelineCanvas<'a> {
                         clip_id,
                         offset_px,
                         current_x,
+                        start_x,
                     } => {
+                        // If total movement < 5px, treat as click-to-select
+                        if (current_x - start_x).abs() < 5.0 {
+                            return Some(
+                                canvas::Action::publish(Message::SelectTimelineClip(
+                                    Some((track_index, clip_id)),
+                                ))
+                                .and_capture(),
+                            );
+                        }
                         let raw_secs = self.px_to_secs(current_x - offset_px).max(0.0);
                         let dest_track = self.track_at_y(cursor_pos.y);
                         let duration = self.clip_duration_secs(clip_id);
@@ -429,6 +428,7 @@ impl<'a> canvas::Program<Message> for TimelineCanvas<'a> {
             track_index: drag_track,
             offset_px,
             current_x,
+            ..
         } = &state.interaction
         {
             let drag_left_px = current_x - offset_px;
@@ -565,7 +565,6 @@ impl<'a> canvas::Program<Message> for TimelineCanvas<'a> {
             start_px: f32,
             width_px: f32,
             duration_secs: f64,
-            asset_id: Uuid,
             video_preview_map: HashMap<Uuid, Vec<TrimPreview>>,
             audio_preview_map: HashMap<Uuid, Vec<TrimPreview>>,
         }
@@ -611,10 +610,16 @@ impl<'a> canvas::Program<Message> for TimelineCanvas<'a> {
                 start_px,
                 width_px: (end_px - start_px).max(4.0),
                 duration_secs: preview.duration_secs,
-                asset_id: preview.asset_id,
                 video_preview_map,
                 audio_preview_map,
             })
+        });
+
+        // Compute link_id of the selected clip for group highlighting
+        let selected_link_id = self.selected_clip.and_then(|(track_idx, clip_id)| {
+            self.timeline.tracks.get(track_idx)
+                .and_then(|t| t.clips.iter().find(|c| c.id == clip_id))
+                .and_then(|c| c.link_id)
         });
 
         // Track lanes
@@ -694,7 +699,7 @@ impl<'a> canvas::Program<Message> for TimelineCanvas<'a> {
                         // Check primary drag preview map
                         if i == info.dest_track {
                             if let Some(previews) = info.preview_map.get(&clip.id) {
-                                let color = color_from_uuid(clip.asset_id);
+                                let color = color_for_track_type(track.track_type);
                                 for preview in previews {
                                     if let (Some(ts), Some(te)) =
                                         (preview.trimmed_start, preview.trimmed_end)
@@ -714,7 +719,7 @@ impl<'a> canvas::Program<Message> for TimelineCanvas<'a> {
                         for linked in &info.linked {
                             if i == linked.track_index {
                                 if let Some(previews) = linked.preview_map.get(&clip.id) {
-                                    let color = color_from_uuid(clip.asset_id);
+                                    let color = color_for_track_type(track.track_type);
                                     for preview in previews {
                                         if let (Some(ts), Some(te)) =
                                             (preview.trimmed_start, preview.trimmed_end)
@@ -747,7 +752,7 @@ impl<'a> canvas::Program<Message> for TimelineCanvas<'a> {
                         };
                         if let Some(map) = preview_map {
                             if let Some(previews) = map.get(&clip.id) {
-                                let color = color_from_uuid(clip.asset_id);
+                                let color = color_for_track_type(track.track_type);
                                 for preview in previews {
                                     if let (Some(ts), Some(te)) =
                                         (preview.trimmed_start, preview.trimmed_end)
@@ -795,14 +800,31 @@ impl<'a> canvas::Program<Message> for TimelineCanvas<'a> {
                     }
                 };
 
-                let color = color_from_uuid(clip.asset_id);
+                let color = color_for_track_type(track.track_type);
                 draw_clip_shape(&mut frame, draw_x, draw_width.max(4.0), track_top, color, dur);
+
+                // Draw selection border if this clip is selected or linked to selected
+                let is_selected = self.selected_clip == Some((i, clip.id))
+                    || (selected_link_id.is_some() && clip.link_id == selected_link_id);
+                if is_selected {
+                    let sel_pos = Point::new(draw_x, track_top + 2.0);
+                    let sel_size = Size::new(draw_width.max(4.0), TRACK_HEIGHT - 4.0);
+                    let sel_path = canvas::Path::new(|b| {
+                        b.rounded_rectangle(sel_pos, sel_size, border::Radius::from(4.0));
+                    });
+                    frame.stroke(
+                        &sel_path,
+                        canvas::Stroke::default()
+                            .with_color(Color::from_rgb(1.0, 0.2, 0.2))
+                            .with_width(3.0),
+                    );
+                }
             }
 
             // Draw source drag new clips on this track
             if let Some(ref sd_info) = source_drag_info {
                 if i == sd_info.video_track || sd_info.audio_track == Some(i) {
-                    let color = color_from_uuid(sd_info.asset_id);
+                    let color = color_for_track_type(track.track_type);
                     draw_clip_shape(
                         &mut frame,
                         sd_info.start_px,
@@ -830,17 +852,6 @@ impl<'a> canvas::Program<Message> for TimelineCanvas<'a> {
                 b.close();
             });
             frame.fill(&triangle, Color::from_rgb(1.0, 0.2, 0.2));
-        }
-
-        // Ghost preview hint for selected asset placement
-        if self.selected_asset_id.is_some() {
-            frame.fill_text(canvas::Text {
-                content: "Click to place clip".into(),
-                position: Point::new(bounds.width / 2.0 - 60.0, 4.0),
-                color: Color::from_rgb(0.8, 0.8, 0.2),
-                size: iced::Pixels(12.0),
-                ..canvas::Text::default()
-            });
         }
 
         // Blade mode: draw vertical orange line at cursor position over clips
@@ -875,10 +886,6 @@ impl<'a> canvas::Program<Message> for TimelineCanvas<'a> {
                 return mouse::Interaction::ResizingHorizontally
             }
             TimelineInteraction::None => {}
-        }
-
-        if self.selected_asset_id.is_some() {
-            return mouse::Interaction::Crosshair;
         }
 
         if let Some(cursor_pos) = cursor.position_in(bounds) {
@@ -985,7 +992,8 @@ mod tests {
         let canvas = TimelineCanvas {
             timeline: &tl,
             playback_position: TimelinePosition::zero(),
-            selected_asset_id: None,
+
+            selected_clip: None,
             zoom: 100.0,
             scroll_offset: 0.0,
             tool_mode: ToolMode::Arrow,
@@ -1001,7 +1009,8 @@ mod tests {
         let canvas = TimelineCanvas {
             timeline: &tl,
             playback_position: TimelinePosition::zero(),
-            selected_asset_id: None,
+
+            selected_clip: None,
             zoom: 100.0,
             scroll_offset: 50.0,
             tool_mode: ToolMode::Arrow,
@@ -1017,7 +1026,8 @@ mod tests {
         let canvas = TimelineCanvas {
             timeline: &tl,
             playback_position: TimelinePosition::zero(),
-            selected_asset_id: None,
+
+            selected_clip: None,
             zoom: 100.0,
             scroll_offset: 0.0,
             tool_mode: ToolMode::Arrow,
@@ -1036,7 +1046,8 @@ mod tests {
         let canvas = TimelineCanvas {
             timeline: &tl,
             playback_position: TimelinePosition::zero(),
-            selected_asset_id: None,
+
+            selected_clip: None,
             zoom: 100.0,
             scroll_offset: 0.0,
             tool_mode: ToolMode::Arrow,
@@ -1054,7 +1065,8 @@ mod tests {
         let canvas = TimelineCanvas {
             timeline: &tl,
             playback_position: TimelinePosition::zero(),
-            selected_asset_id: None,
+
+            selected_clip: None,
             zoom: 100.0,
             scroll_offset: 0.0,
             tool_mode: ToolMode::Arrow,
@@ -1077,7 +1089,8 @@ mod tests {
         let canvas = TimelineCanvas {
             timeline: &tl,
             playback_position: TimelinePosition::zero(),
-            selected_asset_id: None,
+
+            selected_clip: None,
             zoom: 100.0,
             scroll_offset: 200.0, // scrolled right, so negative px → negative secs
             tool_mode: ToolMode::Arrow,
@@ -1100,7 +1113,8 @@ mod tests {
         let canvas = TimelineCanvas {
             timeline: &tl,
             playback_position: TimelinePosition::zero(),
-            selected_asset_id: None,
+
+            selected_clip: None,
             zoom: 100.0,
             scroll_offset: 0.0,
             tool_mode: ToolMode::Blade,
@@ -1129,7 +1143,8 @@ mod tests {
         let canvas = TimelineCanvas {
             timeline: &tl,
             playback_position: TimelinePosition::zero(),
-            selected_asset_id: None,
+
+            selected_clip: None,
             zoom: 100.0,
             scroll_offset: 0.0,
             tool_mode: ToolMode::Arrow,
@@ -1144,6 +1159,7 @@ mod tests {
             clip_id,
             offset_px: 50.0, // clicked 50px from clip's left edge
             current_x: 100.0,
+            start_x: 100.0,
         };
 
         let bounds = Rectangle::new(Point::ORIGIN, Size::new(800.0, 200.0));
@@ -1198,7 +1214,8 @@ mod tests {
         let canvas = TimelineCanvas {
             timeline: &tl,
             playback_position: TimelinePosition::zero(),
-            selected_asset_id: None,
+
+            selected_clip: None,
             zoom: 100.0,
             scroll_offset: 0.0,
             tool_mode: ToolMode::Arrow,
@@ -1253,7 +1270,8 @@ mod tests {
         let canvas = TimelineCanvas {
             timeline: &tl,
             playback_position: TimelinePosition::zero(),
-            selected_asset_id: None,
+
+            selected_clip: None,
             zoom: 100.0,
             scroll_offset: 0.0,
             tool_mode: ToolMode::Arrow,
@@ -1296,7 +1314,8 @@ mod tests {
         let canvas = TimelineCanvas {
             timeline: &tl,
             playback_position: TimelinePosition::zero(),
-            selected_asset_id: None,
+
+            selected_clip: None,
             zoom: 100.0,
             scroll_offset: 0.0,
             tool_mode: ToolMode::Arrow,
@@ -1319,5 +1338,21 @@ mod tests {
             }
             other => panic!("expected Dragging, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn test_color_for_track_type_video_is_green() {
+        let color = color_for_track_type(TrackType::Video);
+        // Green channel should be dominant
+        assert!(color.g > color.r, "video track green should be > red");
+        assert!(color.g > color.b, "video track green should be > blue");
+    }
+
+    #[test]
+    fn test_color_for_track_type_audio_is_blue() {
+        let color = color_for_track_type(TrackType::Audio);
+        // Blue channel should be dominant
+        assert!(color.b > color.r, "audio track blue should be > red");
+        assert!(color.b > color.g, "audio track blue should be > green");
     }
 }

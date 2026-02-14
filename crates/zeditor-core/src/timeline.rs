@@ -990,6 +990,54 @@ impl Timeline {
         Ok(results)
     }
 
+    /// Find all clips across all tracks that reference the given asset_id.
+    /// Returns (track_index, clip_id) pairs.
+    pub fn clips_using_asset(&self, asset_id: Uuid) -> Vec<(usize, Uuid)> {
+        let mut result = Vec::new();
+        for (i, track) in self.tracks.iter().enumerate() {
+            for clip in &track.clips {
+                if clip.asset_id == asset_id {
+                    result.push((i, clip.id));
+                }
+            }
+        }
+        result
+    }
+
+    /// Remove all clips that reference the given asset_id.
+    /// Returns the count of clips removed.
+    pub fn remove_clips_by_asset(&mut self, asset_id: Uuid) -> usize {
+        let mut count = 0;
+        for track in &mut self.tracks {
+            let before = track.clips.len();
+            track.clips.retain(|c| c.asset_id != asset_id);
+            count += before - track.clips.len();
+        }
+        count
+    }
+
+    /// Remove a clip and any linked partner clips.
+    pub fn remove_clip_grouped(&mut self, track_index: usize, clip_id: Uuid) -> Result<()> {
+        let link_id = self
+            .track(track_index)?
+            .get_clip(clip_id)
+            .ok_or(CoreError::ClipNotFound(clip_id))?
+            .link_id;
+
+        // Remove the primary clip
+        self.track_mut(track_index)?.remove_clip(clip_id)?;
+
+        // Remove linked clips if any
+        if let Some(link_id) = link_id {
+            let linked = self.find_linked_clips(link_id);
+            for (linked_track, linked_clip_id) in linked {
+                let _ = self.track_mut(linked_track).ok().map(|t| t.remove_clip(linked_clip_id));
+            }
+        }
+
+        Ok(())
+    }
+
     /// Get the total duration of the timeline (end of last clip across all tracks).
     pub fn duration(&self) -> Duration {
         self.tracks

@@ -108,6 +108,8 @@ struct CachedVideoDecoder {
     /// SWS context for converting from source pixel format to YUV420P at target dimensions.
     /// Created lazily on first decoded frame (needs source format/dimensions).
     sws_ctx: Option<SwsContext>,
+    /// Rotation in degrees (0, 90, 180, 270) from stream metadata.
+    rotation: u32,
 }
 
 const OUTPUT_SAMPLE_RATE: i32 = 48000;
@@ -359,12 +361,14 @@ fn decode_and_convert_video_frame(
     // Open or reuse decoder
     if !decoders.contains_key(&path_key) {
         let decoder = FfmpegDecoder::open(source_path)?;
+        let rotation = decoder.stream_info().rotation;
         decoders.insert(
             path_key.clone(),
             CachedVideoDecoder {
                 decoder,
                 last_pts: -1.0,
                 sws_ctx: None,
+                rotation,
             },
         );
     }
@@ -392,26 +396,43 @@ fn decode_and_convert_video_frame(
                     let src_w = raw_frame.width;
                     let src_h = raw_frame.height;
                     let src_fmt = raw_frame.format;
+                    let rotation = cached.rotation;
 
-                    // Compute canvas layout for this source
+                    // Use display dimensions (after rotation) for canvas layout
+                    let (display_w, display_h) = if rotation == 90 || rotation == 270 {
+                        (src_h as u32, src_w as u32)
+                    } else {
+                        (src_w as u32, src_h as u32)
+                    };
+
+                    // Compute canvas layout for this source using display dimensions
                     let layout = compute_canvas_layout(
-                        src_w as u32,
-                        src_h as u32,
+                        display_w,
+                        display_h,
                         canvas_w,
                         canvas_h,
                         render_w as u32,
                         render_h as u32,
                     );
 
-                    // Create/reuse SWS context: source → clip dimensions (not full render)
+                    // For rotated video, we need to scale to pre-rotation
+                    // clip dimensions (swapped), then rotate after scaling.
+                    let (scale_target_w, scale_target_h) = if rotation == 90 || rotation == 270 {
+                        // Scale to swapped clip dimensions (pre-rotation)
+                        (layout.clip_h, layout.clip_w)
+                    } else {
+                        (layout.clip_w, layout.clip_h)
+                    };
+
+                    // Create/reuse SWS context: source → scale target dimensions
                     if cached.sws_ctx.is_none() {
                         cached.sws_ctx = Some(
                             SwsContext::get_context(
                                 src_w,
                                 src_h,
                                 src_fmt,
-                                layout.clip_w,
-                                layout.clip_h,
+                                scale_target_w,
+                                scale_target_h,
                                 ffi::AV_PIX_FMT_YUV420P,
                                 sws_flags,
                                 None,
@@ -428,13 +449,16 @@ fn decode_and_convert_video_frame(
 
                     let sws = cached.sws_ctx.as_mut().unwrap();
 
-                    return compose_clip_onto_canvas(
+                    return compose_clip_onto_canvas_rotated(
                         &raw_frame,
                         &layout,
                         render_w,
                         render_h,
                         sws,
                         src_h,
+                        scale_target_w,
+                        scale_target_h,
+                        rotation,
                     );
                 }
                 // Otherwise skip (seeking landed before target)
@@ -872,23 +896,27 @@ pub fn compute_canvas_layout(
     }
 }
 
-/// Compose a decoded source frame onto a black canvas at the render output dimensions.
+/// Compose a decoded source frame onto a black canvas, with optional rotation.
 ///
-/// 1. SWS-scale source to `(layout.clip_w, layout.clip_h)` in YUV420P
-/// 2. Create a black frame at `(render_w, render_h)`
-/// 3. Blit the scaled clip onto the canvas at `(layout.clip_x, layout.clip_y)`
-fn compose_clip_onto_canvas(
+/// 1. SWS-scale source to `(scale_w, scale_h)` in YUV420P (pre-rotation dimensions)
+/// 2. If rotation != 0, rotate Y/U/V planes
+/// 3. Create a black frame at `(render_w, render_h)`
+/// 4. Blit the rotated clip onto the canvas at `(layout.clip_x, layout.clip_y)`
+fn compose_clip_onto_canvas_rotated(
     raw_frame: &AVFrame,
     layout: &CanvasLayout,
     render_w: i32,
     render_h: i32,
     sws_ctx: &mut SwsContext,
     src_h: i32,
+    scale_w: i32,
+    scale_h: i32,
+    rotation: u32,
 ) -> Result<AVFrame> {
-    // Scale source to clip dimensions
+    // Scale source to pre-rotation dimensions
     let mut scaled = AVFrame::new();
-    scaled.set_width(layout.clip_w);
-    scaled.set_height(layout.clip_h);
+    scaled.set_width(scale_w);
+    scaled.set_height(scale_h);
     scaled.set_format(ffi::AV_PIX_FMT_YUV420P);
     scaled.alloc_buffer().map_err(|e| {
         MediaError::EncoderError(format!("alloc scaled frame: {e}"))
@@ -898,13 +926,110 @@ fn compose_clip_onto_canvas(
         .scale_frame(raw_frame, 0, src_h, &mut scaled)
         .map_err(|e| MediaError::EncoderError(format!("scale_frame: {e}")))?;
 
+    // Apply rotation to the scaled frame
+    let final_frame = if rotation != 0 {
+        rotate_yuv420p_frame(&scaled, rotation)?
+    } else {
+        scaled
+    };
+
     // Create black canvas at render dimensions
     let mut canvas = create_black_yuv_frame(render_w, render_h)?;
 
-    // Blit scaled clip onto canvas
-    blit_yuv_frame(&scaled, &mut canvas, layout.clip_x, layout.clip_y);
+    // Blit rotated clip onto canvas
+    blit_yuv_frame(&final_frame, &mut canvas, layout.clip_x, layout.clip_y);
 
     Ok(canvas)
+}
+
+/// Rotate a YUV420P frame by the given degrees (90, 180, 270).
+fn rotate_yuv420p_frame(frame: &AVFrame, rotation: u32) -> Result<AVFrame> {
+    let src_w = frame.width as usize;
+    let src_h = frame.height as usize;
+
+    let (dst_w, dst_h) = match rotation {
+        90 | 270 => (src_h, src_w),
+        180 => (src_w, src_h),
+        _ => return Err(MediaError::EncoderError(format!("unsupported rotation: {rotation}"))),
+    };
+
+    let mut dst = AVFrame::new();
+    dst.set_width(dst_w as i32);
+    dst.set_height(dst_h as i32);
+    dst.set_format(ffi::AV_PIX_FMT_YUV420P);
+    dst.alloc_buffer().map_err(|e| {
+        MediaError::EncoderError(format!("alloc rotated frame: {e}"))
+    })?;
+
+    unsafe {
+        let src_ptr = (*frame.as_ptr()).data;
+        let src_ls = (*frame.as_ptr()).linesize;
+        let dst_ptr = (*dst.as_mut_ptr()).data;
+        let dst_ls = (*dst.as_mut_ptr()).linesize;
+
+        // Rotate Y plane (full resolution)
+        rotate_plane(
+            src_ptr[0] as *const u8, src_ls[0] as usize, src_w, src_h,
+            dst_ptr[0] as *mut u8, dst_ls[0] as usize, dst_w, dst_h,
+            rotation,
+        );
+
+        // Rotate U and V planes (half resolution)
+        let half_src_w = src_w / 2;
+        let half_src_h = src_h / 2;
+        let half_dst_w = dst_w / 2;
+        let half_dst_h = dst_h / 2;
+
+        for plane in 1..=2usize {
+            rotate_plane(
+                src_ptr[plane] as *const u8, src_ls[plane] as usize, half_src_w, half_src_h,
+                dst_ptr[plane] as *mut u8, dst_ls[plane] as usize, half_dst_w, half_dst_h,
+                rotation,
+            );
+        }
+    }
+
+    Ok(dst)
+}
+
+/// Rotate a single plane of pixel data.
+unsafe fn rotate_plane(
+    src: *const u8, src_stride: usize, src_w: usize, src_h: usize,
+    dst: *mut u8, dst_stride: usize, _dst_w: usize, _dst_h: usize,
+    rotation: u32,
+) {
+    unsafe {
+        match rotation {
+            90 => {
+                for y in 0..src_h {
+                    for x in 0..src_w {
+                        let dst_x = src_h - 1 - y;
+                        let dst_y = x;
+                        *dst.add(dst_y * dst_stride + dst_x) = *src.add(y * src_stride + x);
+                    }
+                }
+            }
+            180 => {
+                for y in 0..src_h {
+                    for x in 0..src_w {
+                        let dst_x = src_w - 1 - x;
+                        let dst_y = src_h - 1 - y;
+                        *dst.add(dst_y * dst_stride + dst_x) = *src.add(y * src_stride + x);
+                    }
+                }
+            }
+            270 => {
+                for y in 0..src_h {
+                    for x in 0..src_w {
+                        let dst_x = y;
+                        let dst_y = src_w - 1 - x;
+                        *dst.add(dst_y * dst_stride + dst_x) = *src.add(y * src_stride + x);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
 }
 
 /// Blit a YUV420P source frame onto a YUV420P destination frame at the given offset.

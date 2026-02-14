@@ -316,47 +316,8 @@ fn test_timeline_click_empty_moves_cursor() {
 }
 
 #[test]
-fn test_place_selected_clip() {
-    let mut app = App::new();
-    let asset = make_test_asset("clip1", 5.0);
-    let asset_id = asset.id;
-    app.update(Message::MediaImported(Ok(asset)));
-
-    app.selected_asset_id = Some(asset_id);
-
-    app.update(Message::PlaceSelectedClip {
-        asset_id,
-        track_index: 0,
-        position: TimelinePosition::from_secs_f64(2.0),
-    });
-
-    assert_eq!(app.project.timeline.tracks[0].clips.len(), 1);
-    assert!(app.selected_asset_id.is_none());
-    assert_eq!(app.status_message, "Clip placed");
-}
-
-#[test]
-fn test_place_clears_selection() {
-    let mut app = App::new();
-    let asset = make_test_asset("clip1", 5.0);
-    let asset_id = asset.id;
-    app.update(Message::MediaImported(Ok(asset)));
-
-    app.selected_asset_id = Some(asset_id);
-
-    app.update(Message::PlaceSelectedClip {
-        asset_id,
-        track_index: 0,
-        position: TimelinePosition::zero(),
-    });
-
-    assert!(app.selected_asset_id.is_none());
-}
-
-#[test]
 fn test_click_without_selection_moves_cursor() {
     let mut app = App::new();
-    assert!(app.selected_asset_id.is_none());
 
     app.update(Message::TimelineClickEmpty(
         TimelinePosition::from_secs_f64(5.0),
@@ -498,8 +459,8 @@ fn test_place_overlapping_clip_trims_previous() {
     });
     assert_eq!(app.project.timeline.tracks[0].clips.len(), 1);
 
-    // Place second clip at 3s — overlaps [3, 8), should trim first to [0, 3)
-    app.update(Message::PlaceSelectedClip {
+    // Add second clip at 3s — overlaps [3, 8), should trim first to [0, 3)
+    app.update(Message::AddClipToTimeline {
         asset_id,
         track_index: 0,
         position: TimelinePosition::from_secs_f64(3.0),
@@ -762,31 +723,6 @@ fn test_resize_linked_pair() {
     assert_eq!(aud.timeline_range.end, TimelinePosition::from_secs_f64(8.0));
 }
 
-#[test]
-fn test_place_selected_clip_with_audio() {
-    let mut app = App::new();
-
-    let asset = make_test_asset("clip1", 5.0);
-    let asset_id = asset.id;
-    app.update(Message::MediaImported(Ok(asset)));
-
-    app.selected_asset_id = Some(asset_id);
-
-    app.update(Message::PlaceSelectedClip {
-        asset_id,
-        track_index: 0,
-        position: TimelinePosition::from_secs_f64(2.0),
-    });
-
-    assert_eq!(app.project.timeline.tracks[0].clips.len(), 1);
-    assert_eq!(app.project.timeline.tracks[1].clips.len(), 1);
-
-    let vid = &app.project.timeline.tracks[0].clips[0];
-    let aud = &app.project.timeline.tracks[1].clips[0];
-    assert_eq!(vid.timeline_range.start, TimelinePosition::from_secs_f64(2.0));
-    assert_eq!(aud.timeline_range.start, TimelinePosition::from_secs_f64(2.0));
-    assert_eq!(vid.link_id, aud.link_id);
-}
 
 #[test]
 fn test_undo_redo_grouped_add() {
@@ -1521,4 +1457,305 @@ fn test_menu_render_dispatches() {
     let mut app = App::new();
     app.update(Message::MenuAction(MenuAction::Render));
     assert_eq!(app.status_message, "Opening render dialog...");
+}
+
+// ===== Brief 12: Timeline clip selection + delete =====
+
+#[test]
+fn test_select_timeline_clip() {
+    let mut app = App::new();
+    assert!(app.selected_clip.is_none());
+
+    let clip_id = uuid::Uuid::new_v4();
+    app.update(Message::SelectTimelineClip(Some((0, clip_id))));
+    assert_eq!(app.selected_clip, Some((0, clip_id)));
+
+    app.update(Message::SelectTimelineClip(None));
+    assert!(app.selected_clip.is_none());
+}
+
+#[test]
+fn test_delete_selected_clip() {
+    let mut app = App::new();
+    let asset = make_test_asset("clip1", 5.0);
+    let asset_id = asset.id;
+    app.update(Message::MediaImported(Ok(asset)));
+    app.update(Message::AddClipToTimeline {
+        asset_id,
+        track_index: 0,
+        position: TimelinePosition::zero(),
+    });
+
+    let clip_id = app.project.timeline.tracks[0].clips[0].id;
+    // Video+audio clips added (has_audio=true), so 2 tracks
+    assert_eq!(app.project.timeline.tracks[0].clips.len(), 1);
+    assert_eq!(app.project.timeline.tracks[1].clips.len(), 1);
+
+    app.update(Message::RemoveClip {
+        track_index: 0,
+        clip_id,
+    });
+
+    // Both video and audio clips removed (linked)
+    assert_eq!(app.project.timeline.tracks[0].clips.len(), 0);
+    assert_eq!(app.project.timeline.tracks[1].clips.len(), 0);
+    assert_eq!(app.status_message, "Clip removed");
+}
+
+#[test]
+fn test_delete_linked_removes_both() {
+    let mut app = App::new();
+    let asset = make_test_asset("clip1", 5.0);
+    let asset_id = asset.id;
+    app.update(Message::MediaImported(Ok(asset)));
+    app.update(Message::AddClipToTimeline {
+        asset_id,
+        track_index: 0,
+        position: TimelinePosition::zero(),
+    });
+
+    // Delete via audio track clip
+    let audio_clip_id = app.project.timeline.tracks[1].clips[0].id;
+    app.update(Message::RemoveClip {
+        track_index: 1,
+        clip_id: audio_clip_id,
+    });
+
+    // Both should be removed
+    assert_eq!(app.project.timeline.tracks[0].clips.len(), 0);
+    assert_eq!(app.project.timeline.tracks[1].clips.len(), 0);
+}
+
+#[test]
+fn test_delete_is_undoable() {
+    let mut app = App::new();
+    let asset = make_test_asset("clip1", 5.0);
+    let asset_id = asset.id;
+    app.update(Message::MediaImported(Ok(asset)));
+    app.update(Message::AddClipToTimeline {
+        asset_id,
+        track_index: 0,
+        position: TimelinePosition::zero(),
+    });
+
+    let clip_id = app.project.timeline.tracks[0].clips[0].id;
+    app.update(Message::RemoveClip {
+        track_index: 0,
+        clip_id,
+    });
+    assert_eq!(app.project.timeline.tracks[0].clips.len(), 0);
+
+    app.update(Message::Undo);
+    assert_eq!(app.project.timeline.tracks[0].clips.len(), 1);
+    assert_eq!(app.project.timeline.tracks[1].clips.len(), 1);
+}
+
+#[test]
+fn test_click_empty_deselects_clip() {
+    let mut app = App::new();
+    let clip_id = uuid::Uuid::new_v4();
+    app.selected_clip = Some((0, clip_id));
+
+    app.update(Message::TimelineClickEmpty(TimelinePosition::from_secs_f64(1.0)));
+    assert!(app.selected_clip.is_none());
+}
+
+#[test]
+fn test_delete_key_removes_selected_clip() {
+    let mut app = App::new();
+    let asset = make_test_asset("clip1", 5.0);
+    let asset_id = asset.id;
+    app.update(Message::MediaImported(Ok(asset)));
+    app.update(Message::AddClipToTimeline {
+        asset_id,
+        track_index: 0,
+        position: TimelinePosition::zero(),
+    });
+
+    let clip_id = app.project.timeline.tracks[0].clips[0].id;
+    app.selected_clip = Some((0, clip_id));
+
+    // Press Delete key
+    app.update(Message::KeyboardEvent(iced::keyboard::Event::KeyPressed {
+        key: iced::keyboard::Key::Named(iced::keyboard::key::Named::Delete),
+        modified_key: iced::keyboard::Key::Named(iced::keyboard::key::Named::Delete),
+        physical_key: iced::keyboard::key::Physical::Unidentified(
+            iced::keyboard::key::NativeCode::Unidentified,
+        ),
+        location: iced::keyboard::Location::Standard,
+        modifiers: iced::keyboard::Modifiers::empty(),
+        text: None,
+        repeat: false,
+    }));
+
+    assert_eq!(app.project.timeline.tracks[0].clips.len(), 0);
+    assert!(app.selected_clip.is_none());
+}
+
+#[test]
+fn test_select_grouped_clip_links_are_tracked() {
+    // When selecting a clip that has a link_id, the linked clips should
+    // share the same link_id, allowing the UI to highlight them together.
+    let mut app = App::new();
+    let asset = make_test_asset("clip1", 5.0);
+    let asset_id = asset.id;
+    app.update(Message::MediaImported(Ok(asset)));
+
+    // Add clip with audio (creates linked pair)
+    app.update(Message::AddClipToTimeline {
+        asset_id,
+        track_index: 0,
+        position: TimelinePosition::zero(),
+    });
+
+    let vid_clip = &app.project.timeline.tracks[0].clips[0];
+    let aud_clip = &app.project.timeline.tracks[1].clips[0];
+    let vid_id = vid_clip.id;
+    let vid_link = vid_clip.link_id;
+    let aud_link = aud_clip.link_id;
+
+    // Both clips should share the same link_id
+    assert!(vid_link.is_some());
+    assert_eq!(vid_link, aud_link);
+
+    // Select the video clip
+    app.update(Message::SelectTimelineClip(Some((0, vid_id))));
+    assert_eq!(app.selected_clip, Some((0, vid_id)));
+
+    // The audio clip's link_id matches the selected clip's link_id
+    // (the canvas drawing code uses this to highlight both)
+    let selected_link_id = app.project.timeline.tracks[0].clips.iter()
+        .find(|c| c.id == vid_id)
+        .and_then(|c| c.link_id);
+    assert_eq!(selected_link_id, aud_link);
+}
+
+#[test]
+fn test_drag_does_not_select_source_asset() {
+    let mut app = App::new();
+    let asset = make_test_asset("clip1", 5.0);
+    let asset_id = asset.id;
+    app.update(Message::MediaImported(Ok(asset)));
+
+    assert!(app.selected_asset_id.is_none());
+    // Drag start should NOT select the asset
+    app.update(Message::StartDragFromSource(asset_id));
+    assert!(app.selected_asset_id.is_none());
+    // Only mouse-up (SelectSourceAsset) should select
+    app.update(Message::SelectSourceAsset(Some(asset_id)));
+    assert_eq!(app.selected_asset_id, Some(asset_id));
+}
+
+#[test]
+fn test_delete_key_removes_source_no_clips() {
+    let mut app = App::new();
+    let asset = make_test_asset("clip1", 5.0);
+    let asset_id = asset.id;
+    app.update(Message::MediaImported(Ok(asset)));
+    assert_eq!(app.project.source_library.len(), 1);
+
+    // Select the asset
+    app.selected_asset_id = Some(asset_id);
+
+    // No clips in timeline — should remove directly (no confirmation)
+    app.update(Message::ConfirmRemoveAsset(asset_id));
+
+    assert_eq!(app.project.source_library.len(), 0);
+    assert!(app.confirm_dialog.is_none());
+}
+
+#[test]
+fn test_delete_with_clips_shows_confirmation() {
+    let mut app = App::new();
+    let asset = make_test_asset("clip1", 5.0);
+    let asset_id = asset.id;
+    app.update(Message::MediaImported(Ok(asset)));
+    app.update(Message::AddClipToTimeline {
+        asset_id,
+        track_index: 0,
+        position: TimelinePosition::zero(),
+    });
+    assert_eq!(app.project.timeline.tracks[0].clips.len(), 1);
+
+    app.update(Message::ConfirmRemoveAsset(asset_id));
+
+    // Should show confirmation dialog, not remove yet
+    assert!(app.confirm_dialog.is_some());
+    assert_eq!(app.project.source_library.len(), 1);
+}
+
+#[test]
+fn test_confirm_removes_asset_and_clips() {
+    let mut app = App::new();
+    let asset = make_test_asset("clip1", 5.0);
+    let asset_id = asset.id;
+    app.update(Message::MediaImported(Ok(asset)));
+    app.update(Message::AddClipToTimeline {
+        asset_id,
+        track_index: 0,
+        position: TimelinePosition::zero(),
+    });
+
+    app.update(Message::ConfirmRemoveAsset(asset_id));
+    assert!(app.confirm_dialog.is_some());
+
+    app.update(Message::ConfirmDialogAccepted);
+
+    assert!(app.confirm_dialog.is_none());
+    assert_eq!(app.project.source_library.len(), 0);
+    assert_eq!(app.project.timeline.tracks[0].clips.len(), 0);
+    assert_eq!(app.project.timeline.tracks[1].clips.len(), 0);
+}
+
+#[test]
+fn test_dismiss_keeps_asset() {
+    let mut app = App::new();
+    let asset = make_test_asset("clip1", 5.0);
+    let asset_id = asset.id;
+    app.update(Message::MediaImported(Ok(asset)));
+    app.update(Message::AddClipToTimeline {
+        asset_id,
+        track_index: 0,
+        position: TimelinePosition::zero(),
+    });
+
+    app.update(Message::ConfirmRemoveAsset(asset_id));
+    assert!(app.confirm_dialog.is_some());
+
+    app.update(Message::ConfirmDialogDismissed);
+
+    assert!(app.confirm_dialog.is_none());
+    assert_eq!(app.project.source_library.len(), 1);
+    assert_eq!(app.project.timeline.tracks[0].clips.len(), 1);
+}
+
+#[test]
+fn test_delete_key_no_selection_noop() {
+    let mut app = App::new();
+    let asset = make_test_asset("clip1", 5.0);
+    let asset_id = asset.id;
+    app.update(Message::MediaImported(Ok(asset)));
+    app.update(Message::AddClipToTimeline {
+        asset_id,
+        track_index: 0,
+        position: TimelinePosition::zero(),
+    });
+
+    // No clip selected
+    assert!(app.selected_clip.is_none());
+
+    // Press Delete key — should be noop
+    app.update(Message::KeyboardEvent(iced::keyboard::Event::KeyPressed {
+        key: iced::keyboard::Key::Named(iced::keyboard::key::Named::Delete),
+        modified_key: iced::keyboard::Key::Named(iced::keyboard::key::Named::Delete),
+        physical_key: iced::keyboard::key::Physical::Unidentified(
+            iced::keyboard::key::NativeCode::Unidentified,
+        ),
+        location: iced::keyboard::Location::Standard,
+        modifiers: iced::keyboard::Modifiers::empty(),
+        text: None,
+        repeat: false,
+    }));
+
+    assert_eq!(app.project.timeline.tracks[0].clips.len(), 1);
 }
