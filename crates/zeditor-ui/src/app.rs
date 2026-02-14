@@ -1569,40 +1569,20 @@ impl App {
             / self.project.settings.canvas_height as f32;
         let canvas_preview_width = (viewport_height * canvas_aspect).round();
 
-        // Compute preview scale: how many preview pixels per canvas pixel
-        let preview_scale = canvas_preview_width / self.project.settings.canvas_width as f32;
-        let tx = self.current_frame_transform;
-        let offset_x = (tx.x_offset as f32 * preview_scale).round();
-        let offset_y = (tx.y_offset as f32 * preview_scale).round();
-
         let video_area: Element<'_, Message> = if let Some(handle) = &self.current_frame {
             // Black inner container at canvas aspect ratio with the video inside
-            let img: Element<'_, Message> = iced::widget::image(handle.clone())
-                .content_fit(iced::ContentFit::Contain)
-                .width(Length::Fill)
-                .height(Length::Fill)
-                .into();
-
-            // Apply transform offset using padding
-            let shifted: Element<'_, Message> = container(img)
-                .padding(Padding {
-                    top: offset_y.max(0.0),
-                    left: offset_x.max(0.0),
-                    bottom: (-offset_y).max(0.0),
-                    right: (-offset_x).max(0.0),
-                })
-                .width(Length::Fill)
-                .height(Length::Fill)
-                .into();
-
-            let inner = container(shifted)
-                .width(canvas_preview_width)
-                .height(viewport_height)
-                .clip(true)
-                .style(|_theme| container::Style {
-                    background: Some(Background::Color(Color::BLACK)),
-                    ..Default::default()
-                });
+            let inner = container(
+                iced::widget::image(handle.clone())
+                    .content_fit(iced::ContentFit::Contain)
+                    .width(Length::Fill)
+                    .height(Length::Fill),
+            )
+            .width(canvas_preview_width)
+            .height(viewport_height)
+            .style(|_theme| container::Style {
+                background: Some(Background::Color(Color::BLACK)),
+                ..Default::default()
+            });
             // Outer dark container centers the inner canvas box
             container(center(inner))
                 .width(Length::Fill)
@@ -2002,9 +1982,24 @@ impl App {
             // When paused (scrubbing), always display immediately.
             // When playing, only display if the frame's time has arrived.
             if !self.is_playing || frame_timeline_time <= playback_secs + 0.02 {
-                self.current_frame = Some(iced::widget::image::Handle::from_rgba(
-                    frame.width, frame.height, frame.rgba,
-                ));
+                let tx = &self.current_frame_transform;
+                if tx.x_offset != 0.0 || tx.y_offset != 0.0 {
+                    let (composited, cw, ch) = composite_frame_for_preview(
+                        &frame.rgba,
+                        frame.width,
+                        frame.height,
+                        self.project.settings.canvas_width,
+                        self.project.settings.canvas_height,
+                        tx,
+                    );
+                    self.current_frame = Some(iced::widget::image::Handle::from_rgba(
+                        cw, ch, composited,
+                    ));
+                } else {
+                    self.current_frame = Some(iced::widget::image::Handle::from_rgba(
+                        frame.width, frame.height, frame.rgba,
+                    ));
+                }
                 self.drain_stale = false;
                 // Loop to check if there's an even more recent frame also due
             } else if self.drain_stale {
@@ -2110,6 +2105,92 @@ pub fn rgb24_to_rgba32(rgb: &[u8], width: u32, height: u32) -> Vec<u8> {
         rgba.push(255);
     }
     rgba
+}
+
+/// Composite a decoded RGBA frame onto a canvas-proportioned black buffer with transform offset.
+/// Returns (rgba_buffer, width, height) sized to fit within PREVIEW_MAX dimensions.
+fn composite_frame_for_preview(
+    frame_rgba: &[u8],
+    frame_w: u32,
+    frame_h: u32,
+    canvas_w: u32,
+    canvas_h: u32,
+    transform: &zeditor_core::effects::ResolvedTransform,
+) -> (Vec<u8>, u32, u32) {
+    // Determine preview canvas size (fit canvas aspect ratio within PREVIEW_MAX).
+    let scale_x = PREVIEW_MAX_WIDTH as f64 / canvas_w as f64;
+    let scale_y = PREVIEW_MAX_HEIGHT as f64 / canvas_h as f64;
+    let preview_scale = scale_x.min(scale_y).min(1.0);
+    let pw = (canvas_w as f64 * preview_scale).round() as u32;
+    let ph = (canvas_h as f64 * preview_scale).round() as u32;
+
+    // Determine how the video frame fits inside the canvas (centered, aspect-fit).
+    let fit_scale_x = canvas_w as f64 / frame_w as f64;
+    let fit_scale_y = canvas_h as f64 / frame_h as f64;
+    let fit_scale = fit_scale_x.min(fit_scale_y);
+    let clip_w_canvas = (frame_w as f64 * fit_scale).round();
+    let clip_h_canvas = (frame_h as f64 * fit_scale).round();
+    let center_x_canvas = (canvas_w as f64 - clip_w_canvas) / 2.0;
+    let center_y_canvas = (canvas_h as f64 - clip_h_canvas) / 2.0;
+
+    // Apply transform offset (in canvas pixels) then convert to preview pixels.
+    let offset_x = ((center_x_canvas + transform.x_offset) * preview_scale).round() as i32;
+    let offset_y = ((center_y_canvas + transform.y_offset) * preview_scale).round() as i32;
+    let clip_w = (clip_w_canvas * preview_scale).round() as u32;
+    let clip_h = (clip_h_canvas * preview_scale).round() as u32;
+
+    // Black canvas.
+    let mut buf = vec![0u8; (pw * ph * 4) as usize];
+
+    // Blit the frame with nearest-neighbor scaling.
+    blit_rgba_scaled(
+        frame_rgba, frame_w, frame_h, &mut buf, pw, ph, offset_x, offset_y, clip_w, clip_h,
+    );
+
+    (buf, pw, ph)
+}
+
+/// Nearest-neighbor scale + blit RGBA pixels onto a destination buffer.
+/// Handles negative offsets and out-of-bounds clipping.
+fn blit_rgba_scaled(
+    src: &[u8],
+    src_w: u32,
+    src_h: u32,
+    dst: &mut [u8],
+    dst_w: u32,
+    dst_h: u32,
+    offset_x: i32,
+    offset_y: i32,
+    clip_w: u32,
+    clip_h: u32,
+) {
+    if clip_w == 0 || clip_h == 0 {
+        return;
+    }
+
+    // Visible region in dst coords.
+    let x0 = offset_x.max(0) as u32;
+    let y0 = offset_y.max(0) as u32;
+    let x1 = ((offset_x + clip_w as i32) as u32).min(dst_w);
+    let y1 = ((offset_y + clip_h as i32) as u32).min(dst_h);
+
+    if x0 >= x1 || y0 >= y1 {
+        return;
+    }
+
+    for dy in y0..y1 {
+        // Map dst y to src y via nearest-neighbor.
+        let local_y = (dy as i32 - offset_y) as u32;
+        let sy = ((local_y as u64 * src_h as u64) / clip_h as u64).min(src_h as u64 - 1) as u32;
+        for dx in x0..x1 {
+            let local_x = (dx as i32 - offset_x) as u32;
+            let sx =
+                ((local_x as u64 * src_w as u64) / clip_w as u64).min(src_w as u64 - 1) as u32;
+            let si = (sy * src_w + sx) as usize * 4;
+            let di = (dy * dst_w + dx) as usize * 4;
+            dst[di..di + 4].copy_from_slice(&src[si..si + 4]);
+        }
+    }
 }
 
 /// Event filter for global mouse tracking during drag operations.

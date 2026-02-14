@@ -1043,12 +1043,31 @@ unsafe fn rotate_plane(
 }
 
 /// Blit a YUV420P source frame onto a YUV420P destination frame at the given offset.
-/// Handles bounds clamping to prevent buffer overflows.
+/// Handles negative offsets and bounds clamping to prevent buffer overflows.
 fn blit_yuv_frame(src: &AVFrame, dst: &mut AVFrame, offset_x: i32, offset_y: i32) {
-    let src_w = src.width as usize;
-    let src_h = src.height as usize;
-    let dst_w = dst.width as usize;
-    let dst_h = dst.height as usize;
+    let src_w = src.width as i32;
+    let src_h = src.height as i32;
+    let dst_w = dst.width as i32;
+    let dst_h = dst.height as i32;
+
+    // Compute visible region: source start, destination start, visible size
+    let src_x0 = (-offset_x).max(0);
+    let src_y0 = (-offset_y).max(0);
+    let dst_x0 = offset_x.max(0);
+    let dst_y0 = offset_y.max(0);
+    let vis_w = (src_w - src_x0).min(dst_w - dst_x0);
+    let vis_h = (src_h - src_y0).min(dst_h - dst_y0);
+
+    if vis_w <= 0 || vis_h <= 0 {
+        return;
+    }
+
+    let vis_w = vis_w as usize;
+    let vis_h = vis_h as usize;
+    let src_x0 = src_x0 as usize;
+    let src_y0 = src_y0 as usize;
+    let dst_x0 = dst_x0 as usize;
+    let dst_y0 = dst_y0 as usize;
 
     unsafe {
         let src_ptr = (*src.as_ptr()).data;
@@ -1056,56 +1075,32 @@ fn blit_yuv_frame(src: &AVFrame, dst: &mut AVFrame, offset_x: i32, offset_y: i32
         let dst_ptr = (*dst.as_mut_ptr()).data;
         let dst_linesize = (*dst.as_mut_ptr()).linesize;
 
-        // Y plane
-        let y_src = src_ptr[0] as *const u8;
-        let y_dst = dst_ptr[0] as *mut u8;
-        let y_src_stride = src_linesize[0] as usize;
-        let y_dst_stride = dst_linesize[0] as usize;
-
-        for row in 0..src_h {
-            let dst_row = offset_y as usize + row;
-            if dst_row >= dst_h {
-                break;
-            }
-            let copy_w = src_w.min(dst_w.saturating_sub(offset_x as usize));
-            if copy_w == 0 {
-                continue;
-            }
+        // Y plane (full resolution)
+        for row in 0..vis_h {
             std::ptr::copy_nonoverlapping(
-                y_src.add(row * y_src_stride),
-                y_dst.add(dst_row * y_dst_stride + offset_x as usize),
-                copy_w,
+                (src_ptr[0] as *const u8).add((src_y0 + row) * src_linesize[0] as usize + src_x0),
+                (dst_ptr[0] as *mut u8).add((dst_y0 + row) * dst_linesize[0] as usize + dst_x0),
+                vis_w,
             );
         }
 
-        // U and V planes (4:2:0 — half dimensions and offsets)
-        let half_src_w = src_w / 2;
-        let half_src_h = src_h / 2;
-        let half_dst_w = dst_w / 2;
-        let half_dst_h = dst_h / 2;
-        let half_off_x = offset_x as usize / 2;
-        let half_off_y = offset_y as usize / 2;
+        // U and V planes (4:2:0 — half resolution)
+        let half_src_x0 = src_x0 / 2;
+        let half_src_y0 = src_y0 / 2;
+        let half_dst_x0 = dst_x0 / 2;
+        let half_dst_y0 = dst_y0 / 2;
+        let half_vis_w = vis_w / 2;
+        let half_vis_h = vis_h / 2;
 
-        for plane in 1..=2usize {
-            let p_src = src_ptr[plane] as *const u8;
-            let p_dst = dst_ptr[plane] as *mut u8;
-            let p_src_stride = src_linesize[plane] as usize;
-            let p_dst_stride = dst_linesize[plane] as usize;
-
-            for row in 0..half_src_h {
-                let dst_row = half_off_y + row;
-                if dst_row >= half_dst_h {
-                    break;
+        if half_vis_w > 0 && half_vis_h > 0 {
+            for plane in 1..=2usize {
+                for row in 0..half_vis_h {
+                    std::ptr::copy_nonoverlapping(
+                        (src_ptr[plane] as *const u8).add((half_src_y0 + row) * src_linesize[plane] as usize + half_src_x0),
+                        (dst_ptr[plane] as *mut u8).add((half_dst_y0 + row) * dst_linesize[plane] as usize + half_dst_x0),
+                        half_vis_w,
+                    );
                 }
-                let copy_w = half_src_w.min(half_dst_w.saturating_sub(half_off_x));
-                if copy_w == 0 {
-                    continue;
-                }
-                std::ptr::copy_nonoverlapping(
-                    p_src.add(row * p_src_stride),
-                    p_dst.add(dst_row * p_dst_stride + half_off_x),
-                    copy_w,
-                );
             }
         }
     }
