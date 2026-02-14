@@ -68,3 +68,26 @@ We now want to implement the final core piece of our app; video rendering.
   - Removed `FfmpegAudioDecoder` dependency (uses raw rsmpeg audio decode in renderer)
 
 **Test results:** All 216 workspace tests pass
+
+### Fix Default Render Resolution & Improve Scaling Quality
+
+**Problem:** `derive_render_config()` overrode the 1920x1080 default with the source clip's dimensions (e.g. 1744x1308), causing renders at unexpected resolutions. Additionally, the renderer used `SWS_FAST_BILINEAR` (speed-optimized) for scaling, whereas final render output should prioritize quality.
+
+**Changes to `crates/zeditor-media/src/renderer.rs`:**
+- Added `ScalingAlgorithm` enum with `FastBilinear`, `Bilinear`, `Bicubic`, `Lanczos` variants, each mapping to the corresponding `ffi::SWS_*` flag
+- Extended `RenderConfig` with `pub scaling: ScalingAlgorithm` field (default: `Lanczos`)
+- Fixed `derive_render_config()` — removed resolution override (`config.width = asset.width`, `config.height = asset.height`). Resolution always stays at default 1920x1080. FPS still derived from source to avoid temporal artifacts.
+- Threaded `sws_flags` through `encode_video_frames()` → `decode_and_convert_video_frame()` so the configurable scaling algorithm is used instead of hardcoded `SWS_FAST_BILINEAR`
+- Added doc comment listing future extensibility fields (video_codec, audio_codec, container_format, etc.)
+
+**Changes to `crates/zeditor-media/tests/renderer_tests.rs`:**
+- Updated import to include `ScalingAlgorithm`
+- Added `scaling: ScalingAlgorithm::Lanczos` to all 4 manual `RenderConfig` struct literals
+- Added `scaling` assertion to `test_render_config_defaults`
+- Fixed `test_derive_render_config_from_asset` — assertions changed from 320x240 → 1920x1080 (was testing buggy behavior), added FPS assertion
+- Added 3 new e2e tests:
+  - `test_render_upscale_to_1080p` — 320x240 source rendered at 1920x1080, verifies output dimensions and duration
+  - `test_render_upscale_with_audio` — same with audio track, verifies 1920x1080 + audio present
+  - `test_derive_render_config_preserves_1080p_with_any_source` — verifies derive always returns 1920x1080 regardless of source
+
+**Test results:** All 219 workspace tests pass (55 core + 24 media + 2 test-harness + 138 UI)

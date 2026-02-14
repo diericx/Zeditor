@@ -2,7 +2,7 @@ use std::path::PathBuf;
 
 use zeditor_core::media::{MediaAsset, SourceLibrary};
 use zeditor_core::timeline::{Clip, TimeRange, Timeline, TimelinePosition};
-use zeditor_media::renderer::{derive_render_config, render_timeline, RenderConfig};
+use zeditor_media::renderer::{derive_render_config, render_timeline, RenderConfig, ScalingAlgorithm};
 use zeditor_test_harness::fixtures;
 
 /// Helper: create a timeline with one video track, one audio track,
@@ -42,6 +42,7 @@ fn test_render_config_defaults() {
     assert!((config.fps - 30.0).abs() < 0.001);
     assert_eq!(config.crf, 22);
     assert_eq!(config.preset, "superfast");
+    assert_eq!(config.scaling, ScalingAlgorithm::Lanczos);
     assert_eq!(config.output_path, PathBuf::from("/tmp/test.mkv"));
 }
 
@@ -61,6 +62,7 @@ fn test_render_single_clip() {
         fps: 30.0,
         crf: 22,
         preset: "superfast".to_string(),
+        scaling: ScalingAlgorithm::Lanczos,
     };
 
     render_timeline(&timeline, &source_library, &config).unwrap();
@@ -116,6 +118,7 @@ fn test_render_with_gap() {
         fps: 30.0,
         crf: 22,
         preset: "superfast".to_string(),
+        scaling: ScalingAlgorithm::Lanczos,
     };
 
     render_timeline(&timeline, &source_library, &config).unwrap();
@@ -179,6 +182,7 @@ fn test_render_multiple_clips() {
         fps: 30.0,
         crf: 22,
         preset: "superfast".to_string(),
+        scaling: ScalingAlgorithm::Lanczos,
     };
 
     render_timeline(&timeline, &source_library, &config).unwrap();
@@ -212,6 +216,7 @@ fn test_render_with_audio() {
         fps: 30.0,
         crf: 22,
         preset: "superfast".to_string(),
+        scaling: ScalingAlgorithm::Lanczos,
     };
 
     render_timeline(&timeline, &source_library, &config).unwrap();
@@ -245,9 +250,12 @@ fn test_derive_render_config_from_asset() {
     let (timeline, source_library) = single_clip_timeline(&asset, false);
 
     let config = derive_render_config(&timeline, &source_library, output_path.clone());
-    // Test video is 320x240
-    assert_eq!(config.width, 320);
-    assert_eq!(config.height, 240);
+    // Resolution always stays at default 1920x1080 regardless of source
+    assert_eq!(config.width, 1920);
+    assert_eq!(config.height, 1080);
+    // FPS should be derived from source (~25fps for testsrc)
+    assert!(config.fps > 0.0, "FPS should be derived from source");
+    assert_eq!(config.scaling, ScalingAlgorithm::Lanczos);
     assert_eq!(config.output_path, output_path);
 }
 
@@ -261,4 +269,98 @@ fn test_derive_render_config_empty_timeline() {
     // Should fall back to defaults
     assert_eq!(config.width, 1920);
     assert_eq!(config.height, 1080);
+}
+
+#[test]
+fn test_render_upscale_to_1080p() {
+    // Source is 320x240, render at 1920x1080 — verifies upscale works
+    let dir = fixtures::fixture_dir();
+    let video_path = fixtures::generate_test_video(dir.path(), "render_upscale", 2.0);
+    let output_path = dir.path().join("output_upscale.mkv");
+
+    let asset = zeditor_media::probe::probe(&video_path).unwrap();
+    assert_eq!(asset.width, 320);
+    assert_eq!(asset.height, 240);
+
+    let (timeline, source_library) = single_clip_timeline(&asset, false);
+
+    let config = RenderConfig {
+        output_path: output_path.clone(),
+        width: 1920,
+        height: 1080,
+        fps: 30.0,
+        crf: 22,
+        preset: "superfast".to_string(),
+        scaling: ScalingAlgorithm::Lanczos,
+    };
+
+    render_timeline(&timeline, &source_library, &config).unwrap();
+
+    let output_asset = zeditor_media::probe::probe(&output_path).unwrap();
+    assert_eq!(output_asset.width, 1920);
+    assert_eq!(output_asset.height, 1080);
+    let dur = output_asset.duration.as_secs_f64();
+    assert!(
+        dur >= 1.5 && dur <= 3.0,
+        "Expected ~2s duration, got {dur}s"
+    );
+}
+
+#[test]
+fn test_render_upscale_with_audio() {
+    // Source is 320x240 with audio, render at 1920x1080 — verifies upscale + audio
+    let dir = fixtures::fixture_dir();
+    let video_path =
+        fixtures::generate_test_video_with_audio(dir.path(), "render_upscale_audio", 2.0);
+    let output_path = dir.path().join("output_upscale_audio.mkv");
+
+    let asset = zeditor_media::probe::probe(&video_path).unwrap();
+    assert!(asset.has_audio, "Test asset should have audio");
+    assert_eq!(asset.width, 320);
+    assert_eq!(asset.height, 240);
+
+    let (timeline, source_library) = single_clip_timeline(&asset, true);
+
+    let config = RenderConfig {
+        output_path: output_path.clone(),
+        width: 1920,
+        height: 1080,
+        fps: 30.0,
+        crf: 22,
+        preset: "superfast".to_string(),
+        scaling: ScalingAlgorithm::Lanczos,
+    };
+
+    render_timeline(&timeline, &source_library, &config).unwrap();
+
+    let output_asset = zeditor_media::probe::probe(&output_path).unwrap();
+    assert_eq!(output_asset.width, 1920);
+    assert_eq!(output_asset.height, 1080);
+    assert!(output_asset.has_audio, "Output should have audio");
+    let dur = output_asset.duration.as_secs_f64();
+    assert!(
+        dur >= 1.5 && dur <= 3.0,
+        "Expected ~2s duration, got {dur}s"
+    );
+}
+
+#[test]
+fn test_derive_render_config_preserves_1080p_with_any_source() {
+    // Even with a 320x240 source, derive_render_config returns 1920x1080
+    let dir = fixtures::fixture_dir();
+    let video_path = fixtures::generate_test_video(dir.path(), "derive_preserve", 1.0);
+
+    let asset = zeditor_media::probe::probe(&video_path).unwrap();
+    assert_eq!(asset.width, 320);
+    assert_eq!(asset.height, 240);
+
+    let (timeline, source_library) = single_clip_timeline(&asset, false);
+    let output_path = PathBuf::from("/tmp/derive_preserve_output.mkv");
+
+    let config = derive_render_config(&timeline, &source_library, output_path);
+    assert_eq!(config.width, 1920);
+    assert_eq!(config.height, 1080);
+    assert_eq!(config.scaling, ScalingAlgorithm::Lanczos);
+    // FPS should be derived from the source asset
+    assert!(config.fps > 0.0, "FPS should be derived from source");
 }

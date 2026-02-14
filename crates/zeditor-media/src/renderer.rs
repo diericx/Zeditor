@@ -15,7 +15,30 @@ use zeditor_core::timeline::{Timeline, TimelinePosition, TrackType};
 use crate::decoder::{FfmpegDecoder, VideoDecoder};
 use crate::error::{MediaError, Result};
 
+/// Scaling algorithm for video frame resizing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScalingAlgorithm {
+    FastBilinear,
+    Bilinear,
+    Bicubic,
+    Lanczos,
+}
+
+impl ScalingAlgorithm {
+    pub fn to_sws_flags(self) -> ffi::SwsFlags {
+        match self {
+            Self::FastBilinear => ffi::SWS_FAST_BILINEAR,
+            Self::Bilinear => ffi::SWS_BILINEAR,
+            Self::Bicubic => ffi::SWS_BICUBIC,
+            Self::Lanczos => ffi::SWS_LANCZOS,
+        }
+    }
+}
+
 /// Configuration for timeline rendering.
+///
+/// Future fields: video_codec, audio_codec, container_format,
+/// audio_sample_rate, audio_channels, pixel_format.
 pub struct RenderConfig {
     pub output_path: PathBuf,
     pub width: u32,
@@ -23,10 +46,11 @@ pub struct RenderConfig {
     pub fps: f64,
     pub crf: u32,
     pub preset: String,
+    pub scaling: ScalingAlgorithm,
 }
 
 impl RenderConfig {
-    /// Default config: 1920x1080, 30fps, CRF 22, superfast preset.
+    /// Default config: 1920x1080, 30fps, CRF 22, superfast preset, Lanczos scaling.
     pub fn default_with_path(output_path: PathBuf) -> Self {
         Self {
             output_path,
@@ -35,12 +59,14 @@ impl RenderConfig {
             fps: 30.0,
             crf: 22,
             preset: "superfast".to_string(),
+            scaling: ScalingAlgorithm::Lanczos,
         }
     }
 }
 
 /// Derive render config from timeline content. Uses the first video clip's
-/// source asset dimensions/fps, or falls back to 1920x1080@30fps.
+/// source FPS (to avoid temporal artifacts), but always renders at the
+/// default 1920x1080 resolution regardless of source dimensions.
 pub fn derive_render_config(
     timeline: &Timeline,
     source_library: &SourceLibrary,
@@ -48,15 +74,11 @@ pub fn derive_render_config(
 ) -> RenderConfig {
     let mut config = RenderConfig::default_with_path(output_path);
 
-    // Find the first video clip and use its source asset dimensions
+    // Find the first video clip and derive FPS from its source asset
     for track in &timeline.tracks {
         if track.track_type == TrackType::Video {
             if let Some(clip) = track.clips.first() {
                 if let Some(asset) = source_library.get(clip.asset_id) {
-                    if asset.width > 0 && asset.height > 0 {
-                        config.width = asset.width;
-                        config.height = asset.height;
-                    }
                     if asset.fps > 0.0 {
                         config.fps = asset.fps;
                     }
@@ -282,6 +304,7 @@ fn encode_video_frames(
                 width,
                 height,
                 video_decoders,
+                config.scaling.to_sws_flags(),
             )?
         } else {
             create_black_yuv_frame(width, height)?
@@ -309,6 +332,7 @@ fn decode_and_convert_video_frame(
     width: i32,
     height: i32,
     decoders: &mut HashMap<PathBuf, CachedVideoDecoder>,
+    sws_flags: ffi::SwsFlags,
 ) -> Result<AVFrame> {
     let path_key = source_path.to_path_buf();
 
@@ -359,7 +383,7 @@ fn decode_and_convert_video_frame(
                                 width,
                                 height,
                                 ffi::AV_PIX_FMT_YUV420P,
-                                ffi::SWS_FAST_BILINEAR,
+                                sws_flags,
                                 None,
                                 None,
                                 None,
