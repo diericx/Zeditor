@@ -3,6 +3,7 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
+use zeditor_core::effects::EffectType;
 use zeditor_core::media::MediaAsset;
 use zeditor_core::timeline::TimelinePosition;
 use zeditor_ui::app::App;
@@ -2407,4 +2408,139 @@ fn test_composite_rgba_layers() {
     assert_eq!(canvas[idx + 1], 255);
     assert_eq!(canvas[idx + 2], 0);
     assert_eq!(canvas[idx + 3], 255);
+}
+
+// =============================================================================
+// Brief 16: Pixel effect pipeline message tests
+// =============================================================================
+
+#[test]
+fn test_add_grayscale_effect() {
+    let (mut app, _, clip_id) = setup_app_with_clip();
+
+    app.update(Message::AddEffectToSelectedClip(
+        zeditor_core::effects::EffectType::Grayscale,
+    ));
+
+    let clip = app.project.timeline.tracks[0].get_clip(clip_id).unwrap();
+    assert_eq!(clip.effects.len(), 1);
+    assert_eq!(
+        clip.effects[0].effect_type,
+        zeditor_core::effects::EffectType::Grayscale
+    );
+    // Grayscale has no parameters
+    assert!(clip.effects[0].parameters.is_empty());
+}
+
+#[test]
+fn test_add_brightness_effect() {
+    let (mut app, _, clip_id) = setup_app_with_clip();
+
+    app.update(Message::AddEffectToSelectedClip(
+        zeditor_core::effects::EffectType::Brightness,
+    ));
+
+    let clip = app.project.timeline.tracks[0].get_clip(clip_id).unwrap();
+    assert_eq!(clip.effects.len(), 1);
+    assert_eq!(
+        clip.effects[0].effect_type,
+        zeditor_core::effects::EffectType::Brightness
+    );
+    assert_eq!(clip.effects[0].get_float("brightness"), Some(0.0));
+}
+
+#[test]
+fn test_add_opacity_effect() {
+    let (mut app, _, clip_id) = setup_app_with_clip();
+
+    app.update(Message::AddEffectToSelectedClip(
+        zeditor_core::effects::EffectType::Opacity,
+    ));
+
+    let clip = app.project.timeline.tracks[0].get_clip(clip_id).unwrap();
+    assert_eq!(clip.effects.len(), 1);
+    assert_eq!(
+        clip.effects[0].effect_type,
+        zeditor_core::effects::EffectType::Opacity
+    );
+    assert_eq!(clip.effects[0].get_float("opacity"), Some(1.0));
+}
+
+#[test]
+fn test_multiple_effects_on_clip() {
+    let (mut app, _, clip_id) = setup_app_with_clip();
+
+    app.update(Message::AddEffectToSelectedClip(EffectType::Grayscale));
+    app.update(Message::AddEffectToSelectedClip(EffectType::Brightness));
+    app.update(Message::AddEffectToSelectedClip(EffectType::Opacity));
+
+    let clip = app.project.timeline.tracks[0].get_clip(clip_id).unwrap();
+    assert_eq!(clip.effects.len(), 3);
+    assert_eq!(clip.effects[0].effect_type, EffectType::Grayscale);
+    assert_eq!(clip.effects[1].effect_type, EffectType::Brightness);
+    assert_eq!(clip.effects[2].effect_type, EffectType::Opacity);
+}
+
+#[test]
+fn test_undo_add_new_effect_types() {
+    let (mut app, _, clip_id) = setup_app_with_clip();
+
+    app.update(Message::AddEffectToSelectedClip(EffectType::Brightness));
+    let clip = app.project.timeline.tracks[0].get_clip(clip_id).unwrap();
+    assert_eq!(clip.effects.len(), 1);
+
+    app.update(Message::Undo);
+    let clip = app.project.timeline.tracks[0].get_clip(clip_id).unwrap();
+    assert_eq!(clip.effects.len(), 0);
+
+    app.update(Message::Redo);
+    let clip = app.project.timeline.tracks[0].get_clip(clip_id).unwrap();
+    assert_eq!(clip.effects.len(), 1);
+    assert_eq!(clip.effects[0].effect_type, EffectType::Brightness);
+}
+
+#[test]
+fn test_update_brightness_parameter() {
+    let (mut app, _, clip_id) = setup_app_with_clip();
+
+    app.update(Message::AddEffectToSelectedClip(EffectType::Brightness));
+    let effect_id = app.project.timeline.tracks[0]
+        .get_clip(clip_id)
+        .unwrap()
+        .effects[0]
+        .id;
+
+    app.update(Message::UpdateEffectParameter {
+        track_index: 0,
+        clip_id,
+        effect_id,
+        param_name: "brightness".to_string(),
+        value: "0.75".to_string(),
+    });
+
+    let clip = app.project.timeline.tracks[0].get_clip(clip_id).unwrap();
+    assert_eq!(clip.effects[0].get_float("brightness"), Some(0.75));
+}
+
+#[test]
+fn test_update_opacity_parameter() {
+    let (mut app, _, clip_id) = setup_app_with_clip();
+
+    app.update(Message::AddEffectToSelectedClip(EffectType::Opacity));
+    let effect_id = app.project.timeline.tracks[0]
+        .get_clip(clip_id)
+        .unwrap()
+        .effects[0]
+        .id;
+
+    app.update(Message::UpdateEffectParameter {
+        track_index: 0,
+        clip_id,
+        effect_id,
+        param_name: "opacity".to_string(),
+        value: "0.5".to_string(),
+    });
+
+    let clip = app.project.timeline.tracks[0].get_clip(clip_id).unwrap();
+    assert_eq!(clip.effects[0].get_float("opacity"), Some(0.5));
 }

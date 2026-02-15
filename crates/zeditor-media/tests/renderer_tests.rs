@@ -1,5 +1,6 @@
 use std::path::PathBuf;
 
+use zeditor_core::effects::{EffectInstance, EffectType};
 use zeditor_core::media::{MediaAsset, SourceLibrary};
 use zeditor_core::project::ProjectSettings;
 use zeditor_core::timeline::{Clip, TimeRange, Timeline, TimelinePosition};
@@ -698,4 +699,244 @@ fn test_audio_mixing_additive() {
 
     // Remaining buffer should be untouched
     assert_eq!(buffer[4], 0.0);
+}
+
+// =============================================================================
+// Brief 16: Pixel effect pipeline integration tests
+// =============================================================================
+
+/// Helper: create a timeline with one clip that has effects applied.
+fn single_clip_timeline_with_effects(
+    asset: &MediaAsset,
+    effects: Vec<EffectInstance>,
+) -> (Timeline, SourceLibrary) {
+    let mut timeline = Timeline::new();
+    let video_track_idx = timeline.add_track("Video 1", zeditor_core::timeline::TrackType::Video);
+    let source_range = TimeRange {
+        start: TimelinePosition::zero(),
+        end: TimelinePosition::from_secs_f64(asset.duration.as_secs_f64()),
+    };
+    let mut clip = Clip::new(asset.id, TimelinePosition::zero(), source_range);
+    clip.effects = effects;
+    timeline
+        .add_clip_trimming_overlaps(video_track_idx, clip)
+        .unwrap();
+
+    let mut source_library = SourceLibrary::new();
+    source_library.import(asset.clone());
+
+    (timeline, source_library)
+}
+
+#[test]
+fn test_render_with_grayscale_effect() {
+    let dir = fixtures::fixture_dir();
+    let video_path = fixtures::generate_test_video(dir.path(), "grayscale_fx", 1.0);
+    let output_path = dir.path().join("output_grayscale.mkv");
+
+    let asset = zeditor_media::probe::probe(&video_path).unwrap();
+
+    let effects = vec![EffectInstance::new(EffectType::Grayscale)];
+    let (timeline, source_library) = single_clip_timeline_with_effects(&asset, effects);
+
+    let config = RenderConfig {
+        output_path: output_path.clone(),
+        width: 320,
+        height: 240,
+        canvas_width: 320,
+        canvas_height: 240,
+        fps: 30.0,
+        crf: 22,
+        preset: "superfast".to_string(),
+        scaling: ScalingAlgorithm::FastBilinear,
+    };
+
+    render_timeline(&timeline, &source_library, &config).unwrap();
+
+    // Verify output exists
+    assert!(output_path.exists(), "Grayscale render output should exist");
+    let metadata = std::fs::metadata(&output_path).unwrap();
+    assert!(metadata.len() > 0, "Output file should be non-empty");
+
+    // Decode the output and verify pixels are grayscale (R ≈ G ≈ B)
+    use zeditor_media::decoder::{FfmpegDecoder, VideoDecoder};
+    let mut decoder = FfmpegDecoder::open(&output_path).unwrap();
+    let frame = decoder.decode_next_frame_rgba_scaled(320, 240).unwrap().unwrap();
+
+    // Check a sample of pixels - they should be grayscale (R ≈ G ≈ B within tolerance)
+    // YUV→RGB conversion can introduce slight rounding, so allow tolerance
+    let mut grayscale_count = 0;
+    let total_pixels = (frame.width * frame.height) as usize;
+    for i in 0..total_pixels {
+        let r = frame.data[i * 4] as i32;
+        let g = frame.data[i * 4 + 1] as i32;
+        let b = frame.data[i * 4 + 2] as i32;
+        if (r - g).unsigned_abs() <= 10 && (g - b).unsigned_abs() <= 10 && (r - b).unsigned_abs() <= 10 {
+            grayscale_count += 1;
+        }
+    }
+    let grayscale_ratio = grayscale_count as f64 / total_pixels as f64;
+    assert!(
+        grayscale_ratio > 0.8,
+        "Expected mostly grayscale pixels, got {:.1}% grayscale",
+        grayscale_ratio * 100.0
+    );
+}
+
+#[test]
+fn test_render_with_brightness_effect() {
+    let dir = fixtures::fixture_dir();
+    let video_path = fixtures::generate_test_video(dir.path(), "brightness_fx", 1.0);
+
+    // Render without effects
+    let no_fx_output = dir.path().join("output_no_fx.mkv");
+    let asset = zeditor_media::probe::probe(&video_path).unwrap();
+    let (timeline_no_fx, source_library_no_fx) = single_clip_timeline(&asset, false);
+
+    let config_no_fx = RenderConfig {
+        output_path: no_fx_output.clone(),
+        width: 320,
+        height: 240,
+        canvas_width: 320,
+        canvas_height: 240,
+        fps: 30.0,
+        crf: 22,
+        preset: "superfast".to_string(),
+        scaling: ScalingAlgorithm::FastBilinear,
+    };
+    render_timeline(&timeline_no_fx, &source_library_no_fx, &config_no_fx).unwrap();
+
+    // Render with brightness = 0.5
+    let fx_output = dir.path().join("output_bright.mkv");
+    let mut brightness = EffectInstance::new(EffectType::Brightness);
+    brightness.set_float("brightness", 0.5);
+    let (timeline_fx, source_library_fx) = single_clip_timeline_with_effects(&asset, vec![brightness]);
+
+    let config_fx = RenderConfig {
+        output_path: fx_output.clone(),
+        width: 320,
+        height: 240,
+        canvas_width: 320,
+        canvas_height: 240,
+        fps: 30.0,
+        crf: 22,
+        preset: "superfast".to_string(),
+        scaling: ScalingAlgorithm::FastBilinear,
+    };
+    render_timeline(&timeline_fx, &source_library_fx, &config_fx).unwrap();
+
+    // Decode both and compare - bright version should have higher average luminance
+    use zeditor_media::decoder::{FfmpegDecoder, VideoDecoder};
+
+    let mut dec_no_fx = FfmpegDecoder::open(&no_fx_output).unwrap();
+    let frame_no_fx = dec_no_fx.decode_next_frame_rgba_scaled(320, 240).unwrap().unwrap();
+
+    let mut dec_fx = FfmpegDecoder::open(&fx_output).unwrap();
+    let frame_fx = dec_fx.decode_next_frame_rgba_scaled(320, 240).unwrap().unwrap();
+
+    // Compute average luminance for both
+    let avg_lum = |data: &[u8], total: usize| -> f64 {
+        let mut sum = 0u64;
+        for i in 0..total {
+            sum += data[i * 4] as u64 + data[i * 4 + 1] as u64 + data[i * 4 + 2] as u64;
+        }
+        sum as f64 / (total as f64 * 3.0)
+    };
+
+    let total = (frame_no_fx.width * frame_no_fx.height) as usize;
+    let lum_no_fx = avg_lum(&frame_no_fx.data, total);
+    let lum_fx = avg_lum(&frame_fx.data, total);
+
+    assert!(
+        lum_fx > lum_no_fx + 10.0,
+        "Brightness effect should make frame brighter: no_fx={lum_no_fx:.1}, fx={lum_fx:.1}"
+    );
+}
+
+#[test]
+fn test_render_with_transform_effect() {
+    let dir = fixtures::fixture_dir();
+    let video_path = fixtures::generate_test_video(dir.path(), "transform_fx", 1.0);
+    let output_path = dir.path().join("output_transform.mkv");
+
+    let asset = zeditor_media::probe::probe(&video_path).unwrap();
+
+    // Apply a large X offset to shift the clip right
+    let mut transform = EffectInstance::new(EffectType::Transform);
+    transform.set_float("x_offset", 100.0);
+    let (timeline, source_library) = single_clip_timeline_with_effects(&asset, vec![transform]);
+
+    let config = RenderConfig {
+        output_path: output_path.clone(),
+        width: 320,
+        height: 240,
+        canvas_width: 320,
+        canvas_height: 240,
+        fps: 30.0,
+        crf: 22,
+        preset: "superfast".to_string(),
+        scaling: ScalingAlgorithm::FastBilinear,
+    };
+
+    render_timeline(&timeline, &source_library, &config).unwrap();
+
+    assert!(output_path.exists(), "Transform render output should exist");
+    let metadata = std::fs::metadata(&output_path).unwrap();
+    assert!(metadata.len() > 0, "Output file should be non-empty");
+
+    // Decode and verify left side is darker (shifted clip leaves black area)
+    use zeditor_media::decoder::{FfmpegDecoder, VideoDecoder};
+    let mut decoder = FfmpegDecoder::open(&output_path).unwrap();
+    let frame = decoder.decode_next_frame_rgba_scaled(320, 240).unwrap().unwrap();
+
+    // Left 50 pixels should be mostly black (transparent area from transform)
+    let mut left_sum = 0u64;
+    let mut right_sum = 0u64;
+    for y in 0..frame.height {
+        for x in 0..50u32 {
+            let idx = ((y * frame.width + x) * 4) as usize;
+            left_sum += frame.data[idx] as u64 + frame.data[idx + 1] as u64 + frame.data[idx + 2] as u64;
+        }
+        for x in 150..frame.width {
+            let idx = ((y * frame.width + x) * 4) as usize;
+            right_sum += frame.data[idx] as u64 + frame.data[idx + 1] as u64 + frame.data[idx + 2] as u64;
+        }
+    }
+    let left_avg = left_sum as f64 / (50.0 * frame.height as f64 * 3.0);
+    let right_avg = right_sum as f64 / ((frame.width as f64 - 150.0) * frame.height as f64 * 3.0);
+
+    assert!(
+        left_avg < right_avg,
+        "Left side (offset area) should be darker than right: left={left_avg:.1}, right={right_avg:.1}"
+    );
+}
+
+#[test]
+fn test_render_no_effects_fast_path() {
+    // Verify that rendering without effects still works (fast path)
+    let dir = fixtures::fixture_dir();
+    let video_path = fixtures::generate_test_video(dir.path(), "no_fx_fast", 1.0);
+    let output_path = dir.path().join("output_no_fx_fast.mkv");
+
+    let asset = zeditor_media::probe::probe(&video_path).unwrap();
+    let (timeline, source_library) = single_clip_timeline(&asset, false);
+
+    let config = RenderConfig {
+        output_path: output_path.clone(),
+        width: 320,
+        height: 240,
+        canvas_width: 320,
+        canvas_height: 240,
+        fps: 30.0,
+        crf: 22,
+        preset: "superfast".to_string(),
+        scaling: ScalingAlgorithm::FastBilinear,
+    };
+
+    render_timeline(&timeline, &source_library, &config).unwrap();
+
+    assert!(output_path.exists());
+    let output_asset = zeditor_media::probe::probe(&output_path).unwrap();
+    assert_eq!(output_asset.width, 320);
+    assert_eq!(output_asset.height, 240);
 }

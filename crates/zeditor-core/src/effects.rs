@@ -2,9 +2,12 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 /// The type of effect applied to a clip.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum EffectType {
     Transform,
+    Grayscale,
+    Brightness,
+    Opacity,
 }
 
 impl EffectType {
@@ -12,6 +15,9 @@ impl EffectType {
     pub fn display_name(&self) -> &'static str {
         match self {
             Self::Transform => "Transform",
+            Self::Grayscale => "Grayscale",
+            Self::Brightness => "Brightness",
+            Self::Opacity => "Opacity",
         }
     }
 
@@ -38,12 +44,36 @@ impl EffectType {
                     },
                 },
             ],
+            Self::Grayscale => vec![],
+            Self::Brightness => vec![ParameterDefinition {
+                name: "brightness".to_string(),
+                label: "Brightness".to_string(),
+                param_type: ParameterType::Float {
+                    default: 0.0,
+                    min: -1.0,
+                    max: 1.0,
+                },
+            }],
+            Self::Opacity => vec![ParameterDefinition {
+                name: "opacity".to_string(),
+                label: "Opacity".to_string(),
+                param_type: ParameterType::Float {
+                    default: 1.0,
+                    min: 0.0,
+                    max: 1.0,
+                },
+            }],
         }
     }
 
     /// All built-in effect types.
     pub fn all_builtin() -> Vec<EffectType> {
-        vec![EffectType::Transform]
+        vec![
+            EffectType::Transform,
+            EffectType::Grayscale,
+            EffectType::Brightness,
+            EffectType::Opacity,
+        ]
     }
 }
 
@@ -124,25 +154,6 @@ impl EffectInstance {
     }
 }
 
-/// Resolved transform offset for rendering/preview.
-#[derive(Debug, Clone, Copy, PartialEq, Default)]
-pub struct ResolvedTransform {
-    pub x_offset: f64,
-    pub y_offset: f64,
-}
-
-/// Extract cumulative transform offsets from a list of effects.
-pub fn resolve_transform(effects: &[EffectInstance]) -> ResolvedTransform {
-    let mut result = ResolvedTransform::default();
-    for effect in effects {
-        if effect.effect_type == EffectType::Transform {
-            result.x_offset += effect.get_float("x_offset").unwrap_or(0.0);
-            result.y_offset += effect.get_float("y_offset").unwrap_or(0.0);
-        }
-    }
-    result
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -177,36 +188,6 @@ mod tests {
     }
 
     #[test]
-    fn test_resolve_transform_no_effects() {
-        let result = resolve_transform(&[]);
-        assert_eq!(result.x_offset, 0.0);
-        assert_eq!(result.y_offset, 0.0);
-    }
-
-    #[test]
-    fn test_resolve_transform_one_effect() {
-        let mut effect = EffectInstance::new(EffectType::Transform);
-        effect.set_float("x_offset", 50.0);
-        effect.set_float("y_offset", -30.0);
-        let result = resolve_transform(&[effect]);
-        assert_eq!(result.x_offset, 50.0);
-        assert_eq!(result.y_offset, -30.0);
-    }
-
-    #[test]
-    fn test_resolve_transform_additive_stacking() {
-        let mut e1 = EffectInstance::new(EffectType::Transform);
-        e1.set_float("x_offset", 10.0);
-        e1.set_float("y_offset", 20.0);
-        let mut e2 = EffectInstance::new(EffectType::Transform);
-        e2.set_float("x_offset", 30.0);
-        e2.set_float("y_offset", -5.0);
-        let result = resolve_transform(&[e1, e2]);
-        assert_eq!(result.x_offset, 40.0);
-        assert_eq!(result.y_offset, 15.0);
-    }
-
-    #[test]
     fn test_serde_roundtrip() {
         let mut effect = EffectInstance::new(EffectType::Transform);
         effect.set_float("x_offset", 123.456);
@@ -218,12 +199,46 @@ mod tests {
     #[test]
     fn test_effect_type_all_builtin() {
         let all = EffectType::all_builtin();
-        assert_eq!(all.len(), 1);
-        assert_eq!(all[0], EffectType::Transform);
+        assert_eq!(all.len(), 4);
+        assert!(all.contains(&EffectType::Transform));
+        assert!(all.contains(&EffectType::Grayscale));
+        assert!(all.contains(&EffectType::Brightness));
+        assert!(all.contains(&EffectType::Opacity));
     }
 
     #[test]
     fn test_effect_type_display_name() {
         assert_eq!(EffectType::Transform.display_name(), "Transform");
+        assert_eq!(EffectType::Grayscale.display_name(), "Grayscale");
+        assert_eq!(EffectType::Brightness.display_name(), "Brightness");
+        assert_eq!(EffectType::Opacity.display_name(), "Opacity");
+    }
+
+    #[test]
+    fn test_grayscale_no_params() {
+        let effect = EffectInstance::new(EffectType::Grayscale);
+        assert!(effect.parameters.is_empty());
+    }
+
+    #[test]
+    fn test_brightness_default() {
+        let effect = EffectInstance::new(EffectType::Brightness);
+        assert_eq!(effect.get_float("brightness"), Some(0.0));
+    }
+
+    #[test]
+    fn test_opacity_default() {
+        let effect = EffectInstance::new(EffectType::Opacity);
+        assert_eq!(effect.get_float("opacity"), Some(1.0));
+    }
+
+    #[test]
+    fn test_serde_roundtrip_all_types() {
+        for effect_type in EffectType::all_builtin() {
+            let effect = EffectInstance::new(effect_type);
+            let json = serde_json::to_string(&effect).unwrap();
+            let deserialized: EffectInstance = serde_json::from_str(&json).unwrap();
+            assert_eq!(effect, deserialized);
+        }
     }
 }

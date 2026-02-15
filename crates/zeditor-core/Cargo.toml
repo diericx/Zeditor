@@ -9,6 +9,7 @@ serde_json = { workspace = true }
 semver = { workspace = true }
 thiserror = { workspace = true }
 uuid = { workspace = true }
+rayon = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

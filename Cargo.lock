@@ -5682,6 +5682,7 @@ dependencies = [
 name = "zeditor-core"
 version = "0.1.0"
 dependencies = [
+ "rayon",
  "semver",
  "serde",
  "serde_json",

@@ -8,7 +8,8 @@ use iced::widget::{button, center, column, container, image, mouse_area, opaque,
 use iced::{event, keyboard, mouse, time, window, Background, Border, Color, Element, Event, Length, Padding, Point, Subscription, Task};
 use uuid::Uuid;
 
-use zeditor_core::effects::{self, EffectInstance, EffectType, ResolvedTransform};
+use zeditor_core::effects::{EffectInstance, EffectType};
+use zeditor_core::pipeline::{self, EffectContext, EffectRegistry, FrameBuffer};
 use zeditor_core::project::Project;
 use zeditor_core::timeline::{Clip, TimeRange, TimelinePosition, TrackType};
 
@@ -25,7 +26,7 @@ const PREVIEW_MAX_HEIGHT: u32 = 540;
 struct ClipDecodeInfo {
     path: PathBuf,
     time: f64,
-    transform: zeditor_core::effects::ResolvedTransform,
+    effects: Vec<EffectInstance>,
 }
 
 /// Request sent from UI to the decode thread.
@@ -95,7 +96,6 @@ pub struct App {
     pub confirm_dialog: Option<ConfirmDialog>,
     pub left_panel_tab: LeftPanelTab,
     pub track_context_menu: Option<TrackContextMenu>,
-    pub current_frame_transform: ResolvedTransform,
     decode_tx: Option<mpsc::Sender<DecodeRequest>>,
     pub(crate) decode_rx: Option<mpsc::Receiver<DecodedFrame>>,
     pub(crate) decode_clip_id: Option<Uuid>,
@@ -138,7 +138,6 @@ impl Default for App {
             confirm_dialog: None,
             left_panel_tab: LeftPanelTab::default(),
             track_context_menu: None,
-            current_frame_transform: ResolvedTransform::default(),
             decode_tx: None,
             decode_rx: None,
             decode_clip_id: None,
@@ -178,7 +177,6 @@ impl App {
         self.confirm_dialog = None;
         self.left_panel_tab = LeftPanelTab::default();
         self.track_context_menu = None;
-        self.current_frame_transform = ResolvedTransform::default();
         self.thumbnails.clear();
         self.drag_state = None;
         self.timeline_zoom = 100.0;
@@ -2198,8 +2196,6 @@ impl App {
                 let clip_tl_start = clip.timeline_range.start.as_secs_f64();
                 let clip_src_start = clip.source_range.start.as_secs_f64();
                 let source_time = clip_src_start + (playback_pos - clip_tl_start);
-                let transform = effects::resolve_transform(&clip.effects);
-
                 if let Some(asset) = self.project.source_library.get(clip.asset_id) {
                     if first_clip_id.is_none() {
                         first_clip_id = Some(clip.id);
@@ -2209,7 +2205,7 @@ impl App {
                     clip_infos.push(ClipDecodeInfo {
                         path: asset.path.clone(),
                         time: source_time,
-                        transform,
+                        effects: clip.effects.clone(),
                     });
                 }
             }
@@ -2219,7 +2215,6 @@ impl App {
             self.decode_clip_id = None;
             self.decode_clip_ids.clear();
             self.current_frame = None;
-            self.current_frame_transform = ResolvedTransform::default();
             self.pending_frame = None;
             self.send_decode_stop();
             return;
@@ -2227,7 +2222,6 @@ impl App {
 
         self.decode_clip_id = first_clip_id;
         self.decode_clip_ids = clip_ids;
-        self.current_frame_transform = ResolvedTransform::default(); // compositing done in worker
         self.decode_time_offset = first_time_offset;
 
         if let Some(tx) = &self.decode_tx {
@@ -2400,50 +2394,6 @@ pub fn rgb24_to_rgba32(rgb: &[u8], width: u32, height: u32) -> Vec<u8> {
     rgba
 }
 
-/// Composite a decoded RGBA frame onto a canvas-proportioned black buffer with transform offset.
-/// Returns (rgba_buffer, width, height) sized to fit within PREVIEW_MAX dimensions.
-#[allow(dead_code)]
-fn composite_frame_for_preview(
-    frame_rgba: &[u8],
-    frame_w: u32,
-    frame_h: u32,
-    canvas_w: u32,
-    canvas_h: u32,
-    transform: &zeditor_core::effects::ResolvedTransform,
-) -> (Vec<u8>, u32, u32) {
-    // Determine preview canvas size (fit canvas aspect ratio within PREVIEW_MAX).
-    let scale_x = PREVIEW_MAX_WIDTH as f64 / canvas_w as f64;
-    let scale_y = PREVIEW_MAX_HEIGHT as f64 / canvas_h as f64;
-    let preview_scale = scale_x.min(scale_y).min(1.0);
-    let pw = (canvas_w as f64 * preview_scale).round() as u32;
-    let ph = (canvas_h as f64 * preview_scale).round() as u32;
-
-    // Determine how the video frame fits inside the canvas (centered, aspect-fit).
-    let fit_scale_x = canvas_w as f64 / frame_w as f64;
-    let fit_scale_y = canvas_h as f64 / frame_h as f64;
-    let fit_scale = fit_scale_x.min(fit_scale_y);
-    let clip_w_canvas = (frame_w as f64 * fit_scale).round();
-    let clip_h_canvas = (frame_h as f64 * fit_scale).round();
-    let center_x_canvas = (canvas_w as f64 - clip_w_canvas) / 2.0;
-    let center_y_canvas = (canvas_h as f64 - clip_h_canvas) / 2.0;
-
-    // Apply transform offset (in canvas pixels) then convert to preview pixels.
-    let offset_x = ((center_x_canvas + transform.x_offset) * preview_scale).round() as i32;
-    let offset_y = ((center_y_canvas + transform.y_offset) * preview_scale).round() as i32;
-    let clip_w = (clip_w_canvas * preview_scale).round() as u32;
-    let clip_h = (clip_h_canvas * preview_scale).round() as u32;
-
-    // Black canvas.
-    let mut buf = vec![0u8; (pw * ph * 4) as usize];
-
-    // Blit the frame with nearest-neighbor scaling.
-    blit_rgba_scaled(
-        frame_rgba, frame_w, frame_h, &mut buf, pw, ph, offset_x, offset_y, clip_w, clip_h,
-    );
-
-    (buf, pw, ph)
-}
-
 /// Nearest-neighbor scale + blit RGBA pixels onto a destination buffer.
 /// Handles negative offsets and out-of-bounds clipping.
 pub fn blit_rgba_scaled(
@@ -2515,6 +2465,7 @@ fn decode_worker(
 ) {
     use zeditor_media::decoder::{FfmpegDecoder, VideoDecoder};
 
+    let registry = EffectRegistry::with_builtins();
     let mut decoders: HashMap<PathBuf, CachedDecoder> = HashMap::new();
     let mut running = false;
     let mut is_continuous = false;
@@ -2604,6 +2555,7 @@ fn decode_worker(
             multi_canvas_h,
             target_time,
             seeking_to_target,
+            &registry,
         );
         match result {
             Ok(Some(frame)) => {
@@ -2635,6 +2587,10 @@ fn decode_worker(
 /// Decode one frame from each clip and composite them into a single RGBA frame.
 /// Clips are ordered bottom-to-top (V1 first, VN last).
 /// Returns Ok(None) if all clips are at EOF.
+///
+/// Clips with effects go through the pixel pipeline (decode → canvas buffer →
+/// effects → alpha composite). Clips without effects use the fast path
+/// (decode → direct blit, same as before).
 fn decode_and_composite_multi(
     clips: &[ClipDecodeInfo],
     decoders: &mut HashMap<PathBuf, CachedDecoder>,
@@ -2642,6 +2598,7 @@ fn decode_and_composite_multi(
     canvas_h: u32,
     _target_time: f64,
     seeking: bool,
+    registry: &EffectRegistry,
 ) -> std::result::Result<Option<DecodedFrame>, ()> {
     // Determine preview canvas size (fit canvas aspect ratio within PREVIEW_MAX).
     let scale_x = PREVIEW_MAX_WIDTH as f64 / canvas_w as f64;
@@ -2650,10 +2607,20 @@ fn decode_and_composite_multi(
     let pw = (canvas_w as f64 * preview_scale).round() as u32;
     let ph = (canvas_h as f64 * preview_scale).round() as u32;
 
-    // Black canvas
-    let mut canvas = vec![0u8; (pw * ph * 4) as usize];
+    // Output canvas (black, opaque for background)
+    let mut canvas_buf = FrameBuffer::new(pw, ph);
+    // Fill with opaque black background
+    for pixel in canvas_buf.data.chunks_exact_mut(4) {
+        pixel[3] = 255;
+    }
     let mut any_decoded = false;
     let mut first_pts = 0.0_f64;
+
+    let ctx = EffectContext {
+        time_secs: _target_time,
+        frame_number: 0,
+        fps: 30.0,
+    };
 
     for (i, clip) in clips.iter().enumerate() {
         let cached = match decoders.get_mut(&clip.path) {
@@ -2681,32 +2648,47 @@ fn decode_and_composite_multi(
                 first_pts = frame.pts_secs;
             }
 
-            // Compute where this clip goes on the preview canvas
-            let fit_scale_x = canvas_w as f64 / frame.width as f64;
-            let fit_scale_y = canvas_h as f64 / frame.height as f64;
-            let fit_scale = fit_scale_x.min(fit_scale_y);
-            let clip_w_canvas = (frame.width as f64 * fit_scale).round();
-            let clip_h_canvas = (frame.height as f64 * fit_scale).round();
-            let center_x_canvas = (canvas_w as f64 - clip_w_canvas) / 2.0;
-            let center_y_canvas = (canvas_h as f64 - clip_h_canvas) / 2.0;
+            if clip.effects.is_empty() {
+                // Fast path: no effects, direct blit (opaque overwrite)
+                let fit_scale_x = canvas_w as f64 / frame.width as f64;
+                let fit_scale_y = canvas_h as f64 / frame.height as f64;
+                let fit_scale = fit_scale_x.min(fit_scale_y);
+                let clip_w_canvas = (frame.width as f64 * fit_scale).round();
+                let clip_h_canvas = (frame.height as f64 * fit_scale).round();
+                let center_x_canvas = (canvas_w as f64 - clip_w_canvas) / 2.0;
+                let center_y_canvas = (canvas_h as f64 - clip_h_canvas) / 2.0;
 
-            let offset_x = ((center_x_canvas + clip.transform.x_offset) * preview_scale).round() as i32;
-            let offset_y = ((center_y_canvas + clip.transform.y_offset) * preview_scale).round() as i32;
-            let clip_w = (clip_w_canvas * preview_scale).round() as u32;
-            let clip_h = (clip_h_canvas * preview_scale).round() as u32;
+                let offset_x = (center_x_canvas * preview_scale).round() as i32;
+                let offset_y = (center_y_canvas * preview_scale).round() as i32;
+                let clip_w = (clip_w_canvas * preview_scale).round() as u32;
+                let clip_h = (clip_h_canvas * preview_scale).round() as u32;
 
-            blit_rgba_scaled(
-                &frame.data, frame.width, frame.height,
-                &mut canvas, pw, ph,
-                offset_x, offset_y, clip_w, clip_h,
-            );
+                blit_rgba_scaled(
+                    &frame.data, frame.width, frame.height,
+                    &mut canvas_buf.data, pw, ph,
+                    offset_x, offset_y, clip_w, clip_h,
+                );
+            } else {
+                // Effect path: decode → pipeline (canvas buffer + effects) → composite
+                let clip_frame = FrameBuffer::from_rgba_vec(
+                    frame.width, frame.height, frame.data,
+                );
+                let result = pipeline::run_effect_pipeline(
+                    clip_frame, pw, ph, &clip.effects, registry, &ctx,
+                );
+                if result.may_have_transparency {
+                    pipeline::alpha_composite_rgba(&result.frame, &mut canvas_buf);
+                } else {
+                    pipeline::composite_opaque(&result.frame, &mut canvas_buf);
+                }
+            }
             any_decoded = true;
         }
     }
 
     if any_decoded {
         Ok(Some(DecodedFrame {
-            rgba: canvas,
+            rgba: canvas_buf.data,
             width: pw,
             height: ph,
             pts_secs: first_pts,

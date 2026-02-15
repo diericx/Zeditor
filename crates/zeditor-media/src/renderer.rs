@@ -9,8 +9,9 @@ use rsmpeg::ffi;
 use rsmpeg::swresample::SwrContext;
 use rsmpeg::swscale::SwsContext;
 
-use zeditor_core::effects::{self, EffectInstance, ResolvedTransform};
+use zeditor_core::effects::EffectInstance;
 use zeditor_core::media::SourceLibrary;
+use zeditor_core::pipeline::{self, EffectContext, EffectRegistry, FrameBuffer};
 use zeditor_core::project::ProjectSettings;
 use zeditor_core::timeline::{Timeline, TimelinePosition, TrackType};
 
@@ -307,6 +308,7 @@ fn encode_video_frames(
 ) -> Result<()> {
     let canvas_w = config.canvas_width;
     let canvas_h = config.canvas_height;
+    let registry = EffectRegistry::with_builtins();
 
     for frame_idx in 0..total_frames {
         let timeline_time = frame_idx as f64 / config.fps;
@@ -317,26 +319,78 @@ fn encode_video_frames(
         let yuv_frame = if all_clips.is_empty() {
             create_black_yuv_frame(width, height)?
         } else {
-            // Create a black canvas, then composite each clip bottom-to-top
-            let mut canvas = create_black_yuv_frame(width, height)?;
-            for (source_path, source_time, clip_effects) in &all_clips {
-                let transform = effects::resolve_transform(clip_effects);
-                let clip_frame = decode_and_scale_clip(
-                    source_path,
-                    *source_time,
-                    width,
-                    height,
-                    canvas_w,
-                    canvas_h,
-                    video_decoders,
-                    config.scaling.to_sws_flags(),
-                    &transform,
-                )?;
-                if let Some((scaled_frame, layout)) = clip_frame {
-                    blit_yuv_frame(&scaled_frame, &mut canvas, layout.clip_x, layout.clip_y);
+            let any_has_effects = all_clips.iter().any(|(_, _, effects)| !effects.is_empty());
+
+            if any_has_effects {
+                // Effect path: work in RGBA, run pipeline, convert to YUV at end
+                let ctx = EffectContext {
+                    time_secs: timeline_time,
+                    frame_number: frame_idx,
+                    fps: config.fps,
+                };
+
+                let mut canvas = FrameBuffer::new(width as u32, height as u32);
+                // Fill with opaque black background
+                for pixel in canvas.data.chunks_exact_mut(4) {
+                    pixel[3] = 255;
                 }
+
+                for (source_path, source_time, clip_effects) in &all_clips {
+                    let rgba_frame = decode_clip_to_rgba(
+                        source_path,
+                        *source_time,
+                        width as u32,
+                        height as u32,
+                        video_decoders,
+                    )?;
+                    if let Some(clip_frame) = rgba_frame {
+                        if clip_effects.is_empty() {
+                            // No effects: blit directly onto RGBA canvas
+                            let placed = pipeline::blit_clip_to_canvas(
+                                clip_frame, width as u32, height as u32,
+                            );
+                            pipeline::composite_opaque(&placed, &mut canvas);
+                        } else {
+                            // Run effect pipeline
+                            let result = pipeline::run_effect_pipeline(
+                                clip_frame,
+                                width as u32,
+                                height as u32,
+                                clip_effects,
+                                &registry,
+                                &ctx,
+                            );
+                            if result.may_have_transparency {
+                                pipeline::alpha_composite_rgba(&result.frame, &mut canvas);
+                            } else {
+                                pipeline::composite_opaque(&result.frame, &mut canvas);
+                            }
+                        }
+                    }
+                }
+
+                // Convert final RGBA canvas to YUV420P
+                rgba_framebuffer_to_yuv(&canvas)?
+            } else {
+                // Fast path: no effects on any clip, use YUV pipeline
+                let mut canvas = create_black_yuv_frame(width, height)?;
+                for (source_path, source_time, _clip_effects) in &all_clips {
+                    let clip_frame = decode_and_scale_clip(
+                        source_path,
+                        *source_time,
+                        width,
+                        height,
+                        canvas_w,
+                        canvas_h,
+                        video_decoders,
+                        config.scaling.to_sws_flags(),
+                    )?;
+                    if let Some((scaled_frame, layout)) = clip_frame {
+                        blit_yuv_frame(&scaled_frame, &mut canvas, layout.clip_x, layout.clip_y);
+                    }
+                }
+                canvas
             }
-            canvas
         };
 
         let mut frame = yuv_frame;
@@ -353,36 +407,6 @@ fn encode_video_frames(
     Ok(())
 }
 
-/// Decode a raw video frame from source and compose it onto a canvas at render dimensions.
-///
-/// The source is scaled to fit within the project canvas (preserving aspect ratio),
-/// centered, then the canvas is mapped onto the render output.
-#[allow(dead_code)]
-fn decode_and_convert_video_frame(
-    source_path: &Path,
-    source_time: f64,
-    render_w: i32,
-    render_h: i32,
-    canvas_w: u32,
-    canvas_h: u32,
-    decoders: &mut HashMap<PathBuf, CachedVideoDecoder>,
-    sws_flags: ffi::SwsFlags,
-    transform: &ResolvedTransform,
-) -> Result<AVFrame> {
-    let clip_frame = decode_and_scale_clip(
-        source_path, source_time, render_w, render_h, canvas_w, canvas_h,
-        decoders, sws_flags, transform,
-    )?;
-    match clip_frame {
-        Some((scaled_frame, layout)) => {
-            let mut canvas = create_black_yuv_frame(render_w, render_h)?;
-            blit_yuv_frame(&scaled_frame, &mut canvas, layout.clip_x, layout.clip_y);
-            Ok(canvas)
-        }
-        None => create_black_yuv_frame(render_w, render_h),
-    }
-}
-
 /// Decode and scale a video frame from source, returning the scaled/rotated frame
 /// and its canvas layout. Returns None if no frame is available (EOF).
 fn decode_and_scale_clip(
@@ -394,7 +418,6 @@ fn decode_and_scale_clip(
     canvas_h: u32,
     decoders: &mut HashMap<PathBuf, CachedVideoDecoder>,
     sws_flags: ffi::SwsFlags,
-    transform: &ResolvedTransform,
 ) -> Result<Option<(AVFrame, CanvasLayout)>> {
     let path_key = source_path.to_path_buf();
 
@@ -446,7 +469,7 @@ fn decode_and_scale_clip(
                     };
 
                     // Compute canvas layout for this source using display dimensions
-                    let mut layout = compute_canvas_layout(
+                    let layout = compute_canvas_layout(
                         display_w,
                         display_h,
                         canvas_w,
@@ -454,12 +477,6 @@ fn decode_and_scale_clip(
                         render_w as u32,
                         render_h as u32,
                     );
-
-                    // Apply transform offset (in canvas pixels, scaled to render pixels)
-                    let canvas_scale = (render_w as f64 / canvas_w.max(1) as f64)
-                        .min(render_h as f64 / canvas_h.max(1) as f64);
-                    layout.clip_x += (transform.x_offset * canvas_scale) as i32 & !1;
-                    layout.clip_y += (transform.y_offset * canvas_scale) as i32 & !1;
 
                     // For rotated video, we need to scale to pre-rotation
                     // clip dimensions (swapped), then rotate after scaling.
@@ -513,6 +530,119 @@ fn decode_and_scale_clip(
         }
     }
 }
+
+/// Decode a clip to RGBA FrameBuffer for the pixel effect pipeline.
+/// Uses the decoder's built-in RGBA scaling. Returns None if at EOF.
+fn decode_clip_to_rgba(
+    source_path: &Path,
+    source_time: f64,
+    max_w: u32,
+    max_h: u32,
+    decoders: &mut HashMap<PathBuf, CachedVideoDecoder>,
+) -> Result<Option<FrameBuffer>> {
+    let path_key = source_path.to_path_buf();
+
+    // Open or reuse decoder
+    if !decoders.contains_key(&path_key) {
+        let decoder = FfmpegDecoder::open(source_path)?;
+        let rotation = decoder.stream_info().rotation;
+        decoders.insert(
+            path_key.clone(),
+            CachedVideoDecoder {
+                decoder,
+                last_pts: -1.0,
+                sws_ctx: None,
+                rotation,
+            },
+        );
+    }
+
+    let cached = decoders.get_mut(&path_key).unwrap();
+
+    // Seek if needed
+    let needs_seek = source_time < cached.last_pts
+        || (source_time - cached.last_pts) > 2.0
+        || cached.last_pts < 0.0;
+
+    if needs_seek {
+        cached.decoder.seek_to(source_time)?;
+        cached.last_pts = -1.0;
+        cached.sws_ctx = None;
+    }
+
+    // Decode frames until we get one at or past the target time
+    loop {
+        match cached.decoder.decode_next_frame_rgba_scaled(max_w, max_h)? {
+            Some(frame) => {
+                cached.last_pts = frame.pts_secs;
+                if frame.pts_secs >= source_time - 0.05 {
+                    return Ok(Some(FrameBuffer::from_rgba_vec(
+                        frame.width, frame.height, frame.data,
+                    )));
+                }
+                // Skip pre-target frames
+            }
+            None => return Ok(None),
+        }
+    }
+}
+
+/// Convert an RGBA FrameBuffer to a YUV420P AVFrame using SWS.
+fn rgba_framebuffer_to_yuv(fb: &FrameBuffer) -> Result<AVFrame> {
+    let w = fb.width as i32;
+    let h = fb.height as i32;
+
+    // Create SWS context: RGBA → YUV420P
+    let mut sws = SwsContext::get_context(
+        w,
+        h,
+        ffi::AV_PIX_FMT_RGBA,
+        w,
+        h,
+        ffi::AV_PIX_FMT_YUV420P,
+        ffi::SWS_FAST_BILINEAR,
+        None,
+        None,
+        None,
+    )
+    .ok_or_else(|| MediaError::EncoderError("Failed to create RGBA→YUV SWS context".into()))?;
+
+    // Create source AVFrame from RGBA data
+    let mut src_frame = AVFrame::new();
+    src_frame.set_width(w);
+    src_frame.set_height(h);
+    src_frame.set_format(ffi::AV_PIX_FMT_RGBA);
+    unsafe {
+        ffi::av_frame_get_buffer(src_frame.as_mut_ptr(), 0);
+        // Copy RGBA data into the AVFrame
+        let linesize = (*src_frame.as_ptr()).linesize[0] as usize;
+        let src_stride = fb.width as usize * 4;
+        let dst_ptr = (*src_frame.as_mut_ptr()).data[0] as *mut u8;
+        for row in 0..fb.height as usize {
+            std::ptr::copy_nonoverlapping(
+                fb.data.as_ptr().add(row * src_stride),
+                dst_ptr.add(row * linesize),
+                src_stride,
+            );
+        }
+    }
+
+    // Create destination YUV420P frame
+    let mut dst_frame = AVFrame::new();
+    dst_frame.set_width(w);
+    dst_frame.set_height(h);
+    dst_frame.set_format(ffi::AV_PIX_FMT_YUV420P);
+    unsafe {
+        ffi::av_frame_get_buffer(dst_frame.as_mut_ptr(), 0);
+    }
+
+    // Scale (convert) RGBA → YUV420P
+    sws.scale_frame(&src_frame, 0, h, &mut dst_frame)
+        .map_err(|e| MediaError::EncoderError(format!("RGBA→YUV conversion failed: {e}")))?;
+
+    Ok(dst_frame)
+}
+
 
 // =============================================================================
 // Audio encoding — offline clip-at-a-time rendering with sequential decode
