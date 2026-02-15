@@ -10,4 +10,10 @@ At a lower level produce some granular metrics about how much time was spent in 
 
 If you can, and if you think this would help, record this info per frame so we can see a line graph over time of the performance and potentially identify moments in the timeline that are causing slowdowns.
 
-Produce this report however you see best
+Produce this report however you see best but it should be at some level, or some planned way, human readable.
+
+Document how I can produce charts and view averages of these reports.
+
+Enable profiling with an environment variable, default to off.
+
+Default profile file location is next to render file but can be set to a static folder with an env variable.
