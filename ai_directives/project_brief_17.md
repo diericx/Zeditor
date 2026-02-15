@@ -1,6 +1,6 @@
 # Rendering Profiling and Feedback
 
-We are currently having some render time issues and what I would first like us to do is get some feedback.
+We are currently having some render runtime issues (taking too long) and what I would first like us to do is get some solid data on this issue.
 
 Implement profiling that will give us insight into what areas of the render pipeline are taking the longest.
 
