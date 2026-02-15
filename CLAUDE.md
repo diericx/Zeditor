@@ -8,7 +8,7 @@ Zeditor is a video editor built in Rust, aiming to become feature-complete like 
 
 ## Agent Directives
 
-- Read all project briefs before each task
+- Read only the briefs relevant to your current task — use `ai_directives/INDEX.md` to find them
 - Test Driven Development
   - Any new feature developed should have tests such that an AI agent can validate the ENTIRETY of a new feature. If you cannot write a test for the feature end to end to confirm it is working, stop and focus on that.
 - Fault Tolerance
@@ -23,7 +23,7 @@ Zeditor is a video editor built in Rust, aiming to become feature-complete like 
 ## Build & Test Commands
 
 ```bash
-cargo test --workspace              # Run all tests (~137 tests)
+cargo test --workspace              # Run all tests (~362 tests)
 cargo test -p zeditor-core          # Core domain logic tests only
 cargo test -p zeditor-media         # FFmpeg integration tests only
 cargo test -p zeditor-ui            # UI tests (message-level, simulator, canvas)
@@ -110,6 +110,7 @@ iced 0.14 Elm-architecture GUI. Entry point: `iced::application(App::boot, App::
 - **Cross-platform**: Target Arch Linux + FFmpeg 8 now, keep cross-platform in mind.
 - **Code scalability**: Build for iterative scope expansion.
 - **Codified changes**: Append execution logs to the bottom of brief files when executing them.
+- **File size**: Keep source files under 500 lines. Split into submodules when a file exceeds this.
 
 ## Rust Edition & Toolchain
 
