@@ -447,27 +447,24 @@ pub fn alpha_composite_rgba(src: &FrameBuffer, dst: &mut FrameBuffer) {
             let src_row = &src_data[src_start..src_start + row_bytes];
 
             for i in (0..row_bytes).step_by(4) {
-                let sa = src_row[i + 3];
+                let sa = src_row[i + 3] as u32;
                 if sa == 255 {
                     // Fully opaque source — just copy
                     dst_row[i..i + 4].copy_from_slice(&src_row[i..i + 4]);
                 } else if sa > 0 {
-                    let sa_f = sa as f32 * (1.0 / 255.0);
-                    let inv_sa = 1.0 - sa_f;
-                    let da_f = dst_row[i + 3] as f32 * (1.0 / 255.0);
-                    let out_a = sa_f + da_f * inv_sa;
-                    if out_a > 0.0 {
-                        let inv_out_a = 1.0 / out_a;
-                        dst_row[i] = ((src_row[i] as f32 * sa_f
-                            + dst_row[i] as f32 * da_f * inv_sa)
-                            * inv_out_a + 0.5) as u8;
-                        dst_row[i + 1] = ((src_row[i + 1] as f32 * sa_f
-                            + dst_row[i + 1] as f32 * da_f * inv_sa)
-                            * inv_out_a + 0.5) as u8;
-                        dst_row[i + 2] = ((src_row[i + 2] as f32 * sa_f
-                            + dst_row[i + 2] as f32 * da_f * inv_sa)
-                            * inv_out_a + 0.5) as u8;
-                        dst_row[i + 3] = (out_a * 255.0 + 0.5) as u8;
+                    let da = dst_row[i + 3] as u32;
+                    let inv_sa = 255 - sa;
+                    // out_a = sa + da * (1 - sa/255), scaled to 0..255
+                    let out_a = sa + ((da * inv_sa + 127) / 255);
+                    if out_a > 0 {
+                        for c in 0..3 {
+                            let sc = src_row[i + c] as u32;
+                            let dc = dst_row[i + c] as u32;
+                            // Porter-Duff: (sc * sa + dc * da * inv_sa / 255) / out_a
+                            let num = sc * sa + ((dc * da * inv_sa + 127) / 255);
+                            dst_row[i + c] = ((num + out_a / 2) / out_a).min(255) as u8;
+                        }
+                        dst_row[i + 3] = out_a.min(255) as u8;
                     }
                 }
                 // sa == 0: fully transparent source, dst unchanged

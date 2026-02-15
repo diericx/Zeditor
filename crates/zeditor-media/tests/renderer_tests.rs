@@ -270,8 +270,8 @@ fn test_derive_render_config_from_asset() {
     assert_eq!(config.height, 1080);
     assert_eq!(config.canvas_width, 1920);
     assert_eq!(config.canvas_height, 1080);
-    // FPS should be derived from source (~25fps for testsrc)
-    assert!(config.fps > 0.0, "FPS should be derived from source");
+    // FPS should always use project settings (default 30.0)
+    assert_eq!(config.fps, 30.0);
     assert_eq!(config.scaling, ScalingAlgorithm::Lanczos);
     assert_eq!(config.output_path, output_path);
 }
@@ -386,8 +386,26 @@ fn test_derive_render_config_preserves_1080p_with_any_source() {
     assert_eq!(config.canvas_width, 1920);
     assert_eq!(config.canvas_height, 1080);
     assert_eq!(config.scaling, ScalingAlgorithm::Lanczos);
-    // FPS should be derived from the source asset
-    assert!(config.fps > 0.0, "FPS should be derived from source");
+    // FPS should always use project settings (default 30.0)
+    assert_eq!(config.fps, 30.0);
+}
+
+#[test]
+fn test_derive_render_config_uses_project_fps_not_source() {
+    let dir = fixtures::fixture_dir();
+    let video_path = fixtures::generate_test_video(dir.path(), "derive_fps", 1.0);
+
+    let asset = zeditor_media::probe::probe(&video_path).unwrap();
+    let (timeline, source_library) = single_clip_timeline(&asset, false);
+    let output_path = PathBuf::from("/tmp/derive_fps_output.mkv");
+
+    // Set project fps to 24.0 — config should use this, not the source fps
+    let settings = ProjectSettings {
+        fps: 24.0,
+        ..ProjectSettings::default()
+    };
+    let config = derive_render_config(&timeline, &source_library, &settings, output_path);
+    assert_eq!(config.fps, 24.0, "Should use project fps, not source fps");
 }
 
 // =============================================================================

@@ -76,10 +76,10 @@ impl RenderConfig {
 
 /// Derive render config from timeline content and project settings.
 /// Uses the project canvas dimensions for both canvas and render output,
-/// and derives FPS from the first video clip's source (to avoid temporal artifacts).
+/// and always respects the project FPS setting.
 pub fn derive_render_config(
-    timeline: &Timeline,
-    source_library: &SourceLibrary,
+    _timeline: &Timeline,
+    _source_library: &SourceLibrary,
     settings: &ProjectSettings,
     output_path: PathBuf,
 ) -> RenderConfig {
@@ -89,20 +89,6 @@ pub fn derive_render_config(
     config.width = settings.canvas_width;
     config.height = settings.canvas_height;
     config.fps = settings.fps;
-
-    // Override FPS from first source clip if available (to avoid temporal artifacts)
-    for track in &timeline.tracks {
-        if track.track_type == TrackType::Video {
-            if let Some(clip) = track.clips.first() {
-                if let Some(asset) = source_library.get(clip.asset_id) {
-                    if asset.fps > 0.0 {
-                        config.fps = asset.fps;
-                    }
-                    return config;
-                }
-            }
-        }
-    }
     config
 }
 
@@ -115,6 +101,11 @@ struct CachedVideoDecoder {
     sws_ctx: Option<SwsContext>,
     /// Rotation in degrees (0, 90, 180, 270) from stream metadata.
     rotation: u32,
+    /// Source FPS for frame dedup threshold calculation.
+    source_fps: f64,
+    /// Last decoded RGBA frame + its PTS, used to skip redundant decodes when
+    /// consecutive render frames map to the same source frame.
+    last_rgba_frame: Option<(FrameBuffer, f64)>,
 }
 
 const OUTPUT_SAMPLE_RATE: i32 = 48000;
@@ -701,14 +692,16 @@ fn decode_and_scale_clip(
     // Open or reuse decoder
     if !decoders.contains_key(&path_key) {
         let decoder = FfmpegDecoder::open(source_path)?;
-        let rotation = decoder.stream_info().rotation;
+        let info = decoder.stream_info();
         decoders.insert(
             path_key.clone(),
             CachedVideoDecoder {
                 decoder,
                 last_pts: -1.0,
                 sws_ctx: None,
-                rotation,
+                rotation: info.rotation,
+                source_fps: info.fps,
+                last_rgba_frame: None,
             },
         );
     }
@@ -723,8 +716,9 @@ fn decode_and_scale_clip(
     if needs_seek {
         cached.decoder.seek_to(source_time)?;
         cached.last_pts = -1.0;
-        // Invalidate SWS context in case source format changed after seek
+        // Invalidate caches in case source format changed after seek
         cached.sws_ctx = None;
+        cached.last_rgba_frame = None;
     }
 
     // Decode raw frames until we get one at or past the target time
@@ -822,19 +816,33 @@ fn decode_clip_to_rgba(
     // Open or reuse decoder
     if !decoders.contains_key(&path_key) {
         let decoder = FfmpegDecoder::open(source_path)?;
-        let rotation = decoder.stream_info().rotation;
+        let info = decoder.stream_info();
         decoders.insert(
             path_key.clone(),
             CachedVideoDecoder {
                 decoder,
                 last_pts: -1.0,
                 sws_ctx: None,
-                rotation,
+                rotation: info.rotation,
+                source_fps: info.fps,
+                last_rgba_frame: None,
             },
         );
     }
 
     let cached = decoders.get_mut(&path_key).unwrap();
+
+    // Check frame cache: if source_time maps to the same source frame, reuse it
+    if let Some((ref cached_frame, cached_pts)) = cached.last_rgba_frame {
+        let threshold = if cached.source_fps > 0.0 {
+            0.5 / cached.source_fps
+        } else {
+            0.016 // ~60fps fallback
+        };
+        if (source_time - cached_pts).abs() < threshold {
+            return Ok(Some(cached_frame.clone()));
+        }
+    }
 
     // Seek if needed
     let needs_seek = source_time < cached.last_pts
@@ -845,6 +853,7 @@ fn decode_clip_to_rgba(
         cached.decoder.seek_to(source_time)?;
         cached.last_pts = -1.0;
         cached.sws_ctx = None;
+        cached.last_rgba_frame = None;
     }
 
     // Decode frames until we get one at or past the target time
@@ -853,9 +862,11 @@ fn decode_clip_to_rgba(
             Some(frame) => {
                 cached.last_pts = frame.pts_secs;
                 if frame.pts_secs >= source_time - 0.05 {
-                    return Ok(Some(FrameBuffer::from_rgba_vec(
+                    let fb = FrameBuffer::from_rgba_vec(
                         frame.width, frame.height, frame.data,
-                    )));
+                    );
+                    cached.last_rgba_frame = Some((fb.clone(), frame.pts_secs));
+                    return Ok(Some(fb));
                 }
                 // Skip pre-target frames
             }
