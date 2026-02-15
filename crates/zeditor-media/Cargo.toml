@@ -7,7 +7,10 @@ edition = "2024"
 zeditor-core = { path = "../zeditor-core" }
 rsmpeg = { version = "0.18", features = ["link_system_ffmpeg", "ffmpeg8"] }
 thiserror = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
 
 [dev-dependencies]
 zeditor-test-harness = { path = "../zeditor-test-harness" }
 tempfile = { workspace = true }
+serde_json = { workspace = true }

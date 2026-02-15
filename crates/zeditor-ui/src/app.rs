@@ -113,6 +113,13 @@ pub struct App {
     pub(crate) audio_decode_rx: Option<mpsc::Receiver<DecodedAudio>>,
     pub(crate) audio_decode_clip_id: Option<Uuid>,
     pub(crate) audio_decode_time_offset: f64,
+    // Render progress state
+    pub is_rendering: bool,
+    render_progress_rx: Option<mpsc::Receiver<zeditor_media::render_profile::RenderProgress>>,
+    pub render_current_frame: u64,
+    pub render_total_frames: u64,
+    pub render_elapsed: Duration,
+    pub render_start: Option<Instant>,
 }
 
 impl Default for App {
@@ -150,6 +157,12 @@ impl Default for App {
             audio_decode_rx: None,
             audio_decode_clip_id: None,
             audio_decode_time_offset: 0.0,
+            is_rendering: false,
+            render_progress_rx: None,
+            render_current_frame: 0,
+            render_total_frames: 0,
+            render_elapsed: Duration::ZERO,
+            render_start: None,
         }
     }
 }
@@ -764,6 +777,33 @@ impl App {
                 // Drain decoded frames from the channels
                 self.poll_decoded_frame();
                 self.poll_decoded_audio();
+
+                // Poll render progress if rendering
+                if self.is_rendering {
+                    if let Some(ref rx) = self.render_progress_rx {
+                        while let Ok(progress) = rx.try_recv() {
+                            self.render_current_frame = progress.current_frame;
+                            self.render_total_frames = progress.total_frames;
+                            self.render_elapsed = progress.elapsed;
+                        }
+                        if self.render_total_frames > 0 {
+                            let pct = self.render_current_frame as f64
+                                / self.render_total_frames as f64
+                                * 100.0;
+                            let elapsed = self.render_elapsed.as_secs();
+                            let mins = elapsed / 60;
+                            let secs = elapsed % 60;
+                            self.status_message = format!(
+                                "Rendering: {}/{} frames ({:.1}%) | Elapsed: {}:{:02}",
+                                self.render_current_frame,
+                                self.render_total_frames,
+                                pct,
+                                mins,
+                                secs,
+                            );
+                        }
+                    }
+                }
                 Task::none()
             }
             Message::SeekTo(pos) => {
@@ -965,12 +1005,22 @@ impl App {
                             &self.project.settings,
                             path,
                         );
+                        // Create a progress channel for render progress updates
+                        let (ptx, prx) = std::sync::mpsc::channel();
+                        self.is_rendering = true;
+                        self.render_start = Some(Instant::now());
+                        self.render_current_frame = 0;
+                        self.render_total_frames = 0;
+                        self.render_elapsed = Duration::ZERO;
+                        self.render_progress_rx = Some(prx);
+
                         Task::perform(
                             async move {
                                 zeditor_media::renderer::render_timeline(
                                     &timeline,
                                     &source_library,
                                     &config,
+                                    Some(ptx),
                                 )
                                 .map(|()| config.output_path.clone())
                                 .map_err(|e| format!("{e}"))
@@ -988,11 +1038,29 @@ impl App {
                 }
             }
             Message::RenderComplete(path) => {
-                self.status_message = format!("Rendered to {}", path.display());
+                let total_time = self
+                    .render_start
+                    .map(|s| s.elapsed())
+                    .unwrap_or_default();
+                let total_secs = total_time.as_secs();
+                let total_ms = total_time.subsec_millis();
+                self.status_message = format!(
+                    "Rendered to {} | Total time: {}:{:02}.{:03}",
+                    path.display(),
+                    total_secs / 60,
+                    total_secs % 60,
+                    total_ms,
+                );
+                self.is_rendering = false;
+                self.render_progress_rx = None;
+                self.render_start = None;
                 Task::none()
             }
             Message::RenderError(msg) => {
                 self.status_message = format!("Render failed: {msg}");
+                self.is_rendering = false;
+                self.render_progress_rx = None;
+                self.render_start = None;
                 Task::none()
             }
             Message::MenuButtonClicked(id) => {
@@ -1224,27 +1292,93 @@ impl App {
         .size(14);
 
         // System message status bar (bottom of window)
-        let status_message = if self.status_message.is_empty() {
-            "No system messages"
+        let status_bar: Element<'_, Message> = if self.is_rendering && self.render_total_frames > 0
+        {
+            let pct = self.render_current_frame as f64
+                / self.render_total_frames as f64
+                * 100.0;
+            let elapsed = self.render_elapsed.as_secs();
+            let mins = elapsed / 60;
+            let secs = elapsed % 60;
+            let progress_text = format!(
+                "Rendering: {}/{} frames ({:.1}%) | Elapsed: {}:{:02}",
+                self.render_current_frame, self.render_total_frames, pct, mins, secs,
+            );
+
+            let pct_frac = (pct / 100.0).min(1.0) as f32;
+
+            let bar = container(
+                row![
+                    // Green progress fill
+                    container(Space::new().height(4))
+                        .width(Length::FillPortion((pct_frac * 1000.0) as u16))
+                        .style(|_theme| container::Style {
+                            background: Some(Background::Color(Color::from_rgb(
+                                0.2, 0.8, 0.3,
+                            ))),
+                            ..Default::default()
+                        }),
+                    // Empty portion
+                    container(Space::new().height(4))
+                        .width(Length::FillPortion(
+                            ((1.0 - pct_frac) * 1000.0) as u16,
+                        ))
+                        .style(|_theme| container::Style {
+                            background: Some(Background::Color(Color::from_rgb(
+                                0.3, 0.3, 0.33,
+                            ))),
+                            ..Default::default()
+                        }),
+                ]
+                .width(Length::Fill),
+            )
+            .width(Length::Fill);
+
+            container(
+                column![
+                    text(progress_text)
+                        .size(13)
+                        .color(Color::from_rgb(1.0, 0.9, 0.3)),
+                    bar,
+                ]
+                .spacing(2),
+            )
+            .padding([4, 8])
+            .width(Length::Fill)
+            .style(|_theme| container::Style {
+                background: Some(Background::Color(Color::from_rgb(0.18, 0.18, 0.20))),
+                border: Border {
+                    color: Color::from_rgb(0.15, 0.15, 0.17),
+                    width: 1.0,
+                    radius: 0.0.into(),
+                },
+                ..Default::default()
+            })
+            .into()
         } else {
-            &self.status_message
+            let status_message = if self.status_message.is_empty() {
+                "No system messages"
+            } else {
+                &self.status_message
+            };
+            container(
+                text(status_message)
+                    .size(13)
+                    .color(Color::from_rgb(0.7, 0.7, 0.7)),
+            )
+            .padding([4, 8])
+            .width(Length::Fill)
+            .style(|_theme| container::Style {
+                background: Some(Background::Color(Color::from_rgb(0.18, 0.18, 0.20))),
+                border: Border {
+                    color: Color::from_rgb(0.15, 0.15, 0.17),
+                    width: 1.0,
+                    radius: 0.0.into(),
+                },
+                ..Default::default()
+            })
+            .into()
         };
-        let status_bar = container(
-            text(status_message)
-                .size(13)
-                .color(Color::from_rgb(0.7, 0.7, 0.7))
-        )
-        .padding([4, 8])
-        .width(Length::Fill)
-        .style(|_theme| container::Style {
-            background: Some(Background::Color(Color::from_rgb(0.18, 0.18, 0.20))),
-            border: Border {
-                color: Color::from_rgb(0.15, 0.15, 0.17),
-                width: 1.0,
-                radius: 0.0.into(),
-            },
-            ..Default::default()
-        });
 
         let top_row = row![source_panel, video_viewport].spacing(4);
 

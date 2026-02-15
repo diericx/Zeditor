@@ -136,6 +136,73 @@ zeditor-test-harness  Dev-only test builders and fixture generation
 | Ctrl+Shift+Z | Redo |
 | Space | Play/Pause |
 
+## Render Profiling
+
+Zeditor includes a render profiling system that records per-stage and per-frame timing data as JSON.
+
+### Environment Variables
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `ZEDITOR_PROFILE` | off | Set to `1` or `true` to enable profiling |
+| `ZEDITOR_PROFILE_DIR` | next to render output | Directory for profile JSON files |
+
+### Usage
+
+```bash
+# Enable profiling for a render
+ZEDITOR_PROFILE=1 cargo run --release -p zeditor-ui --bin zeditor
+
+# Write profiles to a specific directory
+ZEDITOR_PROFILE=1 ZEDITOR_PROFILE_DIR=/tmp/profiles cargo run --release -p zeditor-ui --bin zeditor
+```
+
+The profile is saved as `<render_output>.profile.json` (e.g., `output.mkv.profile.json`).
+
+### Profile Format
+
+The JSON file contains:
+- `config` — render config snapshot (resolution, fps, codec settings)
+- `stages` — high-level stage timings: setup, video encode, audio encode, flush, write trailer (ms)
+- `frames[]` — per-frame breakdown: find_clips, decode, effects, composite, color_convert, encode (ms)
+- Summary stats: `avg_frame_ms`, `median_frame_ms`, `p95_frame_ms`, `max_frame_ms`, `slowest_frame_index`
+
+### Quick Analysis with jq
+
+```bash
+# Summary stats
+cat output.mkv.profile.json | jq '{total_secs: .total_duration_secs, frames: .total_frames, avg_ms: .avg_frame_ms, p95_ms: .p95_frame_ms, max_ms: .max_frame_ms, slowest_frame: .slowest_frame_index}'
+
+# Stage breakdown
+cat output.mkv.profile.json | jq '.stages'
+
+# Find frames slower than 100ms
+cat output.mkv.profile.json | jq '[.frames[] | select(.total_ms > 100)] | length'
+
+# Per-frame decode vs encode time
+cat output.mkv.profile.json | jq '.frames[] | {frame: .frame_index, decode: .decode_ms, encode: .encode_ms, effects: .effects_ms}'
+
+# Top 10 slowest frames
+cat output.mkv.profile.json | jq '[.frames | sort_by(-.total_ms)[:10][] | {frame: .frame_index, time_ms: .total_ms, clips: .clip_count, effects: .used_effects_path}]'
+```
+
+### Visualization with Python
+
+Requires `matplotlib` (`pip install matplotlib`).
+
+```bash
+# Analyze a profile and generate charts
+python scripts/analyze_profile.py output.mkv.profile.json
+
+# Save charts to a specific directory
+python scripts/analyze_profile.py output.mkv.profile.json --output-dir /tmp/charts
+```
+
+This prints a summary to stdout and saves three PNGs:
+- `render_timeline.png` — per-frame timing breakdown (line graph)
+- `render_stages.png` — time by pipeline stage (pie chart)
+- `render_heatmap.png` — per-frame sub-stage heatmap
+
 ## Troubleshooting
 
 **`ffmpeg` not found / wrong version**

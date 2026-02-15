@@ -73,7 +73,7 @@ fn test_render_single_clip() {
         scaling: ScalingAlgorithm::Lanczos,
     };
 
-    render_timeline(&timeline, &source_library, &config).unwrap();
+    render_timeline(&timeline, &source_library, &config, None).unwrap();
 
     // Verify output exists and is non-empty
     assert!(output_path.exists(), "Output file should exist");
@@ -131,7 +131,7 @@ fn test_render_with_gap() {
         scaling: ScalingAlgorithm::Lanczos,
     };
 
-    render_timeline(&timeline, &source_library, &config).unwrap();
+    render_timeline(&timeline, &source_library, &config, None).unwrap();
 
     assert!(output_path.exists());
     let output_asset = zeditor_media::probe::probe(&output_path).unwrap();
@@ -197,7 +197,7 @@ fn test_render_multiple_clips() {
         scaling: ScalingAlgorithm::Lanczos,
     };
 
-    render_timeline(&timeline, &source_library, &config).unwrap();
+    render_timeline(&timeline, &source_library, &config, None).unwrap();
 
     assert!(output_path.exists());
     let output_asset = zeditor_media::probe::probe(&output_path).unwrap();
@@ -233,7 +233,7 @@ fn test_render_with_audio() {
         scaling: ScalingAlgorithm::Lanczos,
     };
 
-    render_timeline(&timeline, &source_library, &config).unwrap();
+    render_timeline(&timeline, &source_library, &config, None).unwrap();
 
     assert!(output_path.exists());
     let output_asset = zeditor_media::probe::probe(&output_path).unwrap();
@@ -250,7 +250,7 @@ fn test_render_empty_timeline() {
     let source_library = SourceLibrary::new();
 
     let config = RenderConfig::default_with_path(output_path);
-    let result = render_timeline(&timeline, &source_library, &config);
+    let result = render_timeline(&timeline, &source_library, &config, None);
     assert!(result.is_err(), "Empty timeline should produce an error");
 }
 
@@ -314,7 +314,7 @@ fn test_render_upscale_to_1080p() {
         scaling: ScalingAlgorithm::Lanczos,
     };
 
-    render_timeline(&timeline, &source_library, &config).unwrap();
+    render_timeline(&timeline, &source_library, &config, None).unwrap();
 
     let output_asset = zeditor_media::probe::probe(&output_path).unwrap();
     assert_eq!(output_asset.width, 1920);
@@ -353,7 +353,7 @@ fn test_render_upscale_with_audio() {
         scaling: ScalingAlgorithm::Lanczos,
     };
 
-    render_timeline(&timeline, &source_library, &config).unwrap();
+    render_timeline(&timeline, &source_library, &config, None).unwrap();
 
     let output_asset = zeditor_media::probe::probe(&output_path).unwrap();
     assert_eq!(output_asset.width, 1920);
@@ -466,7 +466,7 @@ fn test_render_canvas_composition() {
         scaling: ScalingAlgorithm::Lanczos,
     };
 
-    render_timeline(&timeline, &source_library, &config).unwrap();
+    render_timeline(&timeline, &source_library, &config, None).unwrap();
 
     let output_asset = zeditor_media::probe::probe(&output_path).unwrap();
     assert_eq!(output_asset.width, 1920);
@@ -504,7 +504,7 @@ fn test_render_canvas_downscale() {
         scaling: ScalingAlgorithm::Lanczos,
     };
 
-    render_timeline(&timeline, &source_library, &config).unwrap();
+    render_timeline(&timeline, &source_library, &config, None).unwrap();
 
     let output_asset = zeditor_media::probe::probe(&output_path).unwrap();
     assert_eq!(output_asset.width, 1280);
@@ -542,7 +542,7 @@ fn test_render_source_matches_canvas() {
         scaling: ScalingAlgorithm::Lanczos,
     };
 
-    render_timeline(&timeline, &source_library, &config).unwrap();
+    render_timeline(&timeline, &source_library, &config, None).unwrap();
 
     let output_asset = zeditor_media::probe::probe(&output_path).unwrap();
     assert_eq!(output_asset.width, 320);
@@ -610,7 +610,7 @@ fn test_render_overlapping_video_two_tracks() {
         scaling: ScalingAlgorithm::Lanczos,
     };
 
-    render_timeline(&timeline, &source_library, &config).unwrap();
+    render_timeline(&timeline, &source_library, &config, None).unwrap();
 
     assert!(output_path.exists(), "Output file should exist");
     let metadata = std::fs::metadata(&output_path).unwrap();
@@ -672,7 +672,7 @@ fn test_render_overlapping_audio_two_tracks() {
         scaling: ScalingAlgorithm::Lanczos,
     };
 
-    render_timeline(&timeline, &source_library, &config).unwrap();
+    render_timeline(&timeline, &source_library, &config, None).unwrap();
 
     assert!(output_path.exists(), "Output file should exist");
     let metadata = std::fs::metadata(&output_path).unwrap();
@@ -751,7 +751,7 @@ fn test_render_with_grayscale_effect() {
         scaling: ScalingAlgorithm::FastBilinear,
     };
 
-    render_timeline(&timeline, &source_library, &config).unwrap();
+    render_timeline(&timeline, &source_library, &config, None).unwrap();
 
     // Verify output exists
     assert!(output_path.exists(), "Grayscale render output should exist");
@@ -804,7 +804,7 @@ fn test_render_with_brightness_effect() {
         preset: "superfast".to_string(),
         scaling: ScalingAlgorithm::FastBilinear,
     };
-    render_timeline(&timeline_no_fx, &source_library_no_fx, &config_no_fx).unwrap();
+    render_timeline(&timeline_no_fx, &source_library_no_fx, &config_no_fx, None).unwrap();
 
     // Render with brightness = 0.5
     let fx_output = dir.path().join("output_bright.mkv");
@@ -823,7 +823,7 @@ fn test_render_with_brightness_effect() {
         preset: "superfast".to_string(),
         scaling: ScalingAlgorithm::FastBilinear,
     };
-    render_timeline(&timeline_fx, &source_library_fx, &config_fx).unwrap();
+    render_timeline(&timeline_fx, &source_library_fx, &config_fx, None).unwrap();
 
     // Decode both and compare - bright version should have higher average luminance
     use zeditor_media::decoder::{FfmpegDecoder, VideoDecoder};
@@ -878,7 +878,7 @@ fn test_render_with_transform_effect() {
         scaling: ScalingAlgorithm::FastBilinear,
     };
 
-    render_timeline(&timeline, &source_library, &config).unwrap();
+    render_timeline(&timeline, &source_library, &config, None).unwrap();
 
     assert!(output_path.exists(), "Transform render output should exist");
     let metadata = std::fs::metadata(&output_path).unwrap();
@@ -933,10 +933,163 @@ fn test_render_no_effects_fast_path() {
         scaling: ScalingAlgorithm::FastBilinear,
     };
 
-    render_timeline(&timeline, &source_library, &config).unwrap();
+    render_timeline(&timeline, &source_library, &config, None).unwrap();
 
     assert!(output_path.exists());
     let output_asset = zeditor_media::probe::probe(&output_path).unwrap();
     assert_eq!(output_asset.width, 320);
     assert_eq!(output_asset.height, 240);
+}
+
+// =============================================================================
+// Brief 17: Render profiling integration tests
+// =============================================================================
+
+#[test]
+fn test_render_with_profiling_creates_json() {
+    let dir = fixtures::fixture_dir();
+    let video_path = fixtures::generate_test_video(dir.path(), "profile_json", 1.0);
+    let output_path = dir.path().join("output_profile.mkv");
+
+    let asset = zeditor_media::probe::probe(&video_path).unwrap();
+    let (timeline, source_library) = single_clip_timeline(&asset, false);
+
+    let config = RenderConfig {
+        output_path: output_path.clone(),
+        width: 320,
+        height: 240,
+        canvas_width: 320,
+        canvas_height: 240,
+        fps: 30.0,
+        crf: 22,
+        preset: "superfast".to_string(),
+        scaling: ScalingAlgorithm::FastBilinear,
+    };
+
+    // Enable profiling, clear custom dir
+    unsafe { std::env::set_var("ZEDITOR_PROFILE", "1") };
+    unsafe { std::env::remove_var("ZEDITOR_PROFILE_DIR") };
+
+    render_timeline(&timeline, &source_library, &config, None).unwrap();
+
+    unsafe { std::env::remove_var("ZEDITOR_PROFILE") };
+
+    // Verify profile JSON exists
+    let profile_path = output_path.with_file_name("output_profile.mkv.profile.json");
+    assert!(
+        profile_path.exists(),
+        "Profile JSON should exist at {}",
+        profile_path.display()
+    );
+
+    // Verify it deserializes correctly
+    let content = std::fs::read_to_string(&profile_path).unwrap();
+    let profile: zeditor_media::render_profile::RenderProfile =
+        serde_json::from_str(&content).unwrap();
+
+    assert!(profile.total_frames > 0, "Should have recorded frames");
+    assert!(profile.avg_frame_ms > 0.0, "Avg frame time should be > 0");
+    assert!(
+        profile.stages.video_encode_ms > 0.0,
+        "Video encode stage should have time"
+    );
+    assert_eq!(profile.config.width, 320);
+    assert_eq!(profile.config.height, 240);
+    // Each frame should have metrics
+    assert_eq!(profile.frames.len(), profile.total_frames as usize);
+}
+
+#[test]
+fn test_render_without_profiling_no_json() {
+    let dir = fixtures::fixture_dir();
+    let video_path = fixtures::generate_test_video(dir.path(), "no_profile", 1.0);
+    let output_path = dir.path().join("output_no_profile.mkv");
+
+    let asset = zeditor_media::probe::probe(&video_path).unwrap();
+    let (timeline, source_library) = single_clip_timeline(&asset, false);
+
+    let config = RenderConfig {
+        output_path: output_path.clone(),
+        width: 320,
+        height: 240,
+        canvas_width: 320,
+        canvas_height: 240,
+        fps: 30.0,
+        crf: 22,
+        preset: "superfast".to_string(),
+        scaling: ScalingAlgorithm::FastBilinear,
+    };
+
+    // Ensure profiling is disabled
+    unsafe { std::env::remove_var("ZEDITOR_PROFILE") };
+
+    render_timeline(&timeline, &source_library, &config, None).unwrap();
+
+    // No profile JSON should be created
+    let profile_path = output_path.with_file_name("output_no_profile.mkv.profile.json");
+    assert!(
+        !profile_path.exists(),
+        "Profile JSON should NOT exist when profiling is disabled"
+    );
+}
+
+#[test]
+fn test_render_progress_channel_receives_updates() {
+    let dir = fixtures::fixture_dir();
+    let video_path = fixtures::generate_test_video(dir.path(), "progress_chan", 1.0);
+    let output_path = dir.path().join("output_progress.mkv");
+
+    let asset = zeditor_media::probe::probe(&video_path).unwrap();
+    let (timeline, source_library) = single_clip_timeline(&asset, false);
+
+    let config = RenderConfig {
+        output_path: output_path.clone(),
+        width: 320,
+        height: 240,
+        canvas_width: 320,
+        canvas_height: 240,
+        fps: 30.0,
+        crf: 22,
+        preset: "superfast".to_string(),
+        scaling: ScalingAlgorithm::FastBilinear,
+    };
+
+    // Ensure profiling is off for this test
+    unsafe { std::env::remove_var("ZEDITOR_PROFILE") };
+
+    let (tx, rx) = std::sync::mpsc::channel();
+    render_timeline(&timeline, &source_library, &config, Some(tx)).unwrap();
+
+    // Collect all progress messages
+    let mut messages: Vec<zeditor_media::render_profile::RenderProgress> = Vec::new();
+    while let Ok(msg) = rx.try_recv() {
+        messages.push(msg);
+    }
+
+    // Should have received at least a few progress updates
+    assert!(
+        messages.len() >= 2,
+        "Expected at least 2 progress messages, got {}",
+        messages.len()
+    );
+
+    // Frame counts should be monotonically non-decreasing
+    let mut prev_frame = 0u64;
+    for msg in &messages {
+        assert!(
+            msg.current_frame >= prev_frame,
+            "Frames should be monotonically non-decreasing: {} < {}",
+            msg.current_frame,
+            prev_frame
+        );
+        prev_frame = msg.current_frame;
+    }
+
+    // Last message should be Complete stage
+    let last = messages.last().unwrap();
+    assert_eq!(
+        last.stage,
+        zeditor_media::render_profile::RenderStage::Complete,
+        "Last progress message should be Complete"
+    );
 }

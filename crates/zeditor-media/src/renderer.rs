@@ -17,6 +17,9 @@ use zeditor_core::timeline::{Timeline, TimelinePosition, TrackType};
 
 use crate::decoder::{FfmpegDecoder, VideoDecoder};
 use crate::error::{MediaError, Result};
+use crate::render_profile::{
+    self, FrameMetrics, ProfileCollector, ProfileConfig, RenderProgress, RenderStage,
+};
 
 /// Scaling algorithm for video frame resizing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -121,11 +124,29 @@ const OUTPUT_CHANNELS: i32 = 2;
 ///
 /// Walks the timeline frame-by-frame, decoding source clips for video and audio,
 /// encoding to h264+AAC, and muxing into MKV.
+///
+/// If `progress_tx` is provided, progress updates are sent during the render.
+/// When `ZEDITOR_PROFILE=1` is set, a `.profile.json` file is written next to output.
 pub fn render_timeline(
     timeline: &Timeline,
     source_library: &SourceLibrary,
     config: &RenderConfig,
+    progress_tx: Option<std::sync::mpsc::Sender<RenderProgress>>,
 ) -> Result<()> {
+    let render_start = std::time::Instant::now();
+    let profiling_enabled = render_profile::is_profiling_enabled();
+    let mut profiler = ProfileCollector::new(profiling_enabled);
+
+    profiler.set_render_start(render_start);
+    profiler.set_config(ProfileConfig {
+        output_path: config.output_path.to_string_lossy().to_string(),
+        width: config.width,
+        height: config.height,
+        fps: config.fps,
+        crf: config.crf,
+        preset: config.preset.clone(),
+    });
+
     let total_duration = timeline.duration();
     if total_duration.as_secs_f64() <= 0.0 {
         return Err(MediaError::EncoderError("Timeline is empty".into()));
@@ -133,6 +154,9 @@ pub fn render_timeline(
 
     let total_frames =
         (total_duration.as_secs_f64() * config.fps).ceil() as u64;
+
+    // --- Setup stage ---
+    let setup_start = std::time::Instant::now();
 
     // Ensure dimensions are even (required by x264)
     let width = (config.width & !1).max(2) as i32;
@@ -238,7 +262,13 @@ pub fn render_timeline(
     // --- Decoder cache for video ---
     let mut video_decoders: HashMap<PathBuf, CachedVideoDecoder> = HashMap::new();
 
+    profiler.stages.setup_ms = setup_start.elapsed().as_secs_f64() * 1000.0;
+
+    // Send setup progress
+    send_progress(&progress_tx, 0, total_frames, render_start, RenderStage::Setup);
+
     // --- Video encoding loop ---
+    let video_start = std::time::Instant::now();
     encode_video_frames(
         timeline,
         source_library,
@@ -251,9 +281,15 @@ pub fn render_timeline(
         video_stream_index,
         video_stream_tb,
         &mut video_decoders,
+        &mut profiler,
+        &progress_tx,
+        render_start,
     )?;
+    profiler.stages.video_encode_ms = video_start.elapsed().as_secs_f64() * 1000.0;
 
     // --- Audio encoding: pre-render all clips into buffer, then encode ---
+    send_progress(&progress_tx, total_frames, total_frames, render_start, RenderStage::AudioEncoding);
+    let audio_start = std::time::Instant::now();
     encode_audio_offline(
         timeline,
         source_library,
@@ -264,29 +300,60 @@ pub fn render_timeline(
         audio_stream_index,
         audio_stream_tb,
     )?;
+    profiler.stages.audio_encode_ms = audio_start.elapsed().as_secs_f64() * 1000.0;
 
-    // --- Flush video encoder ---
+    // --- Flush encoders ---
+    send_progress(&progress_tx, total_frames, total_frames, render_start, RenderStage::Flushing);
+    let flush_start = std::time::Instant::now();
     flush_encoder(
         &mut video_enc_ctx,
         &mut output_ctx,
         video_stream_index,
         video_stream_tb,
     )?;
-
-    // --- Flush audio encoder ---
     flush_encoder(
         &mut audio_enc_ctx,
         &mut output_ctx,
         audio_stream_index,
         audio_stream_tb,
     )?;
+    profiler.stages.flush_ms = flush_start.elapsed().as_secs_f64() * 1000.0;
 
     // --- Write trailer ---
+    let trailer_start = std::time::Instant::now();
     output_ctx
         .write_trailer()
         .map_err(|e| MediaError::EncoderError(format!("Failed to write trailer: {e}")))?;
+    profiler.stages.write_trailer_ms = trailer_start.elapsed().as_secs_f64() * 1000.0;
+
+    // Send completion progress
+    send_progress(&progress_tx, total_frames, total_frames, render_start, RenderStage::Complete);
+
+    // Write profile JSON if profiling is enabled
+    if let Some(profile) = profiler.finish() {
+        let profile_path = render_profile::profile_output_path(&config.output_path);
+        let _ = render_profile::write_profile(&profile, &profile_path);
+    }
 
     Ok(())
+}
+
+/// Send a progress update if a channel is available. Silently ignores send errors.
+fn send_progress(
+    tx: &Option<std::sync::mpsc::Sender<RenderProgress>>,
+    current_frame: u64,
+    total_frames: u64,
+    render_start: std::time::Instant,
+    stage: RenderStage,
+) {
+    if let Some(tx) = tx {
+        let _ = tx.send(RenderProgress {
+            current_frame,
+            total_frames,
+            elapsed: render_start.elapsed(),
+            stage,
+        });
+    }
 }
 
 // =============================================================================
@@ -393,10 +460,14 @@ fn encode_video_frames(
     stream_index: i32,
     stream_tb: ffi::AVRational,
     video_decoders: &mut HashMap<PathBuf, CachedVideoDecoder>,
+    profiler: &mut ProfileCollector,
+    progress_tx: &Option<std::sync::mpsc::Sender<RenderProgress>>,
+    render_start: std::time::Instant,
 ) -> Result<()> {
     let canvas_w = config.canvas_width;
     let canvas_h = config.canvas_height;
     let registry = EffectRegistry::with_builtins();
+    let profiling = profiler.is_enabled();
 
     // Pre-create opaque black template for fast canvas reset (single memcpy per frame)
     let black_canvas_data: Vec<u8> = {
@@ -414,14 +485,23 @@ fn encode_video_frames(
     let mut rgba_to_yuv = CachedRgbaToYuvConverter::new(width, height)?;
 
     for frame_idx in 0..total_frames {
+        let frame_start = if profiling {
+            Some(std::time::Instant::now())
+        } else {
+            None
+        };
+
         let timeline_time = frame_idx as f64 / config.fps;
         let pos = TimelinePosition::from_secs_f64(timeline_time);
 
+        let t0 = if profiling { Some(std::time::Instant::now()) } else { None };
         let all_clips = find_all_video_clips_at(timeline, source_library, pos);
+        let find_clips_ms = t0.map(|t| t.elapsed().as_secs_f64() * 1000.0).unwrap_or(0.0);
 
         if all_clips.is_empty() {
             let mut frame = create_black_yuv_frame(width, height)?;
             frame.set_pts(frame_idx as i64);
+            let t_enc = if profiling { Some(std::time::Instant::now()) } else { None };
             encode_frame(
                 video_enc_ctx,
                 output_ctx,
@@ -429,10 +509,33 @@ fn encode_video_frames(
                 stream_index,
                 stream_tb,
             )?;
+            let encode_ms = t_enc.map(|t| t.elapsed().as_secs_f64() * 1000.0).unwrap_or(0.0);
+
+            if profiling {
+                profiler.record_frame(FrameMetrics {
+                    frame_index: frame_idx,
+                    timeline_time_secs: timeline_time,
+                    total_ms: frame_start.unwrap().elapsed().as_secs_f64() * 1000.0,
+                    find_clips_ms,
+                    decode_ms: 0.0,
+                    effects_ms: 0.0,
+                    composite_ms: 0.0,
+                    color_convert_ms: 0.0,
+                    encode_ms,
+                    clip_count: 0,
+                    used_effects_path: false,
+                });
+            }
+
+            // Send progress every 10 frames
+            if frame_idx % 10 == 0 || frame_idx == total_frames - 1 {
+                send_progress(progress_tx, frame_idx + 1, total_frames, render_start, RenderStage::VideoEncoding);
+            }
             continue;
         }
 
         let any_has_effects = all_clips.iter().any(|(_, _, effects)| !effects.is_empty());
+        let clip_count = all_clips.len();
 
         if any_has_effects {
             // Effect path: work in RGBA, run pipeline, convert to YUV at end
@@ -445,7 +548,12 @@ fn encode_video_frames(
             // Reset canvas to opaque black (fast memcpy instead of per-pixel init)
             rgba_canvas.data.copy_from_slice(&black_canvas_data);
 
+            let mut decode_ms = 0.0;
+            let mut effects_ms = 0.0;
+            let mut composite_ms = 0.0;
+
             for (source_path, source_time, clip_effects) in &all_clips {
+                let t_dec = if profiling { Some(std::time::Instant::now()) } else { None };
                 let rgba_frame = decode_clip_to_rgba(
                     source_path,
                     *source_time,
@@ -453,12 +561,15 @@ fn encode_video_frames(
                     height as u32,
                     video_decoders,
                 )?;
+                decode_ms += t_dec.map(|t| t.elapsed().as_secs_f64() * 1000.0).unwrap_or(0.0);
+
                 if let Some(clip_frame) = rgba_frame {
                     if clip_effects.is_empty() {
-                        // No effects: blit directly onto canvas (no intermediate buffer)
+                        let t_comp = if profiling { Some(std::time::Instant::now()) } else { None };
                         pipeline::blit_onto_canvas(&clip_frame, &mut rgba_canvas);
+                        composite_ms += t_comp.map(|t| t.elapsed().as_secs_f64() * 1000.0).unwrap_or(0.0);
                     } else {
-                        // Run effect pipeline, then smart composite
+                        let t_fx = if profiling { Some(std::time::Instant::now()) } else { None };
                         let result = pipeline::run_effect_pipeline(
                             clip_frame,
                             width as u32,
@@ -467,18 +578,26 @@ fn encode_video_frames(
                             &registry,
                             &ctx,
                         );
+                        effects_ms += t_fx.map(|t| t.elapsed().as_secs_f64() * 1000.0).unwrap_or(0.0);
+
+                        let t_comp = if profiling { Some(std::time::Instant::now()) } else { None };
                         if !result.may_have_transparency && result.fills_canvas {
                             pipeline::composite_opaque(&result.frame, &mut rgba_canvas);
                         } else {
                             pipeline::alpha_composite_rgba(&result.frame, &mut rgba_canvas);
                         }
+                        composite_ms += t_comp.map(|t| t.elapsed().as_secs_f64() * 1000.0).unwrap_or(0.0);
                     }
                 }
             }
 
             // Convert final RGBA canvas to YUV420P (reuses cached SWS + frames)
+            let t_cc = if profiling { Some(std::time::Instant::now()) } else { None };
             let yuv_frame = rgba_to_yuv.convert(&rgba_canvas)?;
+            let color_convert_ms = t_cc.map(|t| t.elapsed().as_secs_f64() * 1000.0).unwrap_or(0.0);
+
             yuv_frame.set_pts(frame_idx as i64);
+            let t_enc = if profiling { Some(std::time::Instant::now()) } else { None };
             encode_frame(
                 video_enc_ctx,
                 output_ctx,
@@ -486,10 +605,31 @@ fn encode_video_frames(
                 stream_index,
                 stream_tb,
             )?;
+            let encode_ms = t_enc.map(|t| t.elapsed().as_secs_f64() * 1000.0).unwrap_or(0.0);
+
+            if profiling {
+                profiler.record_frame(FrameMetrics {
+                    frame_index: frame_idx,
+                    timeline_time_secs: timeline_time,
+                    total_ms: frame_start.unwrap().elapsed().as_secs_f64() * 1000.0,
+                    find_clips_ms,
+                    decode_ms,
+                    effects_ms,
+                    composite_ms,
+                    color_convert_ms,
+                    encode_ms,
+                    clip_count,
+                    used_effects_path: true,
+                });
+            }
         } else {
             // Fast path: no effects on any clip, use YUV pipeline
             let mut canvas = create_black_yuv_frame(width, height)?;
+            let mut decode_ms = 0.0;
+            let mut composite_ms = 0.0;
+
             for (source_path, source_time, _clip_effects) in &all_clips {
+                let t_dec = if profiling { Some(std::time::Instant::now()) } else { None };
                 let clip_frame = decode_and_scale_clip(
                     source_path,
                     *source_time,
@@ -500,11 +640,16 @@ fn encode_video_frames(
                     video_decoders,
                     config.scaling.to_sws_flags(),
                 )?;
+                decode_ms += t_dec.map(|t| t.elapsed().as_secs_f64() * 1000.0).unwrap_or(0.0);
+
                 if let Some((scaled_frame, layout)) = clip_frame {
+                    let t_comp = if profiling { Some(std::time::Instant::now()) } else { None };
                     blit_yuv_frame(&scaled_frame, &mut canvas, layout.clip_x, layout.clip_y);
+                    composite_ms += t_comp.map(|t| t.elapsed().as_secs_f64() * 1000.0).unwrap_or(0.0);
                 }
             }
             canvas.set_pts(frame_idx as i64);
+            let t_enc = if profiling { Some(std::time::Instant::now()) } else { None };
             encode_frame(
                 video_enc_ctx,
                 output_ctx,
@@ -512,6 +657,28 @@ fn encode_video_frames(
                 stream_index,
                 stream_tb,
             )?;
+            let encode_ms = t_enc.map(|t| t.elapsed().as_secs_f64() * 1000.0).unwrap_or(0.0);
+
+            if profiling {
+                profiler.record_frame(FrameMetrics {
+                    frame_index: frame_idx,
+                    timeline_time_secs: timeline_time,
+                    total_ms: frame_start.unwrap().elapsed().as_secs_f64() * 1000.0,
+                    find_clips_ms,
+                    decode_ms,
+                    effects_ms: 0.0,
+                    composite_ms,
+                    color_convert_ms: 0.0,
+                    encode_ms,
+                    clip_count,
+                    used_effects_path: false,
+                });
+            }
+        }
+
+        // Send progress every 10 frames and on final frame
+        if frame_idx % 10 == 0 || frame_idx == total_frames - 1 {
+            send_progress(progress_tx, frame_idx + 1, total_frames, render_start, RenderStage::VideoEncoding);
         }
     }
     Ok(())
