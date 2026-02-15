@@ -48,6 +48,23 @@ impl FfmpegAudioDecoder {
             found.ok_or(MediaError::NoAudioStream)?
         };
 
+        // Tell the demuxer to discard non-audio streams so read_packet() skips
+        // video packets entirely. Without this, decoding audio from a video file
+        // reads and discards many video packets per audio frame, making multi-clip
+        // audio decode too slow for real-time playback.
+        {
+            let nb_streams = input_ctx.streams().len();
+            for i in 0..nb_streams {
+                if i != audio_stream_index {
+                    unsafe {
+                        let streams = input_ctx.streams();
+                        let stream_ptr = streams[i].as_ptr() as *mut rsmpeg::ffi::AVStream;
+                        (*stream_ptr).discard = rsmpeg::ffi::AVDISCARD_ALL;
+                    }
+                }
+            }
+        }
+
         let mut decode_ctx = rsmpeg::avcodec::AVCodecContext::new(&decoder);
         {
             let streams = input_ctx.streams();

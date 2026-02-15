@@ -2519,3 +2519,155 @@ fn test_update_opacity_parameter() {
     let clip = app.project.timeline.tracks[0].get_clip(clip_id).unwrap();
     assert_eq!(clip.effects[0].get_float("opacity"), Some(0.5));
 }
+
+// --- Bug 18: EffectParamTextInput tests ---
+
+#[test]
+fn test_effect_param_text_input_valid_number() {
+    let (mut app, _, clip_id) = setup_app_with_clip();
+
+    app.update(Message::AddEffectToSelectedClip(
+        zeditor_core::effects::EffectType::Transform,
+    ));
+    let effect_id = app.project.timeline.tracks[0]
+        .get_clip(clip_id)
+        .unwrap()
+        .effects[0]
+        .id;
+
+    // Send a valid number via text input
+    app.update(Message::EffectParamTextInput {
+        track_index: 0,
+        clip_id,
+        effect_id,
+        param_name: "x_offset".into(),
+        text: "500".into(),
+    });
+
+    let clip = app.project.timeline.tracks[0].get_clip(clip_id).unwrap();
+    assert_eq!(clip.effects[0].get_float("x_offset"), Some(500.0));
+
+    // Text state should be stored
+    assert_eq!(
+        app.effect_param_texts.get(&(effect_id, "x_offset".into())),
+        Some(&"500".to_string())
+    );
+}
+
+#[test]
+fn test_effect_param_text_input_invalid_text() {
+    let (mut app, _, clip_id) = setup_app_with_clip();
+
+    app.update(Message::AddEffectToSelectedClip(
+        zeditor_core::effects::EffectType::Transform,
+    ));
+    let effect_id = app.project.timeline.tracks[0]
+        .get_clip(clip_id)
+        .unwrap()
+        .effects[0]
+        .id;
+
+    // Send non-numeric text — should store text but not update parameter
+    app.update(Message::EffectParamTextInput {
+        track_index: 0,
+        clip_id,
+        effect_id,
+        param_name: "x_offset".into(),
+        text: "abc".into(),
+    });
+
+    let clip = app.project.timeline.tracks[0].get_clip(clip_id).unwrap();
+    assert_eq!(clip.effects[0].get_float("x_offset"), Some(0.0)); // unchanged default
+
+    // Text state should still be stored for display
+    assert_eq!(
+        app.effect_param_texts.get(&(effect_id, "x_offset".into())),
+        Some(&"abc".to_string())
+    );
+}
+
+#[test]
+fn test_effect_param_text_input_out_of_bounds() {
+    let (mut app, _, clip_id) = setup_app_with_clip();
+
+    app.update(Message::AddEffectToSelectedClip(
+        zeditor_core::effects::EffectType::Transform,
+    ));
+    let effect_id = app.project.timeline.tracks[0]
+        .get_clip(clip_id)
+        .unwrap()
+        .effects[0]
+        .id;
+
+    // Send a number beyond max bounds — should not update parameter
+    app.update(Message::EffectParamTextInput {
+        track_index: 0,
+        clip_id,
+        effect_id,
+        param_name: "x_offset".into(),
+        text: "99999".into(),
+    });
+
+    let clip = app.project.timeline.tracks[0].get_clip(clip_id).unwrap();
+    assert_eq!(clip.effects[0].get_float("x_offset"), Some(0.0)); // unchanged
+}
+
+#[test]
+fn test_effect_param_text_input_negative_value() {
+    let (mut app, _, clip_id) = setup_app_with_clip();
+
+    app.update(Message::AddEffectToSelectedClip(
+        zeditor_core::effects::EffectType::Transform,
+    ));
+    let effect_id = app.project.timeline.tracks[0]
+        .get_clip(clip_id)
+        .unwrap()
+        .effects[0]
+        .id;
+
+    // Negative value within range
+    app.update(Message::EffectParamTextInput {
+        track_index: 0,
+        clip_id,
+        effect_id,
+        param_name: "x_offset".into(),
+        text: "-250".into(),
+    });
+
+    let clip = app.project.timeline.tracks[0].get_clip(clip_id).unwrap();
+    assert_eq!(clip.effects[0].get_float("x_offset"), Some(-250.0));
+}
+
+#[test]
+fn test_update_effect_param_clears_text_state() {
+    let (mut app, _, clip_id) = setup_app_with_clip();
+
+    app.update(Message::AddEffectToSelectedClip(
+        zeditor_core::effects::EffectType::Transform,
+    ));
+    let effect_id = app.project.timeline.tracks[0]
+        .get_clip(clip_id)
+        .unwrap()
+        .effects[0]
+        .id;
+
+    // First set via text input
+    app.update(Message::EffectParamTextInput {
+        track_index: 0,
+        clip_id,
+        effect_id,
+        param_name: "x_offset".into(),
+        text: "100".into(),
+    });
+    assert!(app.effect_param_texts.contains_key(&(effect_id, "x_offset".into())));
+
+    // Then update via slider (UpdateEffectParameter) — should clear text state
+    app.update(Message::UpdateEffectParameter {
+        track_index: 0,
+        clip_id,
+        effect_id,
+        param_name: "x_offset".into(),
+        value: 200.0,
+    });
+    assert!(!app.effect_param_texts.contains_key(&(effect_id, "x_offset".into())));
+}

@@ -137,11 +137,11 @@ impl PixelEffect for TransformEffect {
         // Transform can't work in-place (reads and writes overlap), so allocate
         let mut output = FrameBuffer::new(input.width, input.height);
 
-        // Compute visible output range
+        // Compute visible output range (clamp to 0 before u32 cast to prevent wraparound)
         let out_y_start = 0i64.max(y_off_i) as u32;
-        let out_y_end = (h.min(h + y_off_i)) as u32;
+        let out_y_end = 0i64.max(h.min(h + y_off_i)) as u32;
         let out_x_start = 0i64.max(x_off_i) as u32;
-        let out_x_end = (w.min(w + x_off_i)) as u32;
+        let out_x_end = 0i64.max(w.min(w + x_off_i)) as u32;
 
         if out_x_start >= out_x_end || out_y_start >= out_y_end {
             return output;
@@ -1066,5 +1066,56 @@ mod tests {
         let result = run_effect_pipeline(clip, 2, 2, &[opacity], &registry, &dummy_ctx());
         assert!(result.fills_canvas);
         assert!(result.may_have_transparency);
+    }
+
+    // --- Transform large offset crash tests ---
+
+    #[test]
+    fn test_transform_large_negative_offset_no_panic() {
+        let effect = TransformEffect;
+        let fb = FrameBuffer::from_rgba_vec(4, 4, vec![255; 4 * 4 * 4]);
+        let params = vec![
+            ("x_offset".to_string(), ParameterValue::Float(-10000.0)),
+            ("y_offset".to_string(), ParameterValue::Float(-10000.0)),
+        ];
+        let result = effect.process(fb, &params, &dummy_ctx());
+        // All pixels should be transparent (shifted entirely off-screen)
+        assert!(result.data.iter().all(|&b| b == 0));
+    }
+
+    #[test]
+    fn test_transform_large_positive_offset_no_panic() {
+        let effect = TransformEffect;
+        let fb = FrameBuffer::from_rgba_vec(4, 4, vec![255; 4 * 4 * 4]);
+        let params = vec![
+            ("x_offset".to_string(), ParameterValue::Float(10000.0)),
+            ("y_offset".to_string(), ParameterValue::Float(10000.0)),
+        ];
+        let result = effect.process(fb, &params, &dummy_ctx());
+        assert!(result.data.iter().all(|&b| b == 0));
+    }
+
+    #[test]
+    fn test_transform_large_negative_x_only() {
+        let effect = TransformEffect;
+        let fb = FrameBuffer::from_rgba_vec(4, 4, vec![255; 4 * 4 * 4]);
+        let params = vec![
+            ("x_offset".to_string(), ParameterValue::Float(-10000.0)),
+            ("y_offset".to_string(), ParameterValue::Float(0.0)),
+        ];
+        let result = effect.process(fb, &params, &dummy_ctx());
+        assert!(result.data.iter().all(|&b| b == 0));
+    }
+
+    #[test]
+    fn test_transform_large_negative_y_only() {
+        let effect = TransformEffect;
+        let fb = FrameBuffer::from_rgba_vec(4, 4, vec![255; 4 * 4 * 4]);
+        let params = vec![
+            ("x_offset".to_string(), ParameterValue::Float(0.0)),
+            ("y_offset".to_string(), ParameterValue::Float(-10000.0)),
+        ];
+        let result = effect.process(fb, &params, &dummy_ctx());
+        assert!(result.data.iter().all(|&b| b == 0));
     }
 }

@@ -663,10 +663,9 @@ fn test_audio_decode_clip_id_set_during_playback() {
 
     app.update(Message::PlaybackTick);
 
-    assert_eq!(
-        app.audio_decode_clip_id(),
-        Some(audio_clip_id),
-        "audio_decode_clip_id should be set during playback of audio clip"
+    assert!(
+        app.audio_decode_clip_id() == Some(audio_clip_id),
+        "audio_decode_clip_ids should contain the audio clip during playback"
     );
 }
 
@@ -683,10 +682,9 @@ fn test_audio_stopped_in_gap() {
 
     app.update(Message::PlaybackTick);
 
-    assert_eq!(
-        app.audio_decode_clip_id(),
-        None,
-        "audio_decode_clip_id should be None when in gap (no audio clip)"
+    assert!(
+        app.audio_decode_clip_id().is_none(),
+        "audio_decode_clip_ids should be empty when in gap (no audio clip)"
     );
 }
 
@@ -729,9 +727,8 @@ fn test_audio_transition_across_clip_boundary() {
     app.playback_start_wall = Some(start - Duration::from_millis(5500));
     app.update(Message::PlaybackTick);
 
-    assert_eq!(
-        app.audio_decode_clip_id(),
-        Some(audio_clip2_id),
+    assert!(
+        app.audio_decode_clip_id() == Some(audio_clip2_id),
         "audio decode should switch to clip2 after crossing 5s boundary"
     );
     assert!(app.is_playing, "playback should continue into clip2");
@@ -821,9 +818,8 @@ fn test_audio_adjacent_clip_transition_switches_decode() {
     app.playback_start_wall = Some(start - Duration::from_millis(5500));
     app.update(Message::PlaybackTick);
 
-    assert_eq!(
-        app.audio_decode_clip_id(),
-        Some(audio_clip2_id),
+    assert!(
+        app.audio_decode_clip_id() == Some(audio_clip2_id),
         "audio decode should switch to clip2 after crossing 5s boundary"
     );
 
@@ -850,7 +846,7 @@ fn test_timeline_click_stops_audio_decode() {
     // Start playing
     app.update(Message::Play);
     assert!(app.is_playing);
-    assert_eq!(app.audio_decode_clip_id(), Some(audio_clip_id));
+    assert!(app.audio_decode_clip_id() == Some(audio_clip_id));
 
     // Click the timeline at 5s — should pause everything including audio
     app.update(Message::TimelineClickEmpty(

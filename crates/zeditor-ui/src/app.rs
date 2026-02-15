@@ -4,7 +4,7 @@ use std::time::{Duration, Instant};
 
 use std::collections::HashMap;
 
-use iced::widget::{button, center, column, container, image, mouse_area, opaque, row, scrollable, slider, stack, text, Space};
+use iced::widget::{button, center, column, container, image, mouse_area, opaque, row, scrollable, slider, stack, text, text_input, Space};
 use iced::{event, keyboard, mouse, time, window, Background, Border, Color, Element, Event, Length, Padding, Point, Subscription, Task};
 use uuid::Uuid;
 
@@ -96,6 +96,9 @@ pub struct App {
     pub confirm_dialog: Option<ConfirmDialog>,
     pub left_panel_tab: LeftPanelTab,
     pub track_context_menu: Option<TrackContextMenu>,
+    /// Text input state for effect parameters with wide ranges (e.g. transform offset).
+    /// Key: (effect_id, param_name), Value: current text string in the input field.
+    pub effect_param_texts: HashMap<(Uuid, String), String>,
     decode_tx: Option<mpsc::Sender<DecodeRequest>>,
     pub(crate) decode_rx: Option<mpsc::Receiver<DecodedFrame>>,
     pub(crate) decode_clip_id: Option<Uuid>,
@@ -111,6 +114,7 @@ pub struct App {
     audio_player: Option<AudioPlayer>,
     audio_decode_tx: Option<mpsc::Sender<AudioDecodeRequest>>,
     pub(crate) audio_decode_rx: Option<mpsc::Receiver<DecodedAudio>>,
+    /// ID of the audio clip currently being decoded (for change detection).
     pub(crate) audio_decode_clip_id: Option<Uuid>,
     pub(crate) audio_decode_time_offset: f64,
     // Render progress state
@@ -145,6 +149,7 @@ impl Default for App {
             confirm_dialog: None,
             left_panel_tab: LeftPanelTab::default(),
             track_context_menu: None,
+            effect_param_texts: HashMap::new(),
             decode_tx: None,
             decode_rx: None,
             decode_clip_id: None,
@@ -247,7 +252,7 @@ impl App {
 
         // Audio decode thread
         let (audio_req_tx, audio_req_rx) = mpsc::channel::<AudioDecodeRequest>();
-        let (audio_frame_tx, audio_frame_rx) = mpsc::sync_channel::<DecodedAudio>(4);
+        let (audio_frame_tx, audio_frame_rx) = mpsc::sync_channel::<DecodedAudio>(16);
 
         std::thread::spawn(move || {
             audio_decode_worker(audio_req_rx, audio_frame_tx);
@@ -766,9 +771,9 @@ impl App {
                         self.drain_stale = true;
                     }
 
-                    // Check if audio clip changed
-                    let current_audio_id =
-                        self.audio_clip_at_position(self.playback_position).map(|(_, c)| c.id);
+                    // Check if the primary audio clip changed
+                    let current_audio_id = self.audio_clip_at_position(self.playback_position)
+                        .map(|(_, c)| c.id);
                     if current_audio_id != self.audio_decode_clip_id {
                         self.send_audio_decode_seek(true);
                     }
@@ -1242,6 +1247,8 @@ impl App {
                 Task::none()
             }
             Message::UpdateEffectParameter { track_index, clip_id, effect_id, param_name, value } => {
+                // Clear text input state when slider updates the value
+                self.effect_param_texts.remove(&(effect_id, param_name.clone()));
                 let result = self.project.command_history.execute(
                     &mut self.project.timeline,
                     "Update effect parameter",
@@ -1260,6 +1267,51 @@ impl App {
                 }
                 // Trigger decode refresh to update preview
                 self.send_decode_seek(false);
+                Task::none()
+            }
+            Message::EffectParamTextInput { track_index, clip_id, effect_id, param_name, text: input_text } => {
+                // Store the raw text for display
+                self.effect_param_texts.insert((effect_id, param_name.clone()), input_text.clone());
+
+                // If parseable as a number, also update the effect parameter
+                if let Ok(value) = input_text.parse::<f64>() {
+                    // Look up min/max bounds from parameter definitions
+                    let in_bounds = self.project.timeline
+                        .track(track_index)
+                        .ok()
+                        .and_then(|t| t.get_clip(clip_id))
+                        .and_then(|c| c.effects.iter().find(|e| e.id == effect_id))
+                        .map(|effect| {
+                            for def in effect.effect_type.parameter_definitions() {
+                                if def.name == param_name {
+                                    let zeditor_core::effects::ParameterType::Float { min, max, .. } = def.param_type;
+                                    return value >= min && value <= max;
+                                }
+                            }
+                            false
+                        })
+                        .unwrap_or(false);
+
+                    if in_bounds {
+                        let result = self.project.command_history.execute(
+                            &mut self.project.timeline,
+                            "Update effect parameter",
+                            |tl| {
+                                let clip = tl.track_mut(track_index)?
+                                    .get_clip_mut(clip_id)
+                                    .ok_or(zeditor_core::error::CoreError::ClipNotFound(clip_id))?;
+                                if let Some(effect) = clip.effects.iter_mut().find(|e| e.id == effect_id) {
+                                    effect.set_float(&param_name, value);
+                                }
+                                Ok(())
+                            },
+                        );
+                        if let Err(e) = result {
+                            self.status_message = format!("Update effect failed: {e}");
+                        }
+                        self.send_decode_seek(false);
+                    }
+                }
                 Task::none()
             }
         }
@@ -1696,8 +1748,15 @@ impl App {
 
                     // Use percentage display for 0-1 range parameters
                     let is_percentage = min == 0.0 && max == 1.0;
+                    let wide_range = (max - min) > 100.0;
+
                     let param_label = if is_percentage {
                         text(format!("{}: {:.0}%", def.label, current_val * 100.0))
+                            .size(12)
+                            .color(Color::from_rgb(0.7, 0.7, 0.7))
+                    } else if wide_range {
+                        // Label only (value shown in the text input)
+                        text(format!("{}:", def.label))
                             .size(12)
                             .color(Color::from_rgb(0.7, 0.7, 0.7))
                     } else {
@@ -1709,20 +1768,50 @@ impl App {
                         text(val_str).size(12).color(Color::from_rgb(0.7, 0.7, 0.7))
                     };
 
-                    let param_slider = slider(min..=max, current_val, move |v| {
-                        Message::UpdateEffectParameter {
-                            track_index,
-                            clip_id,
-                            effect_id,
-                            param_name: param_name.clone(),
-                            value: v,
-                        }
-                    })
-                    .step(if is_percentage { 0.01 } else { 0.01 })
-                    .width(140);
+                    let param_control: Element<'_, Message> = if wide_range {
+                        // Wide-range params get a text input for precise entry
+                        let text_key = (effect_id, def.name.clone());
+                        let display_text = self.effect_param_texts
+                            .get(&text_key)
+                            .cloned()
+                            .unwrap_or_else(|| {
+                                if current_val == current_val.trunc() {
+                                    format!("{:.0}", current_val)
+                                } else {
+                                    format!("{:.2}", current_val)
+                                }
+                            });
+                        let param_name_for_input = param_name.clone();
+                        text_input("0", &display_text)
+                            .on_input(move |t| {
+                                Message::EffectParamTextInput {
+                                    track_index,
+                                    clip_id,
+                                    effect_id,
+                                    param_name: param_name_for_input.clone(),
+                                    text: t,
+                                }
+                            })
+                            .width(80)
+                            .size(12)
+                            .into()
+                    } else {
+                        slider(min..=max, current_val, move |v| {
+                            Message::UpdateEffectParameter {
+                                track_index,
+                                clip_id,
+                                effect_id,
+                                param_name: param_name.clone(),
+                                value: v,
+                            }
+                        })
+                        .step(if is_percentage { 0.01 } else { 0.01 })
+                        .width(140)
+                        .into()
+                    };
 
                     items.push(
-                        column![param_label, param_slider]
+                        column![param_label, param_control]
                             .spacing(2)
                             .padding(Padding { top: 0.0, right: 0.0, bottom: 0.0, left: 8.0 })
                             .into()
@@ -2450,8 +2539,9 @@ impl App {
         // Collect clip info upfront to avoid borrow conflicts with self
         let playback_pos = self.playback_position.as_secs_f64();
         let mut audio_infos = Vec::new();
-        let mut first_clip_id = None;
+        let mut clip_ids = Vec::new();
         let mut first_time_offset = 0.0;
+        let mut got_first = false;
 
         for (_, track) in self.project.timeline.tracks.iter().enumerate() {
             if track.track_type != TrackType::Audio {
@@ -2463,10 +2553,11 @@ impl App {
                 let source_time = clip_src_start + (playback_pos - clip_tl_start);
 
                 if let Some(asset) = self.project.source_library.get(clip.asset_id) {
-                    if first_clip_id.is_none() {
-                        first_clip_id = Some(clip.id);
+                    if !got_first {
                         first_time_offset = clip_tl_start - clip_src_start;
+                        got_first = true;
                     }
+                    clip_ids.push(clip.id);
                     audio_infos.push(AudioClipInfo {
                         path: asset.path.clone(),
                         time: source_time,
@@ -2489,7 +2580,7 @@ impl App {
             player.clear();
             player.play();
         }
-        self.audio_decode_clip_id = first_clip_id;
+        self.audio_decode_clip_id = clip_ids.into_iter().next();
         self.audio_decode_time_offset = first_time_offset;
 
         if let Some(tx) = &self.audio_decode_tx {
@@ -2846,20 +2937,22 @@ fn decode_and_composite_multi(
 /// Cached audio decoder state for the audio decode worker thread.
 struct CachedAudioDecoder {
     decoder: zeditor_media::audio_decoder::FfmpegAudioDecoder,
+    path: PathBuf,
     last_pts: f64,
 }
 
 /// Background audio decode worker thread. Supports multi-clip mixing.
+/// Uses per-clip-index decoders (not per-path) so overlapping clips from the
+/// same source file each get their own independent decoder.
 fn audio_decode_worker(
     request_rx: mpsc::Receiver<AudioDecodeRequest>,
     audio_tx: mpsc::SyncSender<DecodedAudio>,
 ) {
     use zeditor_media::audio_decoder::FfmpegAudioDecoder;
 
-    let mut audio_decoders: HashMap<PathBuf, CachedAudioDecoder> = HashMap::new();
+    let mut audio_decoders: Vec<Option<CachedAudioDecoder>> = Vec::new();
     let mut running = false;
     let mut is_continuous = false;
-    let mut target_time: f64 = 0.0;
     let mut seeking_to_target = false;
     let mut multi_clips: Vec<AudioClipInfo> = Vec::new();
 
@@ -2883,21 +2976,31 @@ fn audio_decode_worker(
                     clips,
                     continuous,
                 } => {
-                    // Open/seek all decoders
+                    // Resize decoder vec to match clip count
+                    audio_decoders.resize_with(clips.len(), || None);
+                    audio_decoders.truncate(clips.len());
+
+                    // Open/seek decoders per clip index
                     let mut ok = true;
-                    for clip in &clips {
-                        if !audio_decoders.contains_key(&clip.path) {
+                    for (i, clip) in clips.iter().enumerate() {
+                        // Reuse existing decoder if it's for the same path
+                        let needs_new = match &audio_decoders[i] {
+                            Some(cached) => cached.path != clip.path,
+                            None => true,
+                        };
+                        if needs_new {
                             match FfmpegAudioDecoder::open(&clip.path) {
                                 Ok(decoder) => {
-                                    audio_decoders.insert(clip.path.clone(), CachedAudioDecoder {
+                                    audio_decoders[i] = Some(CachedAudioDecoder {
                                         decoder,
+                                        path: clip.path.clone(),
                                         last_pts: -1.0,
                                     });
                                 }
                                 Err(_) => { ok = false; break; }
                             }
                         }
-                        let cached = audio_decoders.get_mut(&clip.path).unwrap();
+                        let cached = audio_decoders[i].as_mut().unwrap();
                         let needs_seek = clip.time < cached.last_pts
                             || (clip.time - cached.last_pts) > 2.0
                             || cached.last_pts < 0.0;
@@ -2914,7 +3017,6 @@ fn audio_decode_worker(
                         continue;
                     }
                     multi_clips = clips;
-                    target_time = multi_clips.first().map(|c| c.time).unwrap_or(0.0);
                     seeking_to_target = true;
                     is_continuous = continuous;
                     running = true;
@@ -2938,7 +3040,7 @@ fn audio_decode_worker(
         let mut any_decoded = false;
 
         for (i, clip) in multi_clips.iter().enumerate() {
-            let cached = match audio_decoders.get_mut(&clip.path) {
+            let cached = match audio_decoders.get_mut(i).and_then(|c| c.as_mut()) {
                 Some(c) => c,
                 None => continue,
             };

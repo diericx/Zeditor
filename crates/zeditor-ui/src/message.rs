@@ -211,4 +211,11 @@ pub enum Message {
         param_name: String,
         value: f64,
     },
+    EffectParamTextInput {
+        track_index: usize,
+        clip_id: Uuid,
+        effect_id: Uuid,
+        param_name: String,
+        text: String,
+    },
 }
