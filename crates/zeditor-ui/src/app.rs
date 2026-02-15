@@ -4,7 +4,7 @@ use std::time::{Duration, Instant};
 
 use std::collections::HashMap;
 
-use iced::widget::{button, center, column, container, image, mouse_area, opaque, row, scrollable, stack, text, Space};
+use iced::widget::{button, center, column, container, image, mouse_area, opaque, row, scrollable, slider, stack, text, Space};
 use iced::{event, keyboard, mouse, time, window, Background, Border, Color, Element, Event, Length, Padding, Point, Subscription, Task};
 use uuid::Uuid;
 
@@ -1174,26 +1174,24 @@ impl App {
                 Task::none()
             }
             Message::UpdateEffectParameter { track_index, clip_id, effect_id, param_name, value } => {
-                if let Ok(float_val) = value.parse::<f64>() {
-                    let result = self.project.command_history.execute(
-                        &mut self.project.timeline,
-                        "Update effect parameter",
-                        |tl| {
-                            let clip = tl.track_mut(track_index)?
-                                .get_clip_mut(clip_id)
-                                .ok_or(zeditor_core::error::CoreError::ClipNotFound(clip_id))?;
-                            if let Some(effect) = clip.effects.iter_mut().find(|e| e.id == effect_id) {
-                                effect.set_float(&param_name, float_val);
-                            }
-                            Ok(())
-                        },
-                    );
-                    if let Err(e) = result {
-                        self.status_message = format!("Update effect failed: {e}");
-                    }
-                    // Trigger decode refresh to update preview
-                    self.send_decode_seek(false);
+                let result = self.project.command_history.execute(
+                    &mut self.project.timeline,
+                    "Update effect parameter",
+                    |tl| {
+                        let clip = tl.track_mut(track_index)?
+                            .get_clip_mut(clip_id)
+                            .ok_or(zeditor_core::error::CoreError::ClipNotFound(clip_id))?;
+                        if let Some(effect) = clip.effects.iter_mut().find(|e| e.id == effect_id) {
+                            effect.set_float(&param_name, value);
+                        }
+                        Ok(())
+                    },
+                );
+                if let Err(e) = result {
+                    self.status_message = format!("Update effect failed: {e}");
                 }
+                // Trigger decode refresh to update preview
+                self.send_decode_seek(false);
                 Task::none()
             }
         }
@@ -1557,28 +1555,41 @@ impl App {
                 // Parameter inputs
                 for def in effect.effect_type.parameter_definitions() {
                     let current_val = effect.get_float(&def.name).unwrap_or(0.0);
-                    let val_str = if current_val == current_val.trunc() {
-                        format!("{:.0}", current_val)
-                    } else {
-                        format!("{}", current_val)
-                    };
-                    let param_label = text(def.label.clone()).size(12).color(Color::from_rgb(0.7, 0.7, 0.7));
                     let effect_id = effect.id;
                     let param_name = def.name.clone();
-                    let input = iced::widget::text_input("0", &val_str)
-                        .on_input(move |v| Message::UpdateEffectParameter {
+
+                    let zeditor_core::effects::ParameterType::Float { min, max, .. } = def.param_type;
+
+                    // Use percentage display for 0-1 range parameters
+                    let is_percentage = min == 0.0 && max == 1.0;
+                    let param_label = if is_percentage {
+                        text(format!("{}: {:.0}%", def.label, current_val * 100.0))
+                            .size(12)
+                            .color(Color::from_rgb(0.7, 0.7, 0.7))
+                    } else {
+                        let val_str = if current_val == current_val.trunc() {
+                            format!("{}: {:.0}", def.label, current_val)
+                        } else {
+                            format!("{}: {:.2}", def.label, current_val)
+                        };
+                        text(val_str).size(12).color(Color::from_rgb(0.7, 0.7, 0.7))
+                    };
+
+                    let param_slider = slider(min..=max, current_val, move |v| {
+                        Message::UpdateEffectParameter {
                             track_index,
                             clip_id,
                             effect_id,
                             param_name: param_name.clone(),
                             value: v,
-                        })
-                        .size(12)
-                        .width(80);
+                        }
+                    })
+                    .step(if is_percentage { 0.01 } else { 0.01 })
+                    .width(140);
+
                     items.push(
-                        row![param_label, Space::new().width(Length::Fill), input]
-                            .spacing(4)
-                            .align_y(iced::Alignment::Center)
+                        column![param_label, param_slider]
+                            .spacing(2)
                             .padding(Padding { top: 0.0, right: 0.0, bottom: 0.0, left: 8.0 })
                             .into()
                     );
@@ -2676,11 +2687,7 @@ fn decode_and_composite_multi(
                 let result = pipeline::run_effect_pipeline(
                     clip_frame, pw, ph, &clip.effects, registry, &ctx,
                 );
-                if result.may_have_transparency {
-                    pipeline::alpha_composite_rgba(&result.frame, &mut canvas_buf);
-                } else {
-                    pipeline::composite_opaque(&result.frame, &mut canvas_buf);
-                }
+                pipeline::alpha_composite_rgba(&result.frame, &mut canvas_buf);
             }
             any_decoded = true;
         }

@@ -345,13 +345,13 @@ fn encode_video_frames(
                     )?;
                     if let Some(clip_frame) = rgba_frame {
                         if clip_effects.is_empty() {
-                            // No effects: blit directly onto RGBA canvas
+                            // No effects: blit onto canvas-sized buffer, then alpha composite
                             let placed = pipeline::blit_clip_to_canvas(
                                 clip_frame, width as u32, height as u32,
                             );
-                            pipeline::composite_opaque(&placed, &mut canvas);
+                            pipeline::alpha_composite_rgba(&placed, &mut canvas);
                         } else {
-                            // Run effect pipeline
+                            // Run effect pipeline, then alpha composite
                             let result = pipeline::run_effect_pipeline(
                                 clip_frame,
                                 width as u32,
@@ -360,11 +360,7 @@ fn encode_video_frames(
                                 &registry,
                                 &ctx,
                             );
-                            if result.may_have_transparency {
-                                pipeline::alpha_composite_rgba(&result.frame, &mut canvas);
-                            } else {
-                                pipeline::composite_opaque(&result.frame, &mut canvas);
-                            }
+                            pipeline::alpha_composite_rgba(&result.frame, &mut canvas);
                         }
                     }
                 }

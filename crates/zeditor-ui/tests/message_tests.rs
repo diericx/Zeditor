@@ -1860,36 +1860,11 @@ fn test_update_effect_parameter() {
         clip_id,
         effect_id,
         param_name: "x_offset".into(),
-        value: "150.5".into(),
+        value: 150.5,
     });
 
     let clip = app.project.timeline.tracks[0].get_clip(clip_id).unwrap();
     assert_eq!(clip.effects[0].get_float("x_offset"), Some(150.5));
-}
-
-#[test]
-fn test_update_effect_parameter_invalid_value() {
-    let (mut app, _, clip_id) = setup_app_with_clip();
-
-    app.update(Message::AddEffectToSelectedClip(
-        zeditor_core::effects::EffectType::Transform,
-    ));
-    let effect_id = app.project.timeline.tracks[0]
-        .get_clip(clip_id)
-        .unwrap()
-        .effects[0]
-        .id;
-
-    app.update(Message::UpdateEffectParameter {
-        track_index: 0,
-        clip_id,
-        effect_id,
-        param_name: "x_offset".into(),
-        value: "not_a_number".into(),
-    });
-
-    let clip = app.project.timeline.tracks[0].get_clip(clip_id).unwrap();
-    assert_eq!(clip.effects[0].get_float("x_offset"), Some(0.0));
 }
 
 #[test]
@@ -1985,7 +1960,7 @@ fn test_undo_redo_update_effect_parameter() {
         clip_id,
         effect_id,
         param_name: "x_offset".into(),
-        value: "200".into(),
+        value: 200.0,
     });
     assert_eq!(
         app.project.timeline.tracks[0]
@@ -2515,7 +2490,7 @@ fn test_update_brightness_parameter() {
         clip_id,
         effect_id,
         param_name: "brightness".to_string(),
-        value: "0.75".to_string(),
+        value: 0.75,
     });
 
     let clip = app.project.timeline.tracks[0].get_clip(clip_id).unwrap();
@@ -2538,7 +2513,7 @@ fn test_update_opacity_parameter() {
         clip_id,
         effect_id,
         param_name: "opacity".to_string(),
-        value: "0.5".to_string(),
+        value: 0.5,
     });
 
     let clip = app.project.timeline.tracks[0].get_clip(clip_id).unwrap();

@@ -209,6 +209,6 @@ pub enum Message {
         clip_id: Uuid,
         effect_id: Uuid,
         param_name: String,
-        value: String,
+        value: f64,
     },
 }
