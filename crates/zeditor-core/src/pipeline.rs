@@ -184,19 +184,22 @@ impl PixelEffect for GrayscaleEffect {
         _params: &[(String, ParameterValue)],
         _ctx: &EffectContext,
     ) -> FrameBuffer {
-        // In-place: no allocation, modify the owned buffer directly
+        // In-place: row-based parallelism to avoid rayon micro-task overhead
+        let row_bytes = input.width as usize * 4;
         input
             .data
-            .par_chunks_exact_mut(4)
-            .for_each(|pixel| {
-                let r = pixel[0] as f32;
-                let g = pixel[1] as f32;
-                let b = pixel[2] as f32;
-                let l = (0.299 * r + 0.587 * g + 0.114 * b).round() as u8;
-                pixel[0] = l;
-                pixel[1] = l;
-                pixel[2] = l;
-                // alpha unchanged
+            .par_chunks_exact_mut(row_bytes)
+            .for_each(|row| {
+                for pixel in row.chunks_exact_mut(4) {
+                    let r = pixel[0] as f32;
+                    let g = pixel[1] as f32;
+                    let b = pixel[2] as f32;
+                    let l = (0.299 * r + 0.587 * g + 0.114 * b).round() as u8;
+                    pixel[0] = l;
+                    pixel[1] = l;
+                    pixel[2] = l;
+                    // alpha unchanged
+                }
             });
         input
     }
@@ -215,15 +218,18 @@ impl PixelEffect for BrightnessEffect {
         let brightness = get_float_param(params, "brightness").unwrap_or(0.0);
         let shift = (brightness * 255.0).round() as i16;
 
-        // In-place: no allocation
+        // In-place: row-based parallelism to avoid rayon micro-task overhead
+        let row_bytes = input.width as usize * 4;
         input
             .data
-            .par_chunks_exact_mut(4)
-            .for_each(|pixel| {
-                pixel[0] = (pixel[0] as i16 + shift).clamp(0, 255) as u8;
-                pixel[1] = (pixel[1] as i16 + shift).clamp(0, 255) as u8;
-                pixel[2] = (pixel[2] as i16 + shift).clamp(0, 255) as u8;
-                // alpha unchanged
+            .par_chunks_exact_mut(row_bytes)
+            .for_each(|row| {
+                for pixel in row.chunks_exact_mut(4) {
+                    pixel[0] = (pixel[0] as i16 + shift).clamp(0, 255) as u8;
+                    pixel[1] = (pixel[1] as i16 + shift).clamp(0, 255) as u8;
+                    pixel[2] = (pixel[2] as i16 + shift).clamp(0, 255) as u8;
+                    // alpha unchanged
+                }
             });
         input
     }
@@ -245,12 +251,15 @@ impl PixelEffect for OpacityEffect {
     ) -> FrameBuffer {
         let opacity = get_float_param(params, "opacity").unwrap_or(1.0);
 
-        // In-place: no allocation
+        // In-place: row-based parallelism to avoid rayon micro-task overhead
+        let row_bytes = input.width as usize * 4;
         input
             .data
-            .par_chunks_exact_mut(4)
-            .for_each(|pixel| {
-                pixel[3] = (pixel[3] as f32 * opacity as f32).round().clamp(0.0, 255.0) as u8;
+            .par_chunks_exact_mut(row_bytes)
+            .for_each(|row| {
+                for pixel in row.chunks_exact_mut(4) {
+                    pixel[3] = (pixel[3] as f32 * opacity as f32).round().clamp(0.0, 255.0) as u8;
+                }
             });
         input
     }
@@ -372,6 +381,10 @@ pub struct PipelineResult {
     /// True if any active effect may have produced transparent pixels.
     /// When false, the compositor can skip alpha blending and do a direct copy.
     pub may_have_transparency: bool,
+    /// True if the clip fills the entire canvas (dimensions matched exactly).
+    /// When `fills_canvas && !may_have_transparency`, `composite_opaque` is safe
+    /// because every pixel is guaranteed alpha=255 with no letterbox gaps.
+    pub fills_canvas: bool,
 }
 
 /// Run the full effect pipeline on a decoded clip frame.
@@ -389,6 +402,10 @@ pub fn run_effect_pipeline(
     registry: &EffectRegistry,
     ctx: &EffectContext,
 ) -> PipelineResult {
+    // Track whether clip fills the canvas (dimensions match exactly).
+    // blit_clip_to_canvas returns the clip unchanged when dimensions match,
+    // so we check before calling it.
+    let fills_canvas = clip_frame.width == canvas_width && clip_frame.height == canvas_height;
     let mut canvas = blit_clip_to_canvas(clip_frame, canvas_width, canvas_height);
     let mut may_have_transparency = false;
 
@@ -406,6 +423,7 @@ pub fn run_effect_pipeline(
     PipelineResult {
         frame: canvas,
         may_have_transparency,
+        fills_canvas,
     }
 }
 
@@ -455,6 +473,66 @@ pub fn alpha_composite_rgba(src: &FrameBuffer, dst: &mut FrameBuffer) {
                 // sa == 0: fully transparent source, dst unchanged
             }
         });
+}
+
+/// Blit a source clip directly onto an existing canvas, centered and aspect-ratio
+/// preserved (letterboxed). Only writes to the clip's actual pixel area — letterbox
+/// regions of the canvas are untouched. This avoids creating an intermediate
+/// canvas-sized buffer and prevents transparent letterbox pixels from erasing
+/// background content.
+pub fn blit_onto_canvas(clip: &FrameBuffer, canvas: &mut FrameBuffer) {
+    if clip.width == 0 || clip.height == 0 || canvas.width == 0 || canvas.height == 0 {
+        return;
+    }
+
+    // Fast path: dimensions match exactly — copy all data
+    if clip.width == canvas.width && clip.height == canvas.height {
+        canvas.data.copy_from_slice(&clip.data);
+        return;
+    }
+
+    // Compute fit: scale clip to fit canvas, preserving aspect ratio
+    let scale_x = canvas.width as f64 / clip.width as f64;
+    let scale_y = canvas.height as f64 / clip.height as f64;
+    let scale = scale_x.min(scale_y);
+
+    let dst_w = (clip.width as f64 * scale).round() as u32;
+    let dst_h = (clip.height as f64 * scale).round() as u32;
+
+    if dst_w == 0 || dst_h == 0 {
+        return;
+    }
+
+    // Center on canvas
+    let offset_x = (canvas.width.saturating_sub(dst_w)) / 2;
+    let offset_y = (canvas.height.saturating_sub(dst_h)) / 2;
+
+    let src_stride = clip.width as usize * 4;
+    let dst_stride = canvas.width as usize * 4;
+
+    // Nearest-neighbor blit using integer math
+    for dy in 0..dst_h {
+        let cy = offset_y + dy;
+        if cy >= canvas.height {
+            break;
+        }
+        let sy =
+            ((dy as u64 * clip.height as u64) / dst_h as u64).min(clip.height as u64 - 1) as u32;
+        let dst_row_offset = cy as usize * dst_stride;
+        let src_row_offset = sy as usize * src_stride;
+
+        for dx in 0..dst_w {
+            let cx = offset_x + dx;
+            if cx >= canvas.width {
+                break;
+            }
+            let sx = ((dx as u64 * clip.width as u64) / dst_w as u64)
+                .min(clip.width as u64 - 1) as u32;
+            let si = src_row_offset + sx as usize * 4;
+            let di = dst_row_offset + cx as usize * 4;
+            canvas.data[di..di + 4].copy_from_slice(&clip.data[si..si + 4]);
+        }
+    }
 }
 
 /// Direct opaque overwrite: copy src onto dst. Both must have the same dimensions.
@@ -900,5 +978,96 @@ mod tests {
         assert_eq!(px[1], 0);
         assert_eq!(px[2], 0);
         assert_eq!(px[3], 128);
+    }
+
+    // --- blit_onto_canvas tests ---
+
+    #[test]
+    fn test_blit_onto_canvas_same_dimensions() {
+        let clip = FrameBuffer::from_rgba_vec(4, 2, vec![
+            255, 0, 0, 255,   0, 255, 0, 255,   0, 0, 255, 255,   128, 128, 128, 255,
+            10, 20, 30, 255,   40, 50, 60, 255,   70, 80, 90, 255,   100, 110, 120, 255,
+        ]);
+        let mut canvas = FrameBuffer::new(4, 2);
+        blit_onto_canvas(&clip, &mut canvas);
+        assert_eq!(canvas.data, clip.data);
+    }
+
+    #[test]
+    fn test_blit_onto_canvas_preserves_letterbox() {
+        // 4x2 clip on 4x4 canvas: should be centered, letterbox rows untouched
+        let mut clip = FrameBuffer::new(4, 2);
+        for y in 0..2 {
+            for x in 0..4 {
+                clip.pixel_mut(x, y).copy_from_slice(&[255, 0, 0, 255]);
+            }
+        }
+        // Pre-fill canvas with green (simulating a background clip)
+        let mut canvas = FrameBuffer::new(4, 4);
+        for pixel in canvas.data.chunks_exact_mut(4) {
+            pixel.copy_from_slice(&[0, 255, 0, 255]);
+        }
+        blit_onto_canvas(&clip, &mut canvas);
+        // Letterbox rows (top/bottom) should remain green (untouched)
+        assert_eq!(canvas.pixel(0, 0), &[0, 255, 0, 255]);
+        assert_eq!(canvas.pixel(0, 3), &[0, 255, 0, 255]);
+        // Middle rows should be red (from clip)
+        assert_eq!(canvas.pixel(0, 1), &[255, 0, 0, 255]);
+        assert_eq!(canvas.pixel(0, 2), &[255, 0, 0, 255]);
+    }
+
+    #[test]
+    fn test_blit_onto_canvas_zero_dimensions() {
+        let clip = FrameBuffer::new(0, 0);
+        let mut canvas = FrameBuffer::new(4, 4);
+        blit_onto_canvas(&clip, &mut canvas);
+        // Canvas unchanged
+        assert!(canvas.data.iter().all(|&b| b == 0));
+    }
+
+    // --- fills_canvas tracking tests ---
+
+    #[test]
+    fn test_pipeline_fills_canvas_true_when_matching() {
+        let registry = EffectRegistry::with_builtins();
+        let clip = FrameBuffer::from_rgba_vec(4, 4, vec![255; 4 * 4 * 4]);
+        let result = run_effect_pipeline(clip, 4, 4, &[], &registry, &dummy_ctx());
+        assert!(result.fills_canvas);
+    }
+
+    #[test]
+    fn test_pipeline_fills_canvas_false_when_different() {
+        let registry = EffectRegistry::with_builtins();
+        let clip = FrameBuffer::from_rgba_vec(2, 1, vec![255; 2 * 1 * 4]);
+        let result = run_effect_pipeline(clip, 4, 4, &[], &registry, &dummy_ctx());
+        assert!(!result.fills_canvas);
+    }
+
+    #[test]
+    fn test_pipeline_smart_composite_opaque_effect() {
+        // Grayscale on matching dimensions: fills_canvas=true, may_have_transparency=false
+        // → composite_opaque is safe
+        let registry = EffectRegistry::with_builtins();
+        let clip = FrameBuffer::from_rgba_vec(2, 2, vec![
+            100, 150, 200, 255,   100, 150, 200, 255,
+            100, 150, 200, 255,   100, 150, 200, 255,
+        ]);
+        let effects = vec![EffectInstance::new(EffectType::Grayscale)];
+        let result = run_effect_pipeline(clip, 2, 2, &effects, &registry, &dummy_ctx());
+        assert!(result.fills_canvas);
+        assert!(!result.may_have_transparency);
+    }
+
+    #[test]
+    fn test_pipeline_smart_composite_transparency_effect() {
+        // Opacity < 1.0: fills_canvas=true, may_have_transparency=true
+        // → must use alpha_composite_rgba
+        let registry = EffectRegistry::with_builtins();
+        let clip = FrameBuffer::from_rgba_vec(2, 2, vec![255; 2 * 2 * 4]);
+        let mut opacity = EffectInstance::new(EffectType::Opacity);
+        opacity.set_float("opacity", 0.5);
+        let result = run_effect_pipeline(clip, 2, 2, &[opacity], &registry, &dummy_ctx());
+        assert!(result.fills_canvas);
+        assert!(result.may_have_transparency);
     }
 }

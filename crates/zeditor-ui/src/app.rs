@@ -2680,14 +2680,18 @@ fn decode_and_composite_multi(
                     offset_x, offset_y, clip_w, clip_h,
                 );
             } else {
-                // Effect path: decode → pipeline (canvas buffer + effects) → composite
+                // Effect path: decode → pipeline (canvas buffer + effects) → smart composite
                 let clip_frame = FrameBuffer::from_rgba_vec(
                     frame.width, frame.height, frame.data,
                 );
                 let result = pipeline::run_effect_pipeline(
                     clip_frame, pw, ph, &clip.effects, registry, &ctx,
                 );
-                pipeline::alpha_composite_rgba(&result.frame, &mut canvas_buf);
+                if !result.may_have_transparency && result.fills_canvas {
+                    pipeline::composite_opaque(&result.frame, &mut canvas_buf);
+                } else {
+                    pipeline::alpha_composite_rgba(&result.frame, &mut canvas_buf);
+                }
             }
             any_decoded = true;
         }

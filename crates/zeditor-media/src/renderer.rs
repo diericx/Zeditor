@@ -293,6 +293,94 @@ pub fn render_timeline(
 // Video encoding — uses raw AVFrames with per-source SWS contexts
 // =============================================================================
 
+/// Cached RGBA→YUV420P converter. Reuses the SWS context and AVFrames across
+/// frames to avoid per-frame allocation churn (SWS creation + 45MB of AVFrame
+/// buffers at 4K, hundreds of times).
+struct CachedRgbaToYuvConverter {
+    sws: SwsContext,
+    src_frame: AVFrame,
+    dst_frame: AVFrame,
+    #[allow(dead_code)]
+    width: i32,
+    height: i32,
+}
+
+impl CachedRgbaToYuvConverter {
+    fn new(width: i32, height: i32) -> Result<Self> {
+        let sws = SwsContext::get_context(
+            width,
+            height,
+            ffi::AV_PIX_FMT_RGBA,
+            width,
+            height,
+            ffi::AV_PIX_FMT_YUV420P,
+            ffi::SWS_FAST_BILINEAR,
+            None,
+            None,
+            None,
+        )
+        .ok_or_else(|| {
+            MediaError::EncoderError("Failed to create RGBA→YUV SWS context".into())
+        })?;
+
+        let mut src_frame = AVFrame::new();
+        src_frame.set_width(width);
+        src_frame.set_height(height);
+        src_frame.set_format(ffi::AV_PIX_FMT_RGBA);
+        unsafe {
+            ffi::av_frame_get_buffer(src_frame.as_mut_ptr(), 0);
+        }
+
+        let mut dst_frame = AVFrame::new();
+        dst_frame.set_width(width);
+        dst_frame.set_height(height);
+        dst_frame.set_format(ffi::AV_PIX_FMT_YUV420P);
+        unsafe {
+            ffi::av_frame_get_buffer(dst_frame.as_mut_ptr(), 0);
+        }
+
+        Ok(Self {
+            sws,
+            src_frame,
+            dst_frame,
+            width,
+            height,
+        })
+    }
+
+    /// Convert RGBA FrameBuffer to YUV420P, reusing cached resources.
+    /// Returns a mutable reference to the internal dst_frame.
+    fn convert(&mut self, fb: &FrameBuffer) -> Result<&mut AVFrame> {
+        // Copy RGBA data into the pre-allocated source AVFrame
+        unsafe {
+            let linesize = (*self.src_frame.as_ptr()).linesize[0] as usize;
+            let src_stride = fb.width as usize * 4;
+            let dst_ptr = (*self.src_frame.as_mut_ptr()).data[0] as *mut u8;
+            for row in 0..fb.height as usize {
+                std::ptr::copy_nonoverlapping(
+                    fb.data.as_ptr().add(row * src_stride),
+                    dst_ptr.add(row * linesize),
+                    src_stride,
+                );
+            }
+        }
+
+        // Make dst_frame writable (resets ref count so SWS can write to it)
+        unsafe {
+            ffi::av_frame_make_writable(self.dst_frame.as_mut_ptr());
+        }
+
+        // Convert RGBA → YUV420P
+        self.sws
+            .scale_frame(&self.src_frame, 0, self.height, &mut self.dst_frame)
+            .map_err(|e| {
+                MediaError::EncoderError(format!("RGBA→YUV conversion failed: {e}"))
+            })?;
+
+        Ok(&mut self.dst_frame)
+    }
+}
+
 fn encode_video_frames(
     timeline: &Timeline,
     source_library: &SourceLibrary,
@@ -310,95 +398,121 @@ fn encode_video_frames(
     let canvas_h = config.canvas_height;
     let registry = EffectRegistry::with_builtins();
 
+    // Pre-create opaque black template for fast canvas reset (single memcpy per frame)
+    let black_canvas_data: Vec<u8> = {
+        let mut data = vec![0u8; width as usize * height as usize * 4];
+        for pixel in data.chunks_exact_mut(4) {
+            pixel[3] = 255;
+        }
+        data
+    };
+
+    // Reusable RGBA canvas buffer — avoids 33MB allocation per frame at 4K
+    let mut rgba_canvas = FrameBuffer::new(width as u32, height as u32);
+
+    // Cached RGBA→YUV converter — avoids creating SWS context + AVFrames per frame
+    let mut rgba_to_yuv = CachedRgbaToYuvConverter::new(width, height)?;
+
     for frame_idx in 0..total_frames {
         let timeline_time = frame_idx as f64 / config.fps;
         let pos = TimelinePosition::from_secs_f64(timeline_time);
 
         let all_clips = find_all_video_clips_at(timeline, source_library, pos);
 
-        let yuv_frame = if all_clips.is_empty() {
-            create_black_yuv_frame(width, height)?
-        } else {
-            let any_has_effects = all_clips.iter().any(|(_, _, effects)| !effects.is_empty());
+        if all_clips.is_empty() {
+            let mut frame = create_black_yuv_frame(width, height)?;
+            frame.set_pts(frame_idx as i64);
+            encode_frame(
+                video_enc_ctx,
+                output_ctx,
+                Some(&frame),
+                stream_index,
+                stream_tb,
+            )?;
+            continue;
+        }
 
-            if any_has_effects {
-                // Effect path: work in RGBA, run pipeline, convert to YUV at end
-                let ctx = EffectContext {
-                    time_secs: timeline_time,
-                    frame_number: frame_idx,
-                    fps: config.fps,
-                };
+        let any_has_effects = all_clips.iter().any(|(_, _, effects)| !effects.is_empty());
 
-                let mut canvas = FrameBuffer::new(width as u32, height as u32);
-                // Fill with opaque black background
-                for pixel in canvas.data.chunks_exact_mut(4) {
-                    pixel[3] = 255;
-                }
+        if any_has_effects {
+            // Effect path: work in RGBA, run pipeline, convert to YUV at end
+            let ctx = EffectContext {
+                time_secs: timeline_time,
+                frame_number: frame_idx,
+                fps: config.fps,
+            };
 
-                for (source_path, source_time, clip_effects) in &all_clips {
-                    let rgba_frame = decode_clip_to_rgba(
-                        source_path,
-                        *source_time,
-                        width as u32,
-                        height as u32,
-                        video_decoders,
-                    )?;
-                    if let Some(clip_frame) = rgba_frame {
-                        if clip_effects.is_empty() {
-                            // No effects: blit onto canvas-sized buffer, then alpha composite
-                            let placed = pipeline::blit_clip_to_canvas(
-                                clip_frame, width as u32, height as u32,
-                            );
-                            pipeline::alpha_composite_rgba(&placed, &mut canvas);
+            // Reset canvas to opaque black (fast memcpy instead of per-pixel init)
+            rgba_canvas.data.copy_from_slice(&black_canvas_data);
+
+            for (source_path, source_time, clip_effects) in &all_clips {
+                let rgba_frame = decode_clip_to_rgba(
+                    source_path,
+                    *source_time,
+                    width as u32,
+                    height as u32,
+                    video_decoders,
+                )?;
+                if let Some(clip_frame) = rgba_frame {
+                    if clip_effects.is_empty() {
+                        // No effects: blit directly onto canvas (no intermediate buffer)
+                        pipeline::blit_onto_canvas(&clip_frame, &mut rgba_canvas);
+                    } else {
+                        // Run effect pipeline, then smart composite
+                        let result = pipeline::run_effect_pipeline(
+                            clip_frame,
+                            width as u32,
+                            height as u32,
+                            clip_effects,
+                            &registry,
+                            &ctx,
+                        );
+                        if !result.may_have_transparency && result.fills_canvas {
+                            pipeline::composite_opaque(&result.frame, &mut rgba_canvas);
                         } else {
-                            // Run effect pipeline, then alpha composite
-                            let result = pipeline::run_effect_pipeline(
-                                clip_frame,
-                                width as u32,
-                                height as u32,
-                                clip_effects,
-                                &registry,
-                                &ctx,
-                            );
-                            pipeline::alpha_composite_rgba(&result.frame, &mut canvas);
+                            pipeline::alpha_composite_rgba(&result.frame, &mut rgba_canvas);
                         }
                     }
                 }
-
-                // Convert final RGBA canvas to YUV420P
-                rgba_framebuffer_to_yuv(&canvas)?
-            } else {
-                // Fast path: no effects on any clip, use YUV pipeline
-                let mut canvas = create_black_yuv_frame(width, height)?;
-                for (source_path, source_time, _clip_effects) in &all_clips {
-                    let clip_frame = decode_and_scale_clip(
-                        source_path,
-                        *source_time,
-                        width,
-                        height,
-                        canvas_w,
-                        canvas_h,
-                        video_decoders,
-                        config.scaling.to_sws_flags(),
-                    )?;
-                    if let Some((scaled_frame, layout)) = clip_frame {
-                        blit_yuv_frame(&scaled_frame, &mut canvas, layout.clip_x, layout.clip_y);
-                    }
-                }
-                canvas
             }
-        };
 
-        let mut frame = yuv_frame;
-        frame.set_pts(frame_idx as i64);
-
-        encode_frame(
-            video_enc_ctx,
-            output_ctx,
-            Some(&frame),
-            stream_index,
-            stream_tb,
-        )?;
+            // Convert final RGBA canvas to YUV420P (reuses cached SWS + frames)
+            let yuv_frame = rgba_to_yuv.convert(&rgba_canvas)?;
+            yuv_frame.set_pts(frame_idx as i64);
+            encode_frame(
+                video_enc_ctx,
+                output_ctx,
+                Some(yuv_frame),
+                stream_index,
+                stream_tb,
+            )?;
+        } else {
+            // Fast path: no effects on any clip, use YUV pipeline
+            let mut canvas = create_black_yuv_frame(width, height)?;
+            for (source_path, source_time, _clip_effects) in &all_clips {
+                let clip_frame = decode_and_scale_clip(
+                    source_path,
+                    *source_time,
+                    width,
+                    height,
+                    canvas_w,
+                    canvas_h,
+                    video_decoders,
+                    config.scaling.to_sws_flags(),
+                )?;
+                if let Some((scaled_frame, layout)) = clip_frame {
+                    blit_yuv_frame(&scaled_frame, &mut canvas, layout.clip_x, layout.clip_y);
+                }
+            }
+            canvas.set_pts(frame_idx as i64);
+            encode_frame(
+                video_enc_ctx,
+                output_ctx,
+                Some(&canvas),
+                stream_index,
+                stream_tb,
+            )?;
+        }
     }
     Ok(())
 }
@@ -582,63 +696,6 @@ fn decode_clip_to_rgba(
         }
     }
 }
-
-/// Convert an RGBA FrameBuffer to a YUV420P AVFrame using SWS.
-fn rgba_framebuffer_to_yuv(fb: &FrameBuffer) -> Result<AVFrame> {
-    let w = fb.width as i32;
-    let h = fb.height as i32;
-
-    // Create SWS context: RGBA → YUV420P
-    let mut sws = SwsContext::get_context(
-        w,
-        h,
-        ffi::AV_PIX_FMT_RGBA,
-        w,
-        h,
-        ffi::AV_PIX_FMT_YUV420P,
-        ffi::SWS_FAST_BILINEAR,
-        None,
-        None,
-        None,
-    )
-    .ok_or_else(|| MediaError::EncoderError("Failed to create RGBA→YUV SWS context".into()))?;
-
-    // Create source AVFrame from RGBA data
-    let mut src_frame = AVFrame::new();
-    src_frame.set_width(w);
-    src_frame.set_height(h);
-    src_frame.set_format(ffi::AV_PIX_FMT_RGBA);
-    unsafe {
-        ffi::av_frame_get_buffer(src_frame.as_mut_ptr(), 0);
-        // Copy RGBA data into the AVFrame
-        let linesize = (*src_frame.as_ptr()).linesize[0] as usize;
-        let src_stride = fb.width as usize * 4;
-        let dst_ptr = (*src_frame.as_mut_ptr()).data[0] as *mut u8;
-        for row in 0..fb.height as usize {
-            std::ptr::copy_nonoverlapping(
-                fb.data.as_ptr().add(row * src_stride),
-                dst_ptr.add(row * linesize),
-                src_stride,
-            );
-        }
-    }
-
-    // Create destination YUV420P frame
-    let mut dst_frame = AVFrame::new();
-    dst_frame.set_width(w);
-    dst_frame.set_height(h);
-    dst_frame.set_format(ffi::AV_PIX_FMT_YUV420P);
-    unsafe {
-        ffi::av_frame_get_buffer(dst_frame.as_mut_ptr(), 0);
-    }
-
-    // Scale (convert) RGBA → YUV420P
-    sws.scale_frame(&src_frame, 0, h, &mut dst_frame)
-        .map_err(|e| MediaError::EncoderError(format!("RGBA→YUV conversion failed: {e}")))?;
-
-    Ok(dst_frame)
-}
-
 
 // =============================================================================
 // Audio encoding — offline clip-at-a-time rendering with sequential decode
